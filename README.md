@@ -19,7 +19,8 @@ suricata_scripts/
 ## Install
 
     sudo ./install.sh                       # install, configure, download rules, go inline
-    sudo ./install.sh 2a02:c7c:1234::/48    # same, adding your ISP's IPv6 prefix(es) to HOME_NET
+    sudo ./install.sh 2a02:c7c:1234::/48    # same, also adding extra IPv6 prefix(es) to HOME_NET
+    sudo ./install.sh --no-ipv6-detect      # don't auto-detect IPv6 prefixes
 
 What it does:
 
@@ -29,8 +30,11 @@ What it does:
 2. Installs `suricata`, `iptables`, `curl` and `python3`, then stops Suricata (the package starts it
    in af-packet IDS mode).
 3. Saves the existing config once to `/var/lib/suricata-installer/suricata.yaml.orig`, then installs
-   `files/suricata.yaml` with this machine's default-route interface filled in (`@DEFAULT_IFACE@`)
-   and any IPv6 prefixes you passed added to HOME_NET. Installs `drop.conf` and `modify.conf`.
+   `files/suricata.yaml` with this machine's default-route interface filled in (`@DEFAULT_IFACE@`).
+   Global IPv6 prefixes on the network are added to HOME_NET: those in the routing table, plus
+   those the router advertises (asked with `rdisc6`, so this works even if the machine hasn't
+   configured an IPv6 address). Prefixes passed as arguments are added too, e.g. your ISP's whole
+   delegated block, which the router only advertises a `/64` of. Installs `drop.conf` and `modify.conf`.
 4. Enables the rule sources in `files/rule-sources.conf` (disabling any no longer listed), then runs
    `suricata-update` to download them and convert the high-confidence rules to drop.
 5. Runs `suricata -T`. If the test fails it restores the previous config and stops **before touching
@@ -39,7 +43,8 @@ What it does:
    (`-q 0`), logrotate and the daily rule-update timer, then starts everything and waits until
    Suricata has attached to the queue.
 
-`install.sh` is safe to re-run, e.g. after editing anything in `files/`. A re-run restarts Suricata
+`install.sh` is safe to re-run, e.g. after editing anything in `files/`, or after your ISP changes
+your IPv6 prefix (`check.sh` warns when a prefix in use isn't in HOME_NET). A re-run restarts Suricata
 once; `stream.midstream` keeps already-open connections alive through the restart.
 
 ## Uninstall

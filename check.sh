@@ -93,6 +93,14 @@ grep -qx '  midstream: true' "$CONF" && pass "stream.midstream is enabled" || wa
 home=$(grep -m1 '^    HOME_NET:' "$CONF")
 info "${home#    }"
 grep -q 'fc00::/7' <<<"$home" && pass "HOME_NET includes IPv6 ranges" || warn "HOME_NET has no IPv6 ranges (re-run ./install.sh?)"
+# Global IPv6 prefixes this machine routes (e.g. after an ISP prefix change) should be in HOME_NET
+for prefix in $(ip -6 route show 2>/dev/null | awk '{print $1}' | grep -iE '^[23][0-9a-f]{0,3}:[0-9a-f:]*/[0-9]+$' | sort -u); do
+    if grep -qF -- "$prefix" <<<"$home"; then
+        pass "IPv6 prefix $prefix is in HOME_NET"
+    else
+        warn "IPv6 prefix $prefix is in use here but not in HOME_NET (re-run ./install.sh)"
+    fi
+done
 if cmp -s "$SRC/drop.conf" /etc/suricata/drop.conf; then
     pass "drop.conf matches $SRC/drop.conf"
 else

@@ -8,8 +8,10 @@
 #   - daily rule updates, size-based log rotation
 # Safe to re-run. Undo with ./uninstall.sh
 #
-# Run with: sudo ./install.sh [IPv6 prefix ...]
-#   Pass any fixed global IPv6 prefixes from your ISP to add them to HOME_NET, e.g.
+# Run with: sudo ./install.sh [--no-ipv6-detect] [IPv6 prefix ...]
+#   Global IPv6 prefixes on this network are detected and added to HOME_NET automatically
+#   (from the routing table, or by asking the router with rdisc6). Pass extra prefixes,
+#   e.g. your ISP's whole delegated block, as arguments:
 #   sudo ./install.sh 2a02:c7c:1234::/48
 set -euo pipefail
 
@@ -23,11 +25,29 @@ PPA=ppa:oisf/suricata-stable
 . /etc/os-release
 [[ ${ID:-} == ubuntu ]] || { echo "This installer supports Ubuntu only (found: ${ID:-unknown})"; exit 1; }
 
-V6_EXTRA=""
-for prefix in "$@"; do
-    [[ $prefix == *:*/* ]] || { echo "Not an IPv6 prefix (expected e.g. 2a02:c7c:1234::/48): $prefix"; exit 1; }
-    V6_EXTRA="$V6_EXTRA,$prefix"
+V6_DETECT=1
+V6_MANUAL=()
+for arg in "$@"; do
+    case $arg in
+        --no-ipv6-detect) V6_DETECT=0 ;;
+        -*) echo "Unknown option: $arg"; exit 2 ;;
+        *:*/*) V6_MANUAL+=("$arg") ;;
+        *) echo "Not an IPv6 prefix (expected e.g. 2a02:c7c:1234::/48): $arg"; exit 1 ;;
+    esac
 done
+
+# Global unicast (2000::/3) prefixes on this network. ULA and link-local are already in HOME_NET.
+detect_ipv6_prefixes() {
+    local iface=$1
+    {
+        # Prefixes this machine is already using
+        ip -6 route show 2>/dev/null | awk '{print $1}'
+        # Prefixes the router advertises, even if this machine hasn't configured an address
+        if command -v rdisc6 >/dev/null && [[ -n $iface ]]; then
+            rdisc6 -1 -r 2 -w 1500 "$iface" 2>/dev/null | sed -n 's/^ *Prefix *: *\([^ ]*\).*/\1/p'
+        fi
+    } | grep -iE '^[23][0-9a-f]{0,3}:[0-9a-f:]*/[0-9]+$' | sort -u
+}
 
 step() { echo; echo "==> $*"; }
 mkdir -p "$STATE_DIR"
@@ -41,7 +61,7 @@ if ! grep -rqs 'oisf/suricata-stable' /etc/apt/sources.list /etc/apt/sources.lis
     touch "$STATE_DIR/added-ppa"   # so uninstall.sh only removes the PPA if we added it
 fi
 apt-get update
-apt-get install -y suricata iptables curl python3
+apt-get install -y suricata iptables curl python3 ndisc6
 version=$(suricata -V | grep -o '[0-9][0-9.]*' | head -1)
 echo "Suricata $version installed"
 [[ ${version%%.*} -ge 8 ]] || echo "WARNING: files/suricata.yaml was written for Suricata 8.x; the config test below will tell us if $version accepts it"
@@ -57,10 +77,23 @@ fi
 PREV=$(mktemp)
 [[ -f $CONF ]] && cp -p "$CONF" "$PREV"
 
-# af-packet isn't used in NFQUEUE mode, but point it at a real interface so the config stays valid
 iface=$(ip route show default 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "dev") { print $(i + 1); exit }}')
-iface=${iface:-eth0}
-sed -e "s/@DEFAULT_IFACE@/$iface/" \
+
+V6_PREFIXES=("${V6_MANUAL[@]}")
+if [[ $V6_DETECT -eq 1 ]]; then
+    mapfile -t detected < <(detect_ipv6_prefixes "$iface")
+    if [[ ${#detected[@]} -gt 0 ]]; then
+        echo "Detected IPv6 prefix(es) on this network: ${detected[*]}"
+        V6_PREFIXES+=("${detected[@]}")
+    else
+        echo "No global IPv6 prefix detected on this network (HOME_NET keeps ULA/link-local only)"
+    fi
+fi
+V6_EXTRA=""
+[[ ${#V6_PREFIXES[@]} -gt 0 ]] && V6_EXTRA=$(printf ',%s' $(printf '%s\n' "${V6_PREFIXES[@]}" | sort -u))
+
+# af-packet isn't used in NFQUEUE mode, but point it at a real interface so the config stays valid
+sed -e "s/@DEFAULT_IFACE@/${iface:-eth0}/" \
     -e "s|^\(    HOME_NET: \"\[.*fe80::/10\)\]\"|\1$V6_EXTRA]\"|" \
     "$SRC/suricata.yaml" > "$CONF.new"
 install -m 0644 -o root -g suricata "$CONF.new" "$CONF"
