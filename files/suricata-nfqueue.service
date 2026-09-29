@@ -1,0 +1,13 @@
+[Unit]
+Description=Divert traffic to Suricata via NFQUEUE (mangle table, ahead of UFW)
+After=ufw.service
+Before=suricata.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/suricata-nfqueue-apply.sh start
+ExecStop=/usr/local/sbin/suricata-nfqueue-apply.sh stop
+
+[Install]
+WantedBy=multi-user.target

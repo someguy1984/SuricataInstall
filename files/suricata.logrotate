@@ -1,0 +1,21 @@
+# Size-based rotation for Suricata logs (no time-based rotation).
+# Install: sudo install -m 644 -o root -g root suricata.logrotate /etc/logrotate.d/suricata
+# Test:    sudo logrotate -d /etc/logrotate.d/suricata
+/var/log/suricata/*.log /var/log/suricata/*.json {
+    # Rotate only once a file exceeds this size (checked each time logrotate runs)
+    size 200M
+    # Keep 5 old copies per file (~1 GB uncompressed worst case for eve.json, far less compressed)
+    rotate 5
+    compress
+    delaycompress
+    missingok
+    notifempty
+    # Needed because /var/log/suricata is not root-owned; logrotate refuses otherwise
+    su suricata suricata
+    create 640 suricata suricata
+    sharedscripts
+    postrotate
+        # SIGHUP makes Suricata reopen its log files (does not reload rules or drop traffic)
+        /bin/kill -HUP "$(cat /run/suricata.pid 2>/dev/null)" 2>/dev/null || true
+    endscript
+}
