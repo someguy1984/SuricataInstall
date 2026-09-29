@@ -1,0 +1,11 @@
+[Unit]
+Description=Update Suricata rules and reload them without a restart
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# suricata-update tests the new ruleset and keeps the old one if the test fails
+ExecStart=/usr/bin/suricata-update
+# ExecReload of suricata.service sends USR2: live rule reload, no traffic interruption
+ExecStartPost=/bin/systemctl reload suricata.service
