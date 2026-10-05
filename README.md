@@ -8,6 +8,7 @@ suricata_scripts/
 ├── install.sh      sudo ./install.sh [IPv6-prefix ...]
 ├── uninstall.sh    sudo ./uninstall.sh [--yes] [--keep-logs]
 ├── check.sh        sudo ./check.sh [--config-test] [--live]
+├── analyse.py      ./analyse.py [--minutes 5] [--end now|latest|TIME] [--json] [-v]
 ├── README.md
 └── files/          everything that gets installed (yaml, drop/modify.conf, units, NFQUEUE script, logrotate)
 ```
@@ -78,6 +79,125 @@ anything fails.
 
 `--live` sends an HTTP request with an apt-style User-Agent to `archive.ubuntu.com`, which triggers
 SID 2013504 (an alert-only rule, never dropped) and confirms it appears in `eve.json`.
+
+## Security breakdown of recent activity
+
+    ./analyse.py                    # last 5 minutes
+    ./analyse.py --minutes 60 -v    # last hour, including INFO findings
+    ./analyse.py --end 13:55        # the 5 minutes up to 13:55 today
+    ./analyse.py --end latest       # the 5 minutes up to the newest record (if logging has stopped)
+    ./analyse.py --json             # for scripts/cron
+
+| Option                    | Meaning                                                                  |
+|---------------------------|--------------------------------------------------------------------------|
+| `--minutes N`             | Length of the window (default 5)                                         |
+| `--end now\|latest\|TIME` | End of the window: now (default), the newest eve.json record, or a local time (`13:55`, `2026-10-05T13:55`) |
+| `--top N`                 | Rows per table (default 10)                                              |
+| `-v`, `--verbose`         | Also show INFO findings and alerts that are informational only            |
+| `--json`                  | Machine-readable output instead of the report                            |
+| `--no-color`              | Plain output (automatic when not writing to a terminal)                  |
+| `--log-dir`, `--config`   | Other log directory (default `/var/log/suricata`) / suricata.yaml to read HOME_NET from |
+
+`analyse.py` is read-only and uses only the Python standard library. It needs root or membership of the
+`suricata` group. Exit status: 0 nothing above LOW, 1 MEDIUM, 2 HIGH/CRITICAL, 3 logs unreadable.
+
+### What it reads
+
+| Source          | Used for                                                                          |
+|-----------------|-----------------------------------------------------------------------------------|
+| `eve.json`      | Everything: alerts, drops, flows, DNS, TLS, HTTP, files, SSH, anomalies, stats. `eve.json.1` too if the window crosses a rotation |
+| `suricata.log`  | Errors, warnings and notices (e.g. rule reloads) during the window                |
+| `fast.log`      | Cross-check of the alert count against eve.json                                   |
+| `stats.log`     | Engine counters, only if eve.json has no stats records                            |
+| `filestore/`    | Files stored by rule matches during the window, matched to their download by sha256 |
+| `suricata.yaml` | HOME_NET, to tell local hosts from remote ones (falls back to the private ranges) |
+
+It reads the logs backwards from the end and stops once it passes the start of the window, so the cost
+depends on the window, not on the file size: a 5-minute window takes milliseconds and a week of logs
+(about 170 MB of eve.json) under a second. Only records in the window are decoded, and of the stats records
+only the first and last.
+
+### The report
+
+1. **Engine health**: packets and rate, IPS accepted/blocked, drop reasons, new and active flows, alerts
+   (and how many were suppressed by thresholds), app-layer errors, and suricata.log/fast.log counts.
+2. **Activity overview**: event counts by type, flows by protocol and direction, top local hosts and remote
+   endpoints by traffic, top DNS domains and TLS SNIs. Remote IPs are named from DNS answers, TLS SNI and
+   HTTP Host headers seen in the window.
+3. **Alerts**: grouped by signature, with count, action (allowed/blocked) and the top source -> destination.
+4. **Findings**: everything flagged, worst first, with details.
+5. **Correlated flows**: for each flow that raised a real alert, everything else logged on it: the DNS
+   lookup that led to it, TLS/HTTP details, files, anomalies, drops and the flow record, plus the flow's
+   `community_id` for pivoting (`jq -c 'select(.community_id=="<id>")' /var/log/suricata/eve.json`). Then the
+   hosts ranked by combined risk score.
+6. **Next steps**: suggested follow-up for the kinds of finding present.
+
+### Severity
+
+| Level    | Meaning                                                                                    |
+|----------|--------------------------------------------------------------------------------------------|
+| CRITICAL | A severity-1 alert rated Critical by ET that was **allowed**, or a host with several serious signals whose worst was HIGH |
+| HIGH     | Severity-1 alert allowed; risky service (SMB, RDP, telnet, databases...) reachable from the internet; attack request that got a 2xx answer; eve.json not written for over 60 s |
+| MEDIUM   | Severity-2 alert allowed, or severity-1 alert blocked; scans from inside; brute force; DGA/tunnelling DNS; executable downloads; expired certificates; engine restarts, memcap drops or suricata.log errors |
+| LOW      | Severity-2 alert blocked; ET INFO/POLICY rules rated severity 1-2; inbound scans; beaconing; large uploads; obsolete or self-signed TLS; abuse-heavy TLDs; plain HTTP to bare IPs |
+| INFO     | Suricata's own stream/decoder events, "Not Suspicious Traffic", engine-reason drops (e.g. stream errors), TLS without SNI. Hidden unless `-v` |
+
+The overall risk is the worst finding. A blocked alert is rated one level lower than an allowed one, since
+the IPS has already stopped it.
+
+### Detections and thresholds
+
+All counts are within the window.
+
+| Finding                     | Triggered by                                                                     |
+|-----------------------------|----------------------------------------------------------------------------------|
+| Port scan                   | One source, 15+ unanswered TCP ports on one host (MEDIUM from inside, LOW from outside) |
+| Sweep                       | One source, one port, 15+ hosts without reply                                    |
+| Exposed service             | External host completed a TCP connection to a local host (port below 49152; flows that look reversed by midstream pickup are ignored) |
+| SSH brute force             | 10+ connections from one external host to port 22 on one local host             |
+| SSH fan-out                 | One local host opening SSH to 10+ different external hosts                       |
+| Risky outbound port         | Answered connection out to telnet, SMB, RDP, IRC, Tor, SOCKS, 4444, 5555, 31337  |
+| Large upload                | 100 MB+ from one local host to one remote host                                   |
+| Beaconing                   | 6+ flows from one local host to the same remote host/port, 5 s+ apart, jitter 15% or less (DNS/NTP excluded) |
+| NXDOMAIN-heavy DNS          | 15+ NXDOMAIN answers, 30%+ of the host's lookups, 10+ different names            |
+| Random-looking domains      | Registered-domain label of 12+ characters, entropy 3.5+, 2+ digits               |
+| DNS tunnelling              | 30+ different subdomains of one domain, averaging 40+ characters; or 50+ TXT lookups |
+| Abuse-heavy TLDs            | Lookups in `.zip`, `.top`, `.xyz`, `.tk`, `.icu` and similar                     |
+| TLS                         | Expired certificate, self-signed certificate, SSLv3/TLS 1.0/1.1, no SNI (external servers only) |
+| Web attacks (inbound)       | Attack patterns in URLs (traversal, `/etc/passwd`, `${jndi:`, SQL injection, `.env`, `.git`...), scanner/tool user-agents, 20+ 4xx responses, unusual methods (PUT, DELETE, PROPFIND...) |
+| HTTP (outbound)             | Requests straight to IP addresses; scripted clients (curl, python, Go...) as INFO |
+| Executable download         | File name, magic or content type of an executable/script (exe, dll, ps1, sh, jar, apk...) |
+| Anomalies                   | 50+ protocol anomalies (LOW), otherwise INFO                                     |
+| Engine pressure             | Any memcap-drop, emergency-mode, queue-overflow, reassembly-gap, exception-policy or NFQ-error counter increased |
+| Restart                     | Uptime went down between two stats records                                      |
+
+### Correlation
+
+Every finding records the hosts it involves. Each host gets a score (CRITICAL 40, HIGH 20, MEDIUM 8, LOW 2).
+A host involved in 2+ kinds of finding with a score of 10+ gets a **correlated** finding listing them, with a
+timeline of its alerts, rule drops and files. If 2+ of those kinds are MEDIUM or worse, it is raised one
+severity level, since independent signals pointing at the same host are stronger than any one alone. Local
+hosts are listed first, and a remote host whose findings are already all shown under a local one isn't repeated.
+
+For example, a malware check-in shows up as: a DNS lookup of an unfamiliar domain, an alert on the TLS session
+to it, beaconing to the same IP every 30 s and an executable downloaded from it, all under one host.
+
+### Running it on a schedule
+
+The exit status makes it usable from cron, e.g. to keep a copy of every report at MEDIUM or above (in the crontab
+of root or of a user in the `suricata` group):
+
+    */5 * * * * /path/to/analyse.py --no-color > ~/suricata-report.txt || cp ~/suricata-report.txt ~/suricata-report-$(date +\%F-\%H\%M).txt
+
+### Limitations
+
+- The thresholds are heuristics for a small network and may need tuning for busy ones (constants near the top
+  of `analyse.py`).
+- Beaconing also matches normal keep-alives and polling (it is LOW unless the same host has other findings).
+- SSH brute force is judged by connection count only; the logs can't show whether a login succeeded.
+- With DNS over HTTPS/TLS (e.g. Control D), Suricata sees few DNS lookups, so the DNS checks and naming
+  of IPs rely mostly on TLS SNI.
+- Over long windows with restarts, the engine counters cover only the time since the last restart.
 
 ## What gets installed
 
