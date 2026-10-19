@@ -5,11 +5,12 @@ Suricata via iptables NFQUEUE rules in the mangle table (so UFW still applies af
 
 ```
 suricata_scripts/
-├── install.sh      sudo ./install.sh [IPv6-prefix ...]
+├── install.sh      sudo ./install.sh [CIDR ...]
 ├── uninstall.sh    sudo ./uninstall.sh [--yes] [--keep-logs]
 ├── check.sh        sudo ./check.sh [--config-test] [--live]
 ├── analyse.py      ./analyse.py [--minutes 5] [--end now|latest|TIME] [--json] [-v]
 ├── README.md
+├── controld/       Control D (ctrld) DNS lockdown kit, installed separately (its own install.sh)
 └── files/          everything that gets installed (yaml, drop/modify.conf, units, NFQUEUE script, logrotate)
 ```
 
@@ -20,33 +21,47 @@ suricata_scripts/
 ## Install
 
     sudo ./install.sh                       # install, configure, download rules, go inline
-    sudo ./install.sh 2a02:c7c:1234::/48    # same, also adding extra IPv6 prefix(es) to HOME_NET
-    sudo ./install.sh --no-ipv6-detect      # don't auto-detect IPv6 prefixes
+    sudo ./install.sh 192.168.1.20/32       # same, also keeping a trusted host/network in HOME_NET
 
 What it does:
 
 1. Checks the machine is Ubuntu, runs `apt update` and adds the OISF PPA (`ppa:oisf/suricata-stable`)
    if it isn't already configured. The yaml is written for Suricata 8.x; Ubuntu's own archive is
-   often on 7.x.
+   often on 7.x. An apt pin (`/etc/apt/preferences.d/suricata-8`) keeps it on 8.x.
 2. Installs `suricata`, `iptables`, `curl` and `python3`, then stops Suricata (the package starts it
    in af-packet IDS mode).
 3. Saves the existing config once to `/var/lib/suricata-installer/suricata.yaml.orig`, then installs
    `files/suricata.yaml` with this machine's default-route interface filled in (`@DEFAULT_IFACE@`).
-   Global IPv6 prefixes on the network are added to HOME_NET: those in the routing table, plus
-   those the router advertises (asked with `rdisc6`, so this works even if the machine hasn't
-   configured an IPv6 address). Prefixes passed as arguments are added too, e.g. your ISP's whole
-   delegated block, which the router only advertises a `/64` of. Installs `drop.conf` and `modify.conf`.
+   HOME_NET is set to this machine's own addresses (see [HOME_NET](#home_net)); CIDRs passed as
+   arguments are written to `/etc/suricata/home-net.extra` and always kept in it. Installs
+   `drop.conf`, `modify.conf` and `local.rules`.
 4. Enables the rule sources in `files/rule-sources.conf` (disabling any no longer listed), then runs
    `suricata-update` to download them and convert the high-confidence rules to drop.
 5. Runs `suricata -T`. If the test fails it restores the previous config and stops **before touching
    the firewall**.
 6. Installs the NFQUEUE firewall script and unit, the systemd override that runs Suricata inline
-   (`-q 0`), logrotate and the daily rule-update timer, then starts everything and waits until
-   Suricata has attached to the queue.
+   (`-q 0`) and sandboxed, logrotate, the daily rule-update timer and the HOME_NET updater, then
+   starts everything and waits until Suricata has attached to the queue.
 
-`install.sh` is safe to re-run, e.g. after editing anything in `files/`, or after your ISP changes
-your IPv6 prefix (`check.sh` warns when a prefix in use isn't in HOME_NET). A re-run restarts Suricata
+`install.sh` is safe to re-run, e.g. after editing anything in `files/`. A re-run restarts Suricata
 once; `stream.midstream` keeps already-open connections alive through the restart.
+
+### HOME_NET
+
+This is a laptop, so "home" is this machine, not whatever network it's on. HOME_NET holds:
+
+- this machine's exact IPv4 addresses, on every interface (Wi-Fi, VPN, libvirt/docker bridges)
+- the `/64` of each global or ULA IPv6 address (temporary privacy addresses rotate inside it,
+  so it can't be narrower), and this machine's exact link-local addresses
+- loopback, plus anything listed in `/etc/suricata/home-net.extra` (one CIDR per line)
+
+Everyone else, including other devices on the same café, hotel or home Wi-Fi, is `EXTERNAL_NET`,
+so rules written for attacks coming from outside fire for them too. `/usr/local/sbin/suricata-home-net`
+rewrites the line and reloads the rules live (USR2, no traffic interruption) when the addresses change.
+It runs from a NetworkManager hook, a 15-minute timer, and before Suricata starts. Each change costs one
+rule reload (about a minute of CPU and briefly double the memory).
+
+    sudo suricata-home-net --check      # print the expected value; exits 1 if the config is stale
 
 ## Uninstall
 
@@ -209,12 +224,18 @@ of root or of a user in the `suricata` group):
 | `suricata-nfqueue-apply.sh`     | `/usr/local/sbin/` (`start` adds / `stop` removes the NFQUEUE rules) |
 | `suricata-nfqueue.service`      | `/etc/systemd/system/` (applies the rules at boot, removes them on stop) |
 | `suricata-override.conf`        | `/etc/systemd/system/suricata.service.d/override.conf` (runs with `-q 0`) |
-| `suricata-rules-update.{service,timer}` | `/etc/systemd/system/` (daily `suricata-update` + live reload) |
+| `suricata-rules-update.{service,timer}` | `/etc/systemd/system/` (daily sandboxed `suricata-update` + live reload) |
+| `local.rules`                   | `/etc/suricata/local.rules` (this machine's own rules; suricata-update leaves it alone) |
+| `suricata-home-net.sh`          | `/usr/local/sbin/suricata-home-net` (keeps HOME_NET on this machine's addresses) |
+| `suricata-home-net.{service,timer}` | `/etc/systemd/system/` (runs it; timer every 15 min) |
+| `90-suricata-home-net`          | `/etc/NetworkManager/dispatcher.d/` (runs it on network changes) |
+| `suricata.apt-pin`              | `/etc/apt/preferences.d/suricata-8` (keeps apt on Suricata 8.x) |
 | `suricata.logrotate`            | `/etc/logrotate.d/suricata` (size-based, 200M x 5)       |
 
-Config highlights vs the stock yaml: `stream.midstream: true`, IPv6 ULA/link-local in HOME_NET,
+Config highlights vs the stock yaml: `stream.midstream: true`, HOME_NET = this machine only,
 checksum validation off (offloaded checksums otherwise cause false drops), NFQ `fail-open: no`,
-eve.json with payloads, community-id, drop and verdict logging, file-store for rule-matched files.
+eve.json with payloads, community-id, drop and verdict logging, file-store for rule-matched files,
+Landlock sandbox on, stats every 60 s to eve.json only (no `stats.log`).
 
 ## Rules and blocking policy
 
@@ -235,6 +256,11 @@ Converted to drop (`files/drop.conf`):
   HUNTING, POLICY, GAMES, CHAT, P2P, DNS, DYN_DNS, TOR and USER_AGENTS categories
 - all abuse.ch rules (SSLBL by message; Feodo Tracker and URLhaus are `trojan-activity`)
 
+Local rules (`files/local.rules`): plain DNS (53) and DNS-over-TLS/QUIC (853) leaving the machine
+are dropped. ctrld resolves over DoH (443), so this only stops leaks, such as ctrld's own plain-DNS
+fallback when its upstream fails, which the DNSLOCK firewall chain exempts. A captive portal that
+needs its own DNS won't resolve while this is in place.
+
 Everything else alerts only. With all sources that's about 90k enabled rules, about 67k of them
 set to drop. Loading them takes about 50 s and about 800 MB of RAM, and a live reload briefly
 needs about double that. When `drop.conf` was introduced, it was checked against this machine's
@@ -244,7 +270,13 @@ alert history: none of the normal traffic seen would have been blocked.
 
 - **Suricata down → traffic passes.** The NFQUEUE rules use `--queue-bypass`: if Suricata is
   stopped, restarting or crashed, traffic flows uninspected rather than being blocked, so a failed
-  start can't cut the network (or an SSH session).
+  start can't cut the network (or an SSH session). To keep that window short, systemd restarts
+  Suricata 5 s after it exits for any reason, and apt is pinned to 8.x so an upgrade can't leave it
+  unable to start.
+- **Sandboxed.** Suricata runs with systemd hardening (read-only system, no kernel or namespace
+  access) and Landlock (once started it can only touch its logs, `/var/lib/suricata` and `/run`).
+  The daily `suricata-update` runs read-only except `/var/lib/suricata`, with no network admin or
+  other privileged capabilities.
 - **Suricata overloaded → excess packets dropped.** NFQ runs with `fail-open: no`: if the queue
   fills because Suricata can't keep up, packets are dropped rather than passed uninspected (TCP
   retransmits them). `check.sh` reports queue overflows; if they appear regularly, investigate

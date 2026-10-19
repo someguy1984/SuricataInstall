@@ -1,0 +1,12 @@
+# This machine's own rules. install.sh installs them as /etc/suricata/local.rules,
+# where suricata-update leaves them alone. SIDs 9000000-9099999 are reserved for local use.
+
+# No unencrypted DNS may leave this machine: ctrld resolves everything over DoH (443).
+# These drop the fallback that ctrld uses when its upstream fails (leak_on_upstream_failure),
+# which the DNSLOCK firewall chain lets through because it exempts ctrld's cgroup.
+# Loopback (ctrld itself) never reaches NFQUEUE, and libvirt VMs talking to this machine's
+# own bridge address are in HOME_NET, so neither is affected.
+drop udp $HOME_NET any -> $EXTERNAL_NET 53 (msg:"LOCAL Plain DNS (UDP) leaving this machine"; classtype:policy-violation; sid:9000001; rev:1;)
+drop tcp $HOME_NET any -> $EXTERNAL_NET 53 (msg:"LOCAL Plain DNS (TCP) leaving this machine"; classtype:policy-violation; sid:9000002; rev:1;)
+drop tcp $HOME_NET any -> $EXTERNAL_NET 853 (msg:"LOCAL DNS-over-TLS leaving this machine (not ctrld)"; classtype:policy-violation; sid:9000003; rev:1;)
+drop udp $HOME_NET any -> $EXTERNAL_NET 853 (msg:"LOCAL DNS-over-QUIC leaving this machine (not ctrld)"; classtype:policy-violation; sid:9000004; rev:1;)

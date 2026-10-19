@@ -7,5 +7,29 @@ Wants=network-online.target
 Type=oneshot
 # suricata-update tests the new ruleset and keeps the old one if the test fails
 ExecStart=/usr/bin/suricata-update
-# ExecReload of suricata.service sends USR2: live rule reload, no traffic interruption
-ExecStartPost=/bin/systemctl reload suricata.service
+# ExecReload of suricata.service sends USR2: live rule reload, no traffic interruption.
+# "+" runs this one step outside the sandbox below, which has no right to manage services.
+ExecStartPost=+/bin/systemctl reload suricata.service
+
+# Sandboxing: this downloads and unpacks archives from the internet as root every day.
+# It may only write the rules/cache directory, and keeps just the capabilities needed to
+# write into /var/lib/suricata (owned by suricata:suricata) as root.
+ProtectSystem=strict
+ReadWritePaths=/var/lib/suricata
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_FOWNER CAP_CHOWN
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6

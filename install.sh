@@ -2,17 +2,19 @@
 # One-shot install of Suricata as an inline IPS (NFQUEUE) on Ubuntu.
 #   - installs Suricata 8.x from the OISF PPA
 #   - pulls ET Open + abuse.ch SSLBL/Feodo Tracker/URLhaus rules (files/rule-sources.conf)
-#   - installs the tuned suricata.yaml from files/ (midstream, IPv6 HOME_NET, rich eve.json)
+#   - installs the tuned suricata.yaml from files/ (midstream, rich eve.json)
 #   - converts high-confidence rules to drop (files/drop.conf)
 #   - diverts all traffic (IPv4 + IPv6) through Suricata via iptables mangle NFQUEUE rules
-#   - daily rule updates, size-based log rotation
+#   - daily rule updates (sandboxed), size-based log rotation
+#   - keeps HOME_NET set to this machine's own addresses as networks change (NetworkManager hook)
+#   - local rules (files/local.rules): no plain DNS/DoT may leave the machine
+#   - pins Suricata to 8.x, and runs it sandboxed (systemd + Landlock)
 # Safe to re-run. Undo with ./uninstall.sh
 #
-# Run with: sudo ./install.sh [--no-ipv6-detect] [IPv6 prefix ...]
-#   Global IPv6 prefixes on this network are detected and added to HOME_NET automatically
-#   (from the routing table, or by asking the router with rdisc6). Pass extra prefixes,
-#   e.g. your ISP's whole delegated block, as arguments:
-#   sudo ./install.sh 2a02:c7c:1234::/48
+# Run with: sudo ./install.sh [CIDR ...]
+#   HOME_NET follows this machine's own addresses automatically. CIDRs given here are kept
+#   in HOME_NET permanently (written to /etc/suricata/home-net.extra, replacing its contents),
+#   e.g. a NAS you trust:  sudo ./install.sh 192.168.1.20/32
 set -euo pipefail
 
 SRC="$(dirname "$(readlink -f "$0")")/files"
@@ -25,29 +27,14 @@ PPA=ppa:oisf/suricata-stable
 . /etc/os-release
 [[ ${ID:-} == ubuntu ]] || { echo "This installer supports Ubuntu only (found: ${ID:-unknown})"; exit 1; }
 
-V6_DETECT=1
-V6_MANUAL=()
+EXTRA_NETS=()
 for arg in "$@"; do
     case $arg in
-        --no-ipv6-detect) V6_DETECT=0 ;;
         -*) echo "Unknown option: $arg"; exit 2 ;;
-        *:*/*) V6_MANUAL+=("$arg") ;;
-        *) echo "Not an IPv6 prefix (expected e.g. 2a02:c7c:1234::/48): $arg"; exit 1 ;;
+        */*) EXTRA_NETS+=("$arg") ;;
+        *) echo "Not a CIDR (expected e.g. 192.168.1.20/32 or 2a02:c7c:1234::/48): $arg"; exit 1 ;;
     esac
 done
-
-# Global unicast (2000::/3) prefixes on this network. ULA and link-local are already in HOME_NET.
-detect_ipv6_prefixes() {
-    local iface=$1
-    {
-        # Prefixes this machine is already using
-        ip -6 route show 2>/dev/null | awk '{print $1}'
-        # Prefixes the router advertises, even if this machine hasn't configured an address
-        if command -v rdisc6 >/dev/null && [[ -n $iface ]]; then
-            rdisc6 -1 -r 2 -w 1500 "$iface" 2>/dev/null | sed -n 's/^ *Prefix *: *\([^ ]*\).*/\1/p'
-        fi
-    } | grep -iE '^[23][0-9a-f]{0,3}:[0-9a-f:]*/[0-9]+$' | sort -u
-}
 
 step() { echo; echo "==> $*"; }
 mkdir -p "$STATE_DIR"
@@ -61,7 +48,8 @@ if ! grep -rqs 'oisf/suricata-stable' /etc/apt/sources.list /etc/apt/sources.lis
     touch "$STATE_DIR/added-ppa"   # so uninstall.sh only removes the PPA if we added it
 fi
 apt-get update
-apt-get install -y suricata iptables curl python3 ndisc6
+install -m 0644 -o root -g root "$SRC/suricata.apt-pin" /etc/apt/preferences.d/suricata-8
+apt-get install -y suricata iptables curl python3
 version=$(suricata -V | grep -o '[0-9][0-9.]*' | head -1)
 echo "Suricata $version installed"
 [[ ${version%%.*} -ge 8 ]] || echo "WARNING: files/suricata.yaml was written for Suricata 8.x; the config test below will tell us if $version accepts it"
@@ -79,28 +67,19 @@ PREV=$(mktemp)
 
 iface=$(ip route show default 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "dev") { print $(i + 1); exit }}')
 
-V6_PREFIXES=("${V6_MANUAL[@]}")
-if [[ $V6_DETECT -eq 1 ]]; then
-    mapfile -t detected < <(detect_ipv6_prefixes "$iface")
-    if [[ ${#detected[@]} -gt 0 ]]; then
-        echo "Detected IPv6 prefix(es) on this network: ${detected[*]}"
-        V6_PREFIXES+=("${detected[@]}")
-    else
-        echo "No global IPv6 prefix detected on this network (HOME_NET keeps ULA/link-local only)"
-    fi
-fi
-V6_EXTRA=""
-[[ ${#V6_PREFIXES[@]} -gt 0 ]] && V6_EXTRA=$(printf ',%s' $(printf '%s\n' "${V6_PREFIXES[@]}" | sort -u))
-
 # af-packet isn't used in NFQUEUE mode, but point it at a real interface so the config stays valid
-sed -e "s/@DEFAULT_IFACE@/${iface:-eth0}/" \
-    -e "s|^\(    HOME_NET: \"\[.*fe80::/10\)\]\"|\1$V6_EXTRA]\"|" \
-    "$SRC/suricata.yaml" > "$CONF.new"
+sed -e "s/@DEFAULT_IFACE@/${iface:-eth0}/" "$SRC/suricata.yaml" > "$CONF.new"
 install -m 0644 -o root -g suricata "$CONF.new" "$CONF"
 rm -f "$CONF.new"
+if [[ ${#EXTRA_NETS[@]} -gt 0 ]]; then
+    printf '%s\n' "# Always in HOME_NET (written by install.sh)" "${EXTRA_NETS[@]}" > /etc/suricata/home-net.extra
+fi
+install -m 0755 -o root -g root "$SRC/suricata-home-net.sh" /usr/local/sbin/suricata-home-net
+/usr/local/sbin/suricata-home-net --no-reload
 grep '^    HOME_NET:' "$CONF"
 install -m 0644 -o root -g root "$SRC/drop.conf" /etc/suricata/drop.conf
 install -m 0644 -o root -g root "$SRC/modify.conf" /etc/suricata/modify.conf
+install -m 0644 -o root -g suricata "$SRC/local.rules" /etc/suricata/local.rules
 
 step "Enabling rule sources (files/rule-sources.conf)"
 suricata-update update-sources
@@ -135,6 +114,13 @@ install -m 0755 -o root -g root "$SRC/suricata-nfqueue-apply.sh" /usr/local/sbin
 install -m 0644 -o root -g root "$SRC/suricata-nfqueue.service" /etc/systemd/system/suricata-nfqueue.service
 install -m 0644 -o root -g root "$SRC/suricata-rules-update.service" /etc/systemd/system/suricata-rules-update.service
 install -m 0644 -o root -g root "$SRC/suricata-rules-update.timer" /etc/systemd/system/suricata-rules-update.timer
+install -m 0644 -o root -g root "$SRC/suricata-home-net.service" /etc/systemd/system/suricata-home-net.service
+install -m 0644 -o root -g root "$SRC/suricata-home-net.timer" /etc/systemd/system/suricata-home-net.timer
+if [[ -d /etc/NetworkManager/dispatcher.d ]]; then
+    install -m 0755 -o root -g root "$SRC/90-suricata-home-net" /etc/NetworkManager/dispatcher.d/90-suricata-home-net
+else
+    echo "NetworkManager not found: HOME_NET is refreshed by the 15-minute timer only"
+fi
 mkdir -p /etc/systemd/system/suricata.service.d
 install -m 0644 -o root -g root "$SRC/suricata-override.conf" /etc/systemd/system/suricata.service.d/override.conf
 # Left over from earlier manual setups; its settings are already in the packaged unit
@@ -146,7 +132,7 @@ systemctl daemon-reload
 systemctl enable suricata-nfqueue.service suricata.service
 systemctl restart suricata-nfqueue.service
 systemctl restart suricata.service
-systemctl enable --now suricata-rules-update.timer
+systemctl enable --now suricata-rules-update.timer suricata-home-net.timer
 
 step "Waiting for Suricata to bind NFQUEUE 0"
 for _ in $(seq 90); do

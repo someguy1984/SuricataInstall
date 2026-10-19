@@ -1,0 +1,10 @@
+[Unit]
+Description=Set Suricata's HOME_NET to this machine's current addresses
+After=suricata.service
+
+[Service]
+Type=oneshot
+# Let a burst of NetworkManager events and IPv6 autoconfiguration settle first,
+# so a network change costs one rule reload rather than several
+ExecStartPre=/bin/sleep 10
+ExecStart=/usr/local/sbin/suricata-home-net

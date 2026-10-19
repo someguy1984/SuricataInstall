@@ -92,15 +92,30 @@ section "Configuration"
 grep -qx '  midstream: true' "$CONF" && pass "stream.midstream is enabled" || warn "stream.midstream is not enabled (re-run ./install.sh?)"
 home=$(grep -m1 '^    HOME_NET:' "$CONF")
 info "${home#    }"
-grep -q 'fc00::/7' <<<"$home" && pass "HOME_NET includes IPv6 ranges" || warn "HOME_NET has no IPv6 ranges (re-run ./install.sh?)"
-# Global IPv6 prefixes this machine routes (e.g. after an ISP prefix change) should be in HOME_NET
-for prefix in $(ip -6 route show 2>/dev/null | awk '{print $1}' | grep -iE '^[23][0-9a-f]{0,3}:[0-9a-f:]*/[0-9]+$' | sort -u); do
-    if grep -qF -- "$prefix" <<<"$home"; then
-        pass "IPv6 prefix $prefix is in HOME_NET"
+if [[ -x /usr/local/sbin/suricata-home-net ]]; then
+    if want_home=$(/usr/local/sbin/suricata-home-net --check); then
+        pass "HOME_NET matches this machine's current addresses"
     else
-        warn "IPv6 prefix $prefix is in use here but not in HOME_NET (re-run ./install.sh)"
+        warn "HOME_NET is out of date for this network; expected:"
+        info "${want_home#    }"
+        info "(fix: sudo systemctl start suricata-home-net.service)"
     fi
-done
+else
+    fail "/usr/local/sbin/suricata-home-net is missing: HOME_NET won't follow network changes (re-run ./install.sh)"
+fi
+systemctl is-active --quiet suricata-home-net.timer && pass "HOME_NET refresh timer is active" \
+    || warn "suricata-home-net.timer is not active (re-run ./install.sh)"
+[[ -x /etc/NetworkManager/dispatcher.d/90-suricata-home-net ]] && pass "NetworkManager hook refreshes HOME_NET on network changes" \
+    || warn "NetworkManager hook not installed: HOME_NET only refreshes every 15 minutes"
+if cmp -s "$SRC/local.rules" /etc/suricata/local.rules; then
+    pass "local.rules matches $SRC/local.rules (plain DNS/DoT leaving the machine is dropped)"
+else
+    warn "/etc/suricata/local.rules is missing or differs from $SRC/local.rules (re-run ./install.sh?)"
+fi
+cmp -s "$SRC/suricata.apt-pin" /etc/apt/preferences.d/suricata-8 && pass "apt keeps Suricata on 8.x" \
+    || warn "Suricata isn't pinned to 8.x: an upgrade to a new major version could stop it starting"
+grep -A1 '^  landlock:' "$CONF" | grep -qx '    enabled: yes' && pass "Landlock sandbox is enabled" \
+    || warn "Landlock sandbox is not enabled"
 if cmp -s "$SRC/drop.conf" /etc/suricata/drop.conf; then
     pass "drop.conf matches $SRC/drop.conf"
 else

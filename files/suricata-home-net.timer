@@ -1,0 +1,9 @@
+[Unit]
+Description=Re-check Suricata's HOME_NET (catches address changes the NetworkManager hook misses)
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=15min
+
+[Install]
+WantedBy=timers.target

@@ -28,7 +28,7 @@ step() { echo; echo "==> $*"; }
 
 # Firewall rules first, so traffic is never queued to a stopped Suricata
 step "Removing NFQUEUE firewall rules"
-systemctl disable --now suricata-rules-update.timer 2>/dev/null
+systemctl disable --now suricata-rules-update.timer suricata-home-net.timer 2>/dev/null
 systemctl disable --now suricata-nfqueue.service 2>/dev/null
 for cmd in iptables ip6tables; do
     command -v $cmd >/dev/null || continue
@@ -50,6 +50,11 @@ step "Removing services and config"
 rm -f /etc/systemd/system/suricata-nfqueue.service \
       /etc/systemd/system/suricata-rules-update.service \
       /etc/systemd/system/suricata-rules-update.timer \
+      /etc/systemd/system/suricata-home-net.service \
+      /etc/systemd/system/suricata-home-net.timer \
+      /etc/NetworkManager/dispatcher.d/90-suricata-home-net \
+      /usr/local/sbin/suricata-home-net \
+      /run/suricata-home-net.lock \
       /etc/systemd/system/suricata.service.d/override.conf \
       /etc/systemd/system/suricata.service.d/network-ordering.conf \
       /usr/local/sbin/suricata-nfqueue-apply.sh \
@@ -57,11 +62,12 @@ rm -f /etc/systemd/system/suricata-nfqueue.service \
       /etc/logrotate.d/suricata
 rmdir /etc/systemd/system/suricata.service.d 2>/dev/null
 systemctl daemon-reload
-systemctl reset-failed suricata.service suricata-nfqueue.service suricata-rules-update.service 2>/dev/null
+systemctl reset-failed suricata.service suricata-nfqueue.service suricata-rules-update.service suricata-home-net.service 2>/dev/null
 
 step "Removing the Suricata package"
 export DEBIAN_FRONTEND=noninteractive
 dpkg -s suricata >/dev/null 2>&1 && apt-get purge -y suricata
+rm -f /etc/apt/preferences.d/suricata-8
 if [[ -f $STATE_DIR/added-ppa ]]; then
     add-apt-repository -r -y ppa:oisf/suricata-stable && echo "Removed the OISF PPA (added by install.sh)"
 fi
