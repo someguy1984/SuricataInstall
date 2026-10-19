@@ -192,6 +192,7 @@ else
 import sys, json, collections
 
 flows = both = v6 = 0
+oneway = collections.Counter()
 events = collections.Counter()
 alerts = collections.Counter()
 blocked = collections.Counter()
@@ -213,6 +214,8 @@ for line in sys.stdin:
             f = e.get("flow", {})
             if f.get("pkts_toserver", 0) and f.get("pkts_toclient", 0):
                 both += 1
+            else:
+                oneway[f'{e.get("dest_ip")}:{e.get("dest_port")}'] += 1
     elif t == "alert":
         a = e["alert"]
         key = (a.get("signature_id"), a.get("signature"))
@@ -232,6 +235,10 @@ if flows:
     pct = 100 * both // flows
     worst = max(worst, res(pct >= 90, f"{pct}% of {flows} recent TCP flows seen in both directions",
                            "FAIL" if pct < 50 else "WARN"))
+    if pct < 90:
+        # One destination soaking up the one-way flows is usually something retrying a host that
+        # never answers (e.g. a stale IP in a config), not Suricata missing the return traffic
+        info("Top one-way destinations: " + ", ".join(f"{k} ({v})" for k, v in oneway.most_common(3)))
 else:
     worst = max(worst, res(False, "No TCP flow records in recent eve.json", "FAIL"))
 worst = max(worst, res(v6 > 0, f"{v6} recent IPv6 flows (any protocol) seen"))
