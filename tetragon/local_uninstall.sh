@@ -36,6 +36,7 @@ rm -f /etc/systemd/system/tetragon-viewer.service \
 	/etc/systemd/system/tetragon-alerts.service \
 	/etc/systemd/system/tetragon.service \
 	/etc/systemd/system/tetragon.service.d/boot-gate.conf \
+	/etc/systemd/system/tetragon.service.d/shutdown.conf \
 	/usr/local/libexec/tetragon-wait-ready \
 	/usr/lib/systemd/system/tetragon.service \
 	/etc/systemd/system/multi-user.target.wants/tetragon.service \

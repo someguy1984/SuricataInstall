@@ -10,10 +10,13 @@
 #   /usr/local/bin/{tetragon,tetra}         official release binaries
 #   /usr/local/lib/tetragon/                BPF objects, bpftool, default config
 #   /etc/systemd/system/tetragon.service    upstream unit, enabled at boot
+#                                           (boot gate drops After=network.target)
 #   /etc/systemd/system/tetragon.service.d/boot-gate.conf
 #                                           starts Tetragon early and holds
 #                                           normal services back until it is
 #                                           recording (see "Boot gate" below)
+#   /etc/systemd/system/tetragon.service.d/shutdown.conf
+#                                           clean stop late in shutdown
 #   /usr/local/libexec/tetragon-wait-ready  readiness check used by the gate
 #   /etc/tetragon/tetragon.conf.d/          our option overrides
 #   /etc/tetragon/tetragon.tp.d/            mirror of ./policies (managed by this
@@ -40,7 +43,7 @@ for arg in "$@"; do
 	--no-viewer) WITH_VIEWER=0 ;;
 	--no-boot-gate) WITH_BOOT_GATE=0 ;;
 	-h | --help)
-		sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'
+		sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'
 		exit 0
 		;;
 	*)
@@ -158,13 +161,23 @@ want=$(find "$ETC/tetragon.tp.d" -maxdepth 1 -name '*.yaml' | wc -l)
 # "Listening for events", i.e. all policies are loaded and events flow.
 # If it is not ready within 90 s boot carries on regardless (the service is
 # left running); if it exits, the unit fails and Restart=on-failure applies.
-# Shutdown needs nothing: DefaultDependencies=no already keeps Tetragon
-# running until systemd's final kill, after every other service has stopped.
+#
+# The network.target ordering has to be removed from the unit file itself. A
+# drop-in cannot clear After= (systemd ignores an empty "After=" for
+# dependency settings), and with it left in place, Before=basic.target forms
+# an ordering cycle (basic.target -> tetragon -> network.target ->
+# wpa_supplicant -> dbus -> basic.target). systemd breaks that cycle by
+# deleting Tetragon's start job, so Tetragon did not start at boot at all.
 GATE_DIR="$UNIT_DIR/tetragon.service.d"
 WAIT_READY=/usr/local/libexec/tetragon-wait-ready
+install -d -m 0755 "$GATE_DIR"
 if ((WITH_BOOT_GATE)); then
 	echo "==> Installing boot gate ($GATE_DIR/boot-gate.conf)"
-	install -d -m 0755 /usr/local/libexec "$GATE_DIR"
+	grep -qx 'After=network.target local-fs.target' "$UNIT_DIR/tetragon.service" ||
+		die "upstream tetragon.service no longer has the expected After= line; review the boot gate before installing (or pass --no-boot-gate)"
+	sed -i 's/^After=network.target local-fs.target$/After=local-fs.target systemd-journald.socket/' \
+		"$UNIT_DIR/tetragon.service"
+	install -d -m 0755 /usr/local/libexec
 	cat >"$WAIT_READY" <<'EOF'
 #!/bin/sh
 # Installed by local_install.sh. Run as ExecStartPost of tetragon.service:
@@ -192,9 +205,8 @@ EOF
 	cat >"$GATE_DIR/boot-gate.conf" <<EOF
 # Installed by $DIR/local_install.sh (remove with --no-boot-gate)
 [Unit]
-# Replace upstream's After=network.target local-fs.target.
-After=
-After=local-fs.target systemd-journald.socket
+# tetragon.service itself was edited to drop After=network.target; see
+# local_install.sh. Without that, this Before= creates a boot ordering cycle.
 Before=basic.target
 
 [Service]
@@ -204,11 +216,35 @@ EOF
 	chmod 0644 "$GATE_DIR/boot-gate.conf"
 else
 	rm -f "$GATE_DIR/boot-gate.conf" "$WAIT_READY"
-	rmdir "$GATE_DIR" 2>/dev/null || true
 fi
+
+# --- Clean shutdown -----------------------------------------------------------
+# With DefaultDependencies=no and nothing else, systemd never stops Tetragon:
+# it is still running when filesystems (including /run/tetragon/cgroup2) are
+# unmounted, then is SIGTERMed together with journald by systemd-shutdown, so
+# its exit is never logged and the event log isn't flushed and closed. Stopping
+# it as part of the shutdown transaction fixes that. Stop order is the reverse
+# of start order, so with the boot gate (Before=basic.target) it still stops
+# only after every normal service has stopped, and before local filesystems
+# and journald go away.
+echo "==> Installing shutdown ordering ($GATE_DIR/shutdown.conf)"
+cat >"$GATE_DIR/shutdown.conf" <<EOF
+# Installed by $DIR/local_install.sh
+[Unit]
+Conflicts=shutdown.target
+Before=shutdown.target
+
+[Service]
+TimeoutStopSec=30
+EOF
+chmod 0644 "$GATE_DIR/shutdown.conf"
 
 # --- Start Tetragon ---------------------------------------------------------
 systemctl daemon-reload
+if ((WITH_BOOT_GATE)) &&
+	systemctl show -p After --value tetragon | tr ' ' '\n' | grep -qx 'network.target'; then
+	die "tetragon.service is still ordered after network.target; with the boot gate this is a boot ordering cycle and Tetragon would not start at boot"
+fi
 systemctl reset-failed tetragon 2>/dev/null || true
 since="$(date '+%Y-%m-%d %H:%M:%S')"
 echo "==> Enabling and starting tetragon.service"
@@ -286,6 +322,10 @@ MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallFilter=~@privileged @resources
+# tetra is a Go binary, and the Go runtime raises RLIMIT_NOFILE at startup with
+# prlimit64 (in @resources). The default filter action kills the process with
+# SIGSYS (status=31/SYS crash loop); return EPERM instead, which Go ignores.
+SystemCallErrorNumber=EPERM
 
 [Install]
 WantedBy=multi-user.target
