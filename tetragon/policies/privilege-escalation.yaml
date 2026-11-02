@@ -3,7 +3,14 @@
 # reduced to the uid calls (the gid variants almost always accompany them).
 #
 # Expect entries for sudo, su, pkexec and cron. Anything else switching to
-# root is worth a look. Rate-limited to one event per process+args per minute.
+# root is worth a look. Rate-limited to one event per process+args per minute;
+# scope "process" so multi-threaded Go programs (which call setuid on every
+# thread) log once rather than once per thread.
+#
+# Only the host user namespace is watched. Rootless Docker's runc, bubblewrap,
+# podman etc. "become root" inside their own user namespace, which gives no
+# privilege on the host (it stays uid 1000), and Docker health checks would
+# otherwise log this every few seconds.
 #
 # Not included (too noisy on a desktop): create_user_ns, which browsers,
 # snaps and bubblewrap do constantly, and capset, which every systemd
@@ -23,16 +30,22 @@ spec:
       type: "int"
     returnArg:
       index: 0
-      type: "int"
+      type: "int64"
     selectors:
     - matchArgs:
       - index: 0
         operator: "Equal"
         values:
         - "0"
+      matchNamespaces:
+      - namespace: User
+        operator: In
+        values:
+        - "host_ns"
       matchActions:
       - action: Post
         rateLimit: "1m"
+        rateLimitScope: "process"
   - call: "__sys_setreuid"
     syscall: false
     return: true
@@ -44,16 +57,22 @@ spec:
       type: "int"
     returnArg:
       index: 0
-      type: "int"
+      type: "int64"
     selectors:
     - matchArgs:
       - index: 1 # effective uid
         operator: "Equal"
         values:
         - "0"
+      matchNamespaces:
+      - namespace: User
+        operator: In
+        values:
+        - "host_ns"
       matchActions:
       - action: Post
         rateLimit: "1m"
+        rateLimitScope: "process"
   - call: "__sys_setresuid"
     syscall: false
     return: true
@@ -67,16 +86,22 @@ spec:
       type: "int"
     returnArg:
       index: 0
-      type: "int"
+      type: "int64"
     selectors:
     - matchArgs:
       - index: 1 # effective uid
         operator: "Equal"
         values:
         - "0"
+      matchNamespaces:
+      - namespace: User
+        operator: In
+        values:
+        - "host_ns"
       matchActions:
       - action: Post
         rateLimit: "1m"
+        rateLimitScope: "process"
   - call: "__sys_setfsuid"
     syscall: false
     return: true
@@ -86,13 +111,19 @@ spec:
       type: "int"
     returnArg:
       index: 0
-      type: "int"
+      type: "int64"
     selectors:
     - matchArgs:
       - index: 0
         operator: "Equal"
         values:
         - "0"
+      matchNamespaces:
+      - namespace: User
+        operator: In
+        values:
+        - "host_ns"
       matchActions:
       - action: Post
         rateLimit: "1m"
+        rateLimitScope: "process"
