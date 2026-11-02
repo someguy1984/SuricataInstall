@@ -1,0 +1,90 @@
+# Observe-only: log writes to places where malware installs itself to survive
+# a reboot or a new login (cron, systemd units, autostart entries, shell
+# startup files, preload, udev and module autoloading, apt sources).
+#
+# Only writes (MAY_WRITE, 0x02) are logged, rate-limited to one event per
+# process+file per minute because every write() call triggers the hook.
+# Package upgrades (dpkg, unattended-upgrades) will show up here too.
+#
+# Limitation: this hooks writes to an already open file. A file written under
+# another name and then renamed into place is only seen if the temporary name
+# also matches a prefix below (true for the directories, not for single files
+# such as ~/.bashrc saved atomically by some editors).
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "persistence"
+spec:
+  kprobes:
+  - call: "security_file_permission"
+    syscall: false
+    return: true
+    message: "Write to an autostart / persistence location"
+    args:
+    - index: 0
+      type: "file"
+    - index: 1
+      type: "int" # 0x04 is MAY_READ, 0x02 is MAY_WRITE
+    returnArg:
+      index: 0
+      type: "int"
+    selectors:
+    - matchArgs:
+      - index: 0
+        operator: "Prefix"
+        values:
+        # scheduled jobs
+        - "/etc/cron"
+        - "/etc/anacrontab"
+        - "/var/spool/cron/"
+        # services and login autostart
+        - "/etc/systemd/system/"
+        - "/etc/systemd/user/"
+        - "/home/j/.config/systemd/user/"
+        - "/etc/xdg/autostart/"
+        - "/home/j/.config/autostart/"
+        - "/etc/rc.local"
+        # shell startup files
+        - "/etc/profile"
+        - "/etc/bash.bashrc"
+        - "/etc/environment"
+        - "/home/j/.bashrc"
+        - "/home/j/.profile"
+        - "/home/j/.bash_profile"
+        - "/home/j/.bash_logout"
+        # library preloading, device and module hooks
+        - "/etc/ld.so.preload"
+        - "/etc/ld.so.conf"
+        - "/etc/udev/rules.d/"
+        - "/etc/modules-load.d/"
+        - "/etc/modprobe.d/"
+        # remote login keys
+        - "/home/j/.ssh/authorized_keys"
+        # package sources and signing keys
+        - "/etc/apt/sources.list"
+        - "/etc/apt/trusted.gpg"
+        - "/etc/apt/keyrings/"
+        # hooks that run as root automatically
+        - "/etc/apt/apt.conf.d/"            # APT::Update::Pre-Invoke etc.
+        - "/etc/update-motd.d/"             # runs on every login
+        - "/etc/NetworkManager/dispatcher.d/"
+        - "/etc/init.d/"
+        - "/etc/systemd/system-generators/"
+        - "/usr/lib/systemd/system/"        # also written by dpkg upgrades
+        # authentication stack (PAM backdoors) and policy overrides
+        - "/etc/pam.d/"
+        - "/etc/security/"
+        - "/etc/polkit-1/rules.d/"
+        # root's shell startup files
+        - "/root/.bashrc"
+        - "/root/.profile"
+        # per-user environment and desktop autostart
+        - "/home/j/.config/environment.d/"
+        - "/home/j/.local/share/applications/"
+      - index: 1
+        operator: "Mask"
+        values:
+        - "2" # MAY_WRITE
+      matchActions:
+      - action: Post
+        rateLimit: "1m"

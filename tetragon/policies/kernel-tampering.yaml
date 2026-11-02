@@ -1,0 +1,81 @@
+# Observe-only: log techniques that malware and rootkits use to reach into the
+# kernel or into other processes. Complements monitor-kernel-modules.yaml.
+#
+#   bpf_check     an eBPF program being loaded. Tetragon itself, systemd and
+#                 runc load programs routinely, so they are excluded below.
+#   security_ptrace_access_check
+#                 one process gaining attach-level access to another, used to
+#                 inject code or read secrets from memory. This is the kernel's
+#                 permission check (ptrace_may_access), not the syscall, so it
+#                 catches every route there, not just ptrace(2):
+#                   - PTRACE_ATTACH / PTRACE_SEIZE, from 64- and 32-bit binaries
+#                     (a hook on the sys_ptrace syscall misses __ia32_sys_ptrace)
+#                   - process_vm_readv / process_vm_writev
+#                   - opening /proc/<pid>/mem
+#                   - pidfd_getfd (stealing another process's file descriptors)
+#                 Only PTRACE_MODE_ATTACH checks are logged; the read-only checks
+#                 that ps/top make on every /proc/<pid> are skipped. A process
+#                 touching itself never reaches this hook. The event is the
+#                 attempt: Yama or capabilities may still deny it afterwards.
+#   security_ptrace_traceme
+#                 the reverse direction: a process calling PTRACE_TRACEME to let
+#                 its parent control it (an anti-debugging and injection trick).
+#   gdb, strace and crash reporters show up in both, which is expected.
+#
+# Based on examples/policylibrary/bpf.yaml and examples/tracingpolicy/sys_ptrace.yaml.
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "kernel-tampering"
+spec:
+  kprobes:
+  - call: "bpf_check"
+    syscall: false
+    message: "eBPF program loaded"
+    args:
+    - index: 1
+      type: "bpf_attr"
+    selectors:
+    - matchBinaries:
+      - operator: "NotIn"
+        values:
+        - "/usr/bin/tetragon"       # Docker image (run.sh)
+        - "/usr/local/bin/tetragon" # native install (local_install.sh)
+        - "/usr/lib/systemd/systemd"
+        - "/usr/bin/runc"
+      matchActions:
+      - action: Post
+        rateLimit: "1m"
+  - call: "security_ptrace_access_check"
+    syscall: false
+    message: "Process requested attach access to another process"
+    args:
+    - index: 0 # struct task_struct *child: the target
+      type: "int"
+      resolve: "tgid"
+      label: "target_pid"
+    - index: 0
+      type: "string"
+      resolve: "comm"
+      label: "target_comm"
+    - index: 1 # unsigned int mode
+      type: "uint32"
+      label: "mode"
+    selectors:
+    - matchArgs:
+      - args: [2]
+        operator: "Mask"
+        values:
+        - "0x2" # PTRACE_MODE_ATTACH
+  - call: "security_ptrace_traceme"
+    syscall: false
+    message: "Process asked to be traced by its parent (PTRACE_TRACEME)"
+    args:
+    - index: 0 # struct task_struct *parent: the new tracer
+      type: "int"
+      resolve: "tgid"
+      label: "tracer_pid"
+    - index: 0
+      type: "string"
+      resolve: "comm"
+      label: "tracer_comm"

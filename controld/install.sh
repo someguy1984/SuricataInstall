@@ -1,7 +1,8 @@
 #!/bin/bash
 # Install the ctrld DNS lockdown. Run as root from this folder.
 #
-#   ./install.sh                  block direct DNS, sandbox ctrld, lock browser DoH
+#   ./install.sh                  block direct DNS and public DoH resolvers, sandbox ctrld,
+#                                 lock browser DoH, make ctrld's config and logs root-only
 #   MODE=redirect ./install.sh    redirect hard-coded IPv4 resolvers to ctrld instead of refusing
 #   HARDEN=0 ./install.sh         skip the ctrld sandbox drop-in
 #   BROWSERS=0 ./install.sh       skip the Firefox/Chromium policies
@@ -37,6 +38,23 @@ systemctl is-active --quiet ctrld || die "ctrld is not running; fix that first s
 resolves || die "ctrld is running but not answering on 127.0.0.1:53; not locking DNS to it"
 echo "ctrld is up and answering"
 mkdir -p "$STATE"
+
+say "Securing ctrld's binary, config and logs"
+# ctrld runs as root, so nothing else needs to read its config (it holds the profile ID) or
+# be able to replace its binary; the logs hold every domain looked up
+chown root:root /usr/local/bin/ctrld
+chmod 0755 /usr/local/bin/ctrld
+chown -R root:root /etc/controld
+chmod 0700 /etc/controld
+find /etc/controld -type f -exec chmod 0600 {} +
+for f in /var/log/ctrld.log /var/log/ctrld.err.log; do
+    [ -e "$f" ] && chown root:adm "$f" && chmod 0640 "$f"
+done
+install -m 0644 -o root -g root "$HERE/files/ctrld.logrotate" /etc/logrotate.d/ctrld
+# Re-applies those permissions at every boot, in case something resets them
+install -m 0644 -o root -g root "$HERE/files/ctrld-logs.tmpfiles" /etc/tmpfiles.d/ctrld-logs.conf
+systemd-tmpfiles --create /etc/tmpfiles.d/ctrld-logs.conf
+ls -ld /etc/controld /var/log/ctrld*.log
 
 say "Firewall lockdown (mode=$MODE)"
 install -m 0755 -o root -g root "$HERE/files/dns-lockdown.sh" /usr/local/sbin/dns-lockdown.sh

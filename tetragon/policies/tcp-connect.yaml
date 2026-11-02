@@ -1,0 +1,29 @@
+# Observe-only: log outbound TCP connections (who connected where).
+# Trimmed version of examples/tracingpolicy/tcp-connect.yaml without the
+# very noisy tcp_sendmsg/tcp_close probes.
+#
+# Connections that never leave this machine are filtered out in the kernel:
+#   127.0.0.0/8, ::1     loopback
+#   10.5.0.0/24          the-profit-center-wrapper compose network ("share")
+#   172.17.0.0/16        default Docker bridge
+# Connections to your LAN (192.168.x.x) and the internet are still logged.
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "tcp-connect"
+spec:
+  kprobes:
+  - call: "tcp_connect"
+    syscall: false
+    args:
+    - index: 0
+      type: "sock"
+    selectors:
+    - matchArgs:
+      - index: 0
+        operator: "NotDAddr"
+        values:
+        - "127.0.0.0/8"
+        - "::1/128"
+        - "10.5.0.0/24"
+        - "172.17.0.0/16"

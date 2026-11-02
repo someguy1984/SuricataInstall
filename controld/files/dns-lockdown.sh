@@ -3,8 +3,10 @@
 #
 # Builds a DNSLOCK chain in the filter table (IPv4 + IPv6), jumped to from OUTPUT
 # position 1, that refuses plain DNS (53), DoT/DoQ (853), mDNS (5353) and LLMNR (5355)
-# to anything off-box. Loopback (i.e. ctrld on 127.0.0.1:53) and ctrld's own
-# cgroup are exempt.
+# to anything off-box, plus HTTPS/QUIC (443) to well-known public DoH resolvers'
+# fixed IPs, so apps can't bypass ctrld with their own DNS-over-HTTPS. Loopback
+# (i.e. ctrld on 127.0.0.1:53) and ctrld's own cgroup are exempt. Suricata's
+# local.rules block the same resolvers by name (SNI) for the ones without fixed IPs.
 #
 # MODE=redirect (in /etc/default/dns-lockdown) additionally rewrites IPv4 port-53
 # traffic to 127.0.0.1:53 in the nat table, so apps with hard-coded resolvers
@@ -22,6 +24,11 @@ CHAIN=DNSLOCK
 CGROUP=system.slice/ctrld.service
 MODE=block
 [ -r /etc/default/dns-lockdown ] && . /etc/default/dns-lockdown
+
+# Anycast IPs that serve nothing but public DNS (Cloudflare, Google, Quad9, OpenDNS,
+# AdGuard, CleanBrowsing, Mullvad, DNS.SB). ctrld's upstream (Control D) is not listed.
+DOH_V4=1.1.1.1,1.0.0.1,1.1.1.2,1.0.0.2,1.1.1.3,1.0.0.3,8.8.8.8,8.8.4.4,9.9.9.9,149.112.112.112,9.9.9.10,149.112.112.10,9.9.9.11,149.112.112.11,208.67.222.222,208.67.220.220,208.67.222.123,208.67.220.123,94.140.14.14,94.140.15.15,94.140.14.15,94.140.15.16,185.228.168.9,185.228.169.9,185.228.168.168,185.228.169.168,194.242.2.2,194.242.2.3,194.242.2.4,194.242.2.5,194.242.2.6,194.242.2.9,185.222.222.222,45.11.45.11
+DOH_V6=2606:4700:4700::1111,2606:4700:4700::1001,2606:4700:4700::1112,2606:4700:4700::1002,2606:4700:4700::1113,2606:4700:4700::1003,2001:4860:4860::8888,2001:4860:4860::8844,2620:fe::fe,2620:fe::9,2620:fe::10,2620:fe::fe:10,2620:fe::11,2620:fe::fe:11,2620:119:35::35,2620:119:53::53,2a10:50c0::ad1:ff,2a10:50c0::ad2:ff
 
 log() { echo "dns-lockdown: $*"; logger -t dns-lockdown -- "$*" 2>/dev/null || true; }
 
@@ -52,6 +59,11 @@ build_filter() {
         $cmd -A $CHAIN -p $proto --dport 5355 -j DROP || return 1
     done
     $cmd -A $CHAIN -p udp --dport 5353 -j DROP || return 1
+    local doh=$DOH_V4
+    [ "$cmd" = ip6tables ] && doh=$DOH_V6
+    # tcp-reset / port-unreachable so a blocked DoH client fails over at once instead of hanging
+    $cmd -A $CHAIN -p tcp --dport 443 -d "$doh" -j REJECT --reject-with tcp-reset || return 1
+    $cmd -A $CHAIN -p udp --dport 443 -d "$doh" -j REJECT || return 1
     $cmd -I OUTPUT 1 -j $CHAIN || return 1
 }
 

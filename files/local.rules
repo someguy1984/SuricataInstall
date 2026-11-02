@@ -10,3 +10,40 @@ drop udp $HOME_NET any -> $EXTERNAL_NET 53 (msg:"LOCAL Plain DNS (UDP) leaving t
 drop tcp $HOME_NET any -> $EXTERNAL_NET 53 (msg:"LOCAL Plain DNS (TCP) leaving this machine"; classtype:policy-violation; sid:9000002; rev:1;)
 drop tcp $HOME_NET any -> $EXTERNAL_NET 853 (msg:"LOCAL DNS-over-TLS leaving this machine (not ctrld)"; classtype:policy-violation; sid:9000003; rev:1;)
 drop udp $HOME_NET any -> $EXTERNAL_NET 853 (msg:"LOCAL DNS-over-QUIC leaving this machine (not ctrld)"; classtype:policy-violation; sid:9000004; rev:1;)
+
+# DoH bypass: apps that bring their own DNS-over-HTTPS resolver skip ctrld (and so the Control D
+# profile) entirely, over ordinary port 443. Drop TLS (DoH) and QUIC (DoH3) connections whose SNI
+# is a well-known public resolver; subdomains match too (dotprefix), e.g. mozilla.cloudflare-dns.com.
+# ctrld's own upstream, dns.controld.com, is deliberately not listed. The dns-lockdown firewall
+# (controld/) also rejects 443 to these resolvers' fixed IPs, which covers connections that hide
+# their SNI (ECH). Add resolvers here as they turn up.
+drop tls $HOME_NET any -> $EXTERNAL_NET any (msg:"LOCAL DoH bypass to public resolver dns.google"; tls.sni; dotprefix; content:".dns.google"; endswith; nocase; classtype:policy-violation; sid:9000101; rev:1;)
+drop quic $HOME_NET any -> $EXTERNAL_NET any (msg:"LOCAL DoH3 bypass to public resolver dns.google"; quic.sni; dotprefix; content:".dns.google"; endswith; nocase; classtype:policy-violation; sid:9000201; rev:1;)
+drop tls $HOME_NET any -> $EXTERNAL_NET any (msg:"LOCAL DoH bypass to public resolver cloudflare-dns.com"; tls.sni; dotprefix; content:".cloudflare-dns.com"; endswith; nocase; classtype:policy-violation; sid:9000102; rev:1;)
+drop quic $HOME_NET any -> $EXTERNAL_NET any (msg:"LOCAL DoH3 bypass to public resolver cloudflare-dns.com"; quic.sni; dotprefix; content:".cloudflare-dns.com"; endswith; nocase; classtype:policy-violation; sid:9000202; rev:1;)
+drop tls $HOME_NET any -> $EXTERNAL_NET any (msg:"LOCAL DoH bypass to public resolver one.one.one.one"; tls.sni; dotprefix; content:".one.one.one.one"; endswith; nocase; classtype:policy-violation; sid:9000103; rev:1;)
+drop quic $HOME_NET any -> $EXTERNAL_NET any (msg:"LOCAL DoH3 bypass to public resolver one.one.one.one"; quic.sni; dotprefix; content:".one.one.one.one"; endswith; nocase; classtype:policy-violation; sid:9000203; rev:1;)
+drop tls $HOME_NET any -> $EXTERNAL_NET any (msg:"LOCAL DoH bypass to public resolver quad9.net"; tls.sni; dotprefix; content:".quad9.net"; endswith; nocase; classtype:policy-violation; sid:9000104; rev:1;)
+drop quic $HOME_NET any -> $EXTERNAL_NET any (msg:"LOCAL DoH3 bypass to public resolver quad9.net"; quic.sni; dotprefix; content:".quad9.net"; endswith; nocase; classtype:policy-violation; sid:9000204; rev:1;)
+drop tls $HOME_NET any -> $EXTERNAL_NET any (msg:"LOCAL DoH bypass to public resolver doh.opendns.com"; tls.sni; dotprefix; content:".doh.opendns.com"; endswith; nocase; classtype:policy-violation; sid:9000105; rev:1;)
+drop quic $HOME_NET any -> $EXTERNAL_NET any (msg:"LOCAL DoH3 bypass to public resolver doh.opendns.com"; quic.sni; dotprefix; content:".doh.opendns.com"; endswith; nocase; classtype:policy-violation; sid:9000205; rev:1;)
+drop tls $HOME_NET any -> $EXTERNAL_NET any (msg:"LOCAL DoH bypass to public resolver dns.adguard-dns.com"; tls.sni; dotprefix; content:".dns.adguard-dns.com"; endswith; nocase; classtype:policy-violation; sid:9000106; rev:1;)
+drop quic $HOME_NET any -> $EXTERNAL_NET any (msg:"LOCAL DoH3 bypass to public resolver dns.adguard-dns.com"; quic.sni; dotprefix; content:".dns.adguard-dns.com"; endswith; nocase; classtype:policy-violation; sid:9000206; rev:1;)
+drop tls $HOME_NET any -> $EXTERNAL_NET any (msg:"LOCAL DoH bypass to public resolver dns.adguard.com"; tls.sni; dotprefix; content:".dns.adguard.com"; endswith; nocase; classtype:policy-violation; sid:9000107; rev:1;)
+drop quic $HOME_NET any -> $EXTERNAL_NET any (msg:"LOCAL DoH3 bypass to public resolver dns.adguard.com"; quic.sni; dotprefix; content:".dns.adguard.com"; endswith; nocase; classtype:policy-violation; sid:9000207; rev:1;)
+drop tls $HOME_NET any -> $EXTERNAL_NET any (msg:"LOCAL DoH bypass to public resolver doh.cleanbrowsing.org"; tls.sni; dotprefix; content:".doh.cleanbrowsing.org"; endswith; nocase; classtype:policy-violation; sid:9000108; rev:1;)
+drop quic $HOME_NET any -> $EXTERNAL_NET any (msg:"LOCAL DoH3 bypass to public resolver doh.cleanbrowsing.org"; quic.sni; dotprefix; content:".doh.cleanbrowsing.org"; endswith; nocase; classtype:policy-violation; sid:9000208; rev:1;)
+drop tls $HOME_NET any -> $EXTERNAL_NET any (msg:"LOCAL DoH bypass to public resolver dns.nextdns.io"; tls.sni; dotprefix; content:".dns.nextdns.io"; endswith; nocase; classtype:policy-violation; sid:9000109; rev:1;)
+drop quic $HOME_NET any -> $EXTERNAL_NET any (msg:"LOCAL DoH3 bypass to public resolver dns.nextdns.io"; quic.sni; dotprefix; content:".dns.nextdns.io"; endswith; nocase; classtype:policy-violation; sid:9000209; rev:1;)
+drop tls $HOME_NET any -> $EXTERNAL_NET any (msg:"LOCAL DoH bypass to public resolver dns.mullvad.net"; tls.sni; dotprefix; content:".dns.mullvad.net"; endswith; nocase; classtype:policy-violation; sid:9000110; rev:1;)
+drop quic $HOME_NET any -> $EXTERNAL_NET any (msg:"LOCAL DoH3 bypass to public resolver dns.mullvad.net"; quic.sni; dotprefix; content:".dns.mullvad.net"; endswith; nocase; classtype:policy-violation; sid:9000210; rev:1;)
+drop tls $HOME_NET any -> $EXTERNAL_NET any (msg:"LOCAL DoH bypass to public resolver doh.mullvad.net"; tls.sni; dotprefix; content:".doh.mullvad.net"; endswith; nocase; classtype:policy-violation; sid:9000111; rev:1;)
+drop quic $HOME_NET any -> $EXTERNAL_NET any (msg:"LOCAL DoH3 bypass to public resolver doh.mullvad.net"; quic.sni; dotprefix; content:".doh.mullvad.net"; endswith; nocase; classtype:policy-violation; sid:9000211; rev:1;)
+drop tls $HOME_NET any -> $EXTERNAL_NET any (msg:"LOCAL DoH bypass to public resolver doh.dns.sb"; tls.sni; dotprefix; content:".doh.dns.sb"; endswith; nocase; classtype:policy-violation; sid:9000112; rev:1;)
+drop quic $HOME_NET any -> $EXTERNAL_NET any (msg:"LOCAL DoH3 bypass to public resolver doh.dns.sb"; quic.sni; dotprefix; content:".doh.dns.sb"; endswith; nocase; classtype:policy-violation; sid:9000212; rev:1;)
+drop tls $HOME_NET any -> $EXTERNAL_NET any (msg:"LOCAL DoH bypass to public resolver freedns.controld.com"; tls.sni; dotprefix; content:".freedns.controld.com"; endswith; nocase; classtype:policy-violation; sid:9000113; rev:1;)
+drop quic $HOME_NET any -> $EXTERNAL_NET any (msg:"LOCAL DoH3 bypass to public resolver freedns.controld.com"; quic.sni; dotprefix; content:".freedns.controld.com"; endswith; nocase; classtype:policy-violation; sid:9000213; rev:1;)
+drop tls $HOME_NET any -> $EXTERNAL_NET any (msg:"LOCAL DoH bypass to public resolver dns.alidns.com"; tls.sni; dotprefix; content:".dns.alidns.com"; endswith; nocase; classtype:policy-violation; sid:9000114; rev:1;)
+drop quic $HOME_NET any -> $EXTERNAL_NET any (msg:"LOCAL DoH3 bypass to public resolver dns.alidns.com"; quic.sni; dotprefix; content:".dns.alidns.com"; endswith; nocase; classtype:policy-violation; sid:9000214; rev:1;)
+drop tls $HOME_NET any -> $EXTERNAL_NET any (msg:"LOCAL DoH bypass to public resolver doh.pub"; tls.sni; dotprefix; content:".doh.pub"; endswith; nocase; classtype:policy-violation; sid:9000115; rev:1;)
+drop quic $HOME_NET any -> $EXTERNAL_NET any (msg:"LOCAL DoH3 bypass to public resolver doh.pub"; quic.sni; dotprefix; content:".doh.pub"; endswith; nocase; classtype:policy-violation; sid:9000215; rev:1;)

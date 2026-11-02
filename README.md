@@ -259,7 +259,10 @@ Converted to drop (`files/drop.conf`):
 Local rules (`files/local.rules`): plain DNS (53) and DNS-over-TLS/QUIC (853) leaving the machine
 are dropped. ctrld resolves over DoH (443), so this only stops leaks, such as ctrld's own plain-DNS
 fallback when its upstream fails, which the DNSLOCK firewall chain exempts. A captive portal that
-needs its own DNS won't resolve while this is in place.
+needs its own DNS won't resolve while this is in place. They also drop TLS (DoH) and QUIC (DoH3) connections whose
+SNI is a well-known public DoH resolver (dns.google, cloudflare-dns.com, quad9.net, NextDNS, AdGuard,
+Mullvad, ...), so apps can't bypass ctrld with their own resolver; `controld/` blocks the same
+resolvers' fixed IPs in the firewall, which also covers connections that hide their SNI.
 
 Everything else alerts only. With all sources that's about 90k enabled rules, about 67k of them
 set to drop. Loading them takes about 50 s and about 800 MB of RAM, and a live reload briefly

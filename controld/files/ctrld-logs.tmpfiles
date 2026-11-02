@@ -1,0 +1,6 @@
+# Installed by controld/install.sh as /etc/tmpfiles.d/ctrld-logs.conf
+# Re-applies private permissions to ctrld's logs at every boot (systemd creates them 0644
+# if they're ever deleted). They hold the domains looked up.
+z /var/log/ctrld.log     0640 root adm -
+z /var/log/ctrld.err.log 0640 root adm -
+z /etc/controld          0700 root root -

@@ -1,0 +1,20 @@
+# Events matching any line below are NOT written to tetragon.log (and so never
+# reach the web viewer). Within a line, all fields must match (AND); separate
+# lines are alternatives (OR). Lines starting with # are ignored by run.sh.
+# Field reference: docs/content/en/docs/concepts/events.md ("export filters").
+#
+# Process exits: every exec already logs the process; exits double the volume.
+{"event_set": ["PROCESS_EXIT"]}
+#
+# Rootless Docker plumbing that runs every time a container or health check starts.
+{"binary_regex": ["^/usr/bin/runc$", "containerd-shim-runc-v2$"]}
+#
+# Docker health checks in the-profit-center-wrapper (mysql every 5s, mailpit every 15s).
+{"arguments_regex": ["SHOW DATABASES;", "^readyz$"]}
+#
+# GNOME's sandboxed image decoders (glycin), launched by bubblewrap.
+{"binary_regex": ["^/usr/libexec/glycin-loaders/"]}
+{"binary_regex": ["^/usr/bin/bwrap$"], "arguments_regex": ["/usr/libexec/glycin-loaders/"]}
+#
+# Firefox's own web traffic. Delete this line to see every site connection again.
+{"policy_names": ["tcp-connect"], "binary_regex": ["^/snap/firefox/"]}

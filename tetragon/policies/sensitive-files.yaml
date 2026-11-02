@@ -1,0 +1,108 @@
+# Observe-only: log access to a short list of sensitive files.
+# Based on examples/tracingpolicy/filename_monitoring.yaml, narrowed from all
+# of /etc/ (very noisy) to credential and access-control files.
+#
+# Selectors are OR'ed:
+#   1. any access by a program that is NOT a normal authentication tool
+#   2. any write (MAY_WRITE, 0x02), by anyone; this list also includes
+#      /etc/passwd and /etc/group, which everything reads but little writes
+#   3. any access to your own private keys and credentials by a program that
+#      is NOT the tool that owns them (catches credential stealers)
+# so routine reads by sudo and the PAM password helper are not logged.
+# ("/etc/sudoers" is a prefix, so it also covers /etc/sudoers.d/.)
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "sensitive-files"
+spec:
+  kprobes:
+  - call: "security_file_permission"
+    syscall: false
+    return: true
+    args:
+    - index: 0
+      type: "file" # (struct file *) used for getting the path
+    - index: 1
+      type: "int" # 0x04 is MAY_READ, 0x02 is MAY_WRITE
+    returnArg:
+      index: 0
+      type: "int"
+    selectors:
+    - matchArgs:
+      - index: 0
+        operator: "Prefix"
+        values:
+        - "/etc/shadow"
+        - "/etc/gshadow"
+        - "/etc/sudoers"
+        - "/etc/ssh/sshd_config"
+        - "/root/.ssh/"
+      matchBinaries:
+      - operator: "NotIn"
+        values:
+        - "/usr/bin/sudo"
+        - "/usr/sbin/unix_chkpwd"
+        - "/usr/bin/su"
+        - "/usr/bin/login"
+        - "/usr/sbin/sshd"
+        - "/usr/sbin/cron"
+    - matchArgs:
+      - index: 0
+        operator: "Prefix"
+        values:
+        - "/etc/shadow"
+        - "/etc/gshadow"
+        - "/etc/sudoers"
+        - "/etc/ssh/sshd_config"
+        - "/root/.ssh/"
+        - "/etc/passwd"
+        - "/etc/group"
+      - index: 1
+        operator: "Mask"
+        values:
+        - "2" # MAY_WRITE
+    - matchArgs:
+      - index: 0
+        operator: "Prefix"
+        values:
+        - "/home/j/.ssh/id_"
+        - "/home/j/.gnupg/private-keys-v1.d/"
+        - "/home/j/.docker/config.json"
+        - "/home/j/.aws/credentials"
+        - "/home/j/.kube/config"
+        - "/home/j/.git-credentials"
+      matchBinaries:
+      - operator: "NotIn"
+        values:
+        - "/usr/bin/ssh"
+        - "/usr/bin/ssh-add"
+        - "/usr/bin/ssh-agent"
+        - "/usr/bin/ssh-keygen"
+        - "/usr/bin/gpg"
+        - "/usr/bin/gpg-agent"
+        - "/usr/bin/gnome-keyring-daemon"
+        - "/usr/bin/docker"
+        - "/usr/bin/git"
+        - "/usr/lib/git-core/git-remote-http" # git-remote-https symlinks here
+        - "/usr/lib/git-core/git" # git-credential-* symlink here
+  - call: "security_path_truncate"
+    syscall: false
+    return: true
+    args:
+    - index: 0
+      type: "path" # (struct path *) used for getting the path
+    returnArg:
+      index: 0
+      type: "int"
+    selectors:
+    - matchArgs:
+      - index: 0
+        operator: "Prefix"
+        values:
+        - "/etc/shadow"
+        - "/etc/gshadow"
+        - "/etc/sudoers"
+        - "/etc/ssh/sshd_config"
+        - "/root/.ssh/"
+        - "/etc/passwd"
+        - "/etc/group"

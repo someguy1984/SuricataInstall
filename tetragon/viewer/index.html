@@ -1,0 +1,256 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tetragon Events</title>
+<style>
+  :root {
+    --bg: #f7f7f5; --panel: #ffffff; --fg: #1d1d1b; --muted: #6b6b66;
+    --line: #e4e4df; --hover: #f0f0ec; --accent: #2f6fdb;
+    --exec: #1f8a4c; --exit: #8a8a85; --kprobe: #b35c00; --alert: #c2332b;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #151514; --panel: #1d1d1c; --fg: #e8e8e3; --muted: #9a9a94;
+      --line: #2e2e2c; --hover: #262624; --accent: #7aa7ff;
+      --exec: #5cc98a; --exit: #8a8a85; --kprobe: #f0a050; --alert: #ff7a70;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+         font: 14px/1.4 system-ui, sans-serif; }
+  header { position: sticky; top: 0; z-index: 1; background: var(--panel);
+           border-bottom: 1px solid var(--line); padding: 10px 16px;
+           display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: center; }
+  h1 { font-size: 16px; margin: 0 8px 0 0; }
+  #status { font-size: 12px; color: var(--muted); }
+  #status.live::before { content: "● "; color: var(--exec); }
+  #status.down::before { content: "● "; color: var(--alert); }
+  input[type=search] { flex: 1 1 220px; min-width: 0; padding: 6px 10px;
+           border: 1px solid var(--line); border-radius: 6px;
+           background: var(--bg); color: var(--fg); font: inherit; }
+  label { font-size: 13px; color: var(--muted); white-space: nowrap; cursor: pointer; }
+  button { font: inherit; font-size: 13px; padding: 5px 10px; cursor: pointer;
+           border: 1px solid var(--line); border-radius: 6px;
+           background: var(--bg); color: var(--fg); }
+  #counts { font-size: 12px; color: var(--muted); width: 100%; }
+  main { padding: 0 16px 24px; }
+  table { width: 100%; border-collapse: collapse; table-layout: fixed;
+          font: 12.5px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  th { text-align: left; font-weight: 600; color: var(--muted);
+       padding: 8px 6px; border-bottom: 1px solid var(--line); }
+  td { padding: 4px 6px; border-bottom: 1px solid var(--line);
+       vertical-align: top; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  tr.ev { cursor: pointer; }
+  tr.ev:hover td { background: var(--hover); }
+  tr.ev.open td { white-space: normal; word-break: break-all; }
+  td.t { width: 7.5em; color: var(--muted); }
+  td.k { width: 9em; font-weight: 600; }
+  td.p { width: 22em; }
+  td.u { width: 5em; color: var(--muted); }
+  .exec { color: var(--exec); } .exit { color: var(--exit); }
+  .kprobe { color: var(--kprobe); } .alert { color: var(--alert); }
+  .dim { color: var(--muted); }
+  pre { margin: 4px 0 8px; padding: 8px; background: var(--bg);
+        border: 1px solid var(--line); border-radius: 6px;
+        white-space: pre-wrap; word-break: break-all; font-size: 12px; }
+  #empty { color: var(--muted); padding: 32px 0; text-align: center; }
+  @media (max-width: 760px) {
+    td.u, th.u, td.par, th.par { display: none; }
+    td.p { width: 12em; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>Tetragon events</h1>
+  <span id="status">connecting…</span>
+  <input type="search" id="q" placeholder="Show only: binary, path, IP… (all words must match)">
+  <input type="search" id="x" placeholder="Exclude: comma-separated, e.g. gnome-shell, /snap/code/">
+  <label><input type="checkbox" class="kind" value="exec" checked> exec</label>
+  <label><input type="checkbox" class="kind" value="exit"> exit</label>
+  <label><input type="checkbox" class="kind" value="kprobe" checked> policy hits</label>
+  <label><input type="checkbox" id="hideRoot"> hide uid 0</label>
+  <label><input type="checkbox" id="onlyAlerts"> only ⚠</label>
+  <button id="pause">Pause</button>
+  <button id="clear">Clear</button>
+  <div id="counts"></div>
+</header>
+<main>
+  <table>
+    <thead><tr>
+      <th class="t">time</th><th class="k">event</th><th class="p">process</th>
+      <th class="u">uid</th><th>details</th><th class="par" style="width:14em">parent</th>
+    </tr></thead>
+    <tbody id="rows"></tbody>
+  </table>
+  <div id="empty">Waiting for events…</div>
+</main>
+<script>
+const MAX_ROWS = 3000;
+const rows = document.getElementById("rows");
+const q = document.getElementById("q");
+const statusEl = document.getElementById("status");
+const countsEl = document.getElementById("counts");
+const emptyEl = document.getElementById("empty");
+let paused = false, buffered = [];
+const counts = {};
+
+const base = s => (s || "").split("/").pop();
+const esc = s => String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+
+function fmtArg(a) {
+  const k = Object.keys(a).find(k => k !== "label");
+  if (!k) return "";
+  const v = a[k];
+  const lbl = a.label ? a.label + "=" : "";
+  switch (k) {
+    case "file_arg": case "path_arg":
+      return lbl + v.path + (v.permission ? " (" + v.permission + ")" : "");
+    case "sock_arg":
+      return lbl + `${v.saddr}:${v.sport} → ${v.daddr}:${v.dport}` + (v.protocol ? " " + v.protocol : "");
+    case "sockaddr_arg":
+      return lbl + `${v.addr}:${v.port}`;
+    case "module_arg":
+      return lbl + "module " + v.name;
+    case "process_credentials_arg":
+      return lbl + `uid=${v.uid} euid=${v.euid} gid=${v.gid} egid=${v.egid}`;
+    case "int_arg": case "uint_arg": case "long_arg": case "size_arg": case "string_arg":
+      return lbl + v;
+    default:
+      return lbl + k.replace(/_arg$/, "") + "=" + JSON.stringify(v);
+  }
+}
+
+function describe(ev) {
+  const type = Object.keys(ev).find(k => k.startsWith("process_"));
+  const e = ev[type] || {};
+  const p = e.process || {};
+  const out = {
+    time: ev.time || "", type, p, parent: e.parent || {}, raw: ev,
+    kind: "kprobe", label: type ? type.replace("process_", "") : "?", details: "", cls: "kprobe",
+  };
+  if (type === "process_exec") {
+    out.kind = "exec"; out.cls = "exec"; out.label = "exec";
+    out.details = (p.arguments || "") + (p.cwd ? `   [cwd ${p.cwd}]` : "");
+    const raised = (p.binary_properties || {}).privileges_changed || [];
+    if (raised.length) {
+      out.cls = "alert"; out.label = "exec ⚠ priv";
+      out.details = `[${raised.map(r => r.replace("PRIVILEGES_RAISED_EXEC_", "")).join(", ")} → euid ${(p.process_credentials || {}).euid ?? "?"}] ` + out.details;
+    }
+  } else if (type === "process_exit") {
+    out.kind = "exit"; out.cls = "exit"; out.label = "exit";
+    out.details = e.signal ? "signal " + e.signal : "status " + (e.status || 0);
+  } else {
+    out.label = e.function_name || e.event || out.label;
+    const args = (e.args || []).map(fmtArg).filter(Boolean);
+    if (e.return && Object.keys(e.return).length) args.push("ret=" + fmtArg(e.return));
+    out.details = (e.policy_name ? `[${e.policy_name}] ` : "") + (e.message ? e.message + ": " : "") + args.join("  ");
+    if (e.action && !/POST$/.test(e.action)) { out.cls = "alert"; out.details += "  action=" + e.action; }
+  }
+  out.search = (JSON.stringify(ev)).toLowerCase();
+  return out;
+}
+
+const xEl = document.getElementById("x");
+try { xEl.value = localStorage.getItem("exclude") || ""; } catch {}
+let xCache = null;
+function excludes() {
+  if (xCache === null) xCache = xEl.value.toLowerCase().split(",").map(w => w.trim()).filter(Boolean);
+  return xCache;
+}
+xEl.addEventListener("input", () => {
+  xCache = null;
+  try { localStorage.setItem("exclude", xEl.value); } catch {}
+  applyFilter();
+});
+
+function visible(d) {
+  const kinds = [...document.querySelectorAll(".kind:checked")].map(c => c.value);
+  if (!kinds.includes(d.kind)) return false;
+  if (document.getElementById("hideRoot").checked && (d.p.uid || 0) === 0) return false;
+  if (document.getElementById("onlyAlerts").checked && d.cls !== "alert") return false;
+  if (excludes().some(w => d.search.includes(w))) return false;
+  const words = q.value.toLowerCase().split(/\s+/).filter(Boolean);
+  return words.every(w => d.search.includes(w));
+}
+
+function row(d) {
+  const tr = document.createElement("tr");
+  tr.className = "ev";
+  tr._d = d;
+  const t = d.time ? new Date(d.time).toLocaleTimeString() : "";
+  const proc = `${esc(base(d.p.binary))} <span class="dim">${d.p.pid ?? ""}</span>`;
+  const par = d.parent.binary ? `${esc(base(d.parent.binary))} <span class="dim">${d.parent.pid ?? ""}</span>` : "";
+  tr.innerHTML = `<td class="t">${t}</td><td class="k ${d.cls}">${esc(d.label)}</td>` +
+    `<td class="p" title="${esc(d.p.binary || "")}">${proc}</td><td class="u">${d.p.uid ?? ""}</td>` +
+    `<td>${esc(d.details)}</td><td class="par">${par}</td>`;
+  tr.hidden = !visible(d);
+  return tr;
+}
+
+function add(d) {
+  counts[d.kind] = (counts[d.kind] || 0) + 1;
+  rows.prepend(row(d));
+  while (rows.children.length > MAX_ROWS) rows.lastElementChild.remove();
+}
+
+function refreshEmpty() {
+  emptyEl.hidden = [...rows.children].some(r => !r.hidden && r.classList.contains("ev"));
+  const total = Object.values(counts).reduce((a, b) => a + b, 0);
+  countsEl.textContent = `${total} events received · exec ${counts.exec || 0} · exit ${counts.exit || 0} · policy hits ${counts.kprobe || 0}` +
+    (paused ? ` · paused (${buffered.length} queued)` : "") + ` · showing newest ${MAX_ROWS} max`;
+}
+
+function applyFilter() {
+  document.querySelectorAll("tr.detail").forEach(r => r.remove());
+  for (const tr of rows.children) tr.hidden = !visible(tr._d);
+  refreshEmpty();
+}
+
+rows.addEventListener("click", ev => {
+  const tr = ev.target.closest("tr.ev");
+  if (!tr) return;
+  const next = tr.nextElementSibling;
+  if (next && next.classList.contains("detail")) { next.remove(); tr.classList.remove("open"); return; }
+  tr.classList.add("open");
+  const det = document.createElement("tr");
+  det.className = "detail";
+  det._d = tr._d;
+  det.innerHTML = `<td colspan="6"><pre>${esc(JSON.stringify(tr._d.raw, null, 2))}</pre></td>`;
+  tr.after(det);
+});
+
+q.addEventListener("input", applyFilter);
+document.querySelectorAll(".kind, #hideRoot, #onlyAlerts").forEach(c => c.addEventListener("change", applyFilter));
+document.getElementById("clear").onclick = () => {
+  rows.innerHTML = ""; for (const k in counts) delete counts[k]; refreshEmpty();
+};
+document.getElementById("pause").onclick = e => {
+  paused = !paused;
+  e.target.textContent = paused ? "Resume" : "Pause";
+  if (!paused) { buffered.forEach(add); buffered = []; }
+  refreshEmpty();
+};
+
+let pending = 0;
+function connect() {
+  const es = new EventSource("/events");
+  es.onopen = () => { statusEl.textContent = "live"; statusEl.className = "live"; };
+  es.onerror = () => { statusEl.textContent = "disconnected, retrying…"; statusEl.className = "down"; };
+  es.addEventListener("reset", () => {
+    rows.innerHTML = ""; buffered = []; for (const k in counts) delete counts[k]; refreshEmpty();
+  });
+  es.onmessage = m => {
+    let ev;
+    try { ev = JSON.parse(m.data); } catch { return; }
+    const d = describe(ev);
+    if (paused) buffered.push(d); else add(d);
+    if (!pending) pending = requestAnimationFrame(() => { pending = 0; refreshEmpty(); });
+  };
+}
+connect();
+</script>
+</body>
+</html>

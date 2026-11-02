@@ -1,0 +1,98 @@
+# Observe-only: log processes that switch to uid 0 (become root).
+# Based on examples/policylibrary/privileges/privileges-setuid-root.yaml,
+# reduced to the uid calls (the gid variants almost always accompany them).
+#
+# Expect entries for sudo, su, pkexec and cron. Anything else switching to
+# root is worth a look. Rate-limited to one event per process+args per minute.
+#
+# Not included (too noisy on a desktop): create_user_ns, which browsers,
+# snaps and bubblewrap do constantly, and capset, which every systemd
+# service does at start.
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "privilege-escalation"
+spec:
+  kprobes:
+  - call: "__sys_setuid"
+    syscall: false
+    return: true
+    message: "Process switched to uid 0 (setuid)"
+    args:
+    - index: 0
+      type: "int"
+    returnArg:
+      index: 0
+      type: "int"
+    selectors:
+    - matchArgs:
+      - index: 0
+        operator: "Equal"
+        values:
+        - "0"
+      matchActions:
+      - action: Post
+        rateLimit: "1m"
+  - call: "__sys_setreuid"
+    syscall: false
+    return: true
+    message: "Process switched to uid 0 (setreuid)"
+    args:
+    - index: 0
+      type: "int"
+    - index: 1
+      type: "int"
+    returnArg:
+      index: 0
+      type: "int"
+    selectors:
+    - matchArgs:
+      - index: 1 # effective uid
+        operator: "Equal"
+        values:
+        - "0"
+      matchActions:
+      - action: Post
+        rateLimit: "1m"
+  - call: "__sys_setresuid"
+    syscall: false
+    return: true
+    message: "Process switched to uid 0 (setresuid)"
+    args:
+    - index: 0
+      type: "int"
+    - index: 1
+      type: "int"
+    - index: 2
+      type: "int"
+    returnArg:
+      index: 0
+      type: "int"
+    selectors:
+    - matchArgs:
+      - index: 1 # effective uid
+        operator: "Equal"
+        values:
+        - "0"
+      matchActions:
+      - action: Post
+        rateLimit: "1m"
+  - call: "__sys_setfsuid"
+    syscall: false
+    return: true
+    message: "Process switched filesystem uid to 0 (setfsuid)"
+    args:
+    - index: 0
+      type: "int"
+    returnArg:
+      index: 0
+      type: "int"
+    selectors:
+    - matchArgs:
+      - index: 0
+        operator: "Equal"
+        values:
+        - "0"
+      matchActions:
+      - action: Post
+        rateLimit: "1m"

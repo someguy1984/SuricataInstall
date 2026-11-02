@@ -19,6 +19,8 @@ if [ -x /usr/local/sbin/dns-lockdown.sh ]; then
     /usr/local/sbin/dns-lockdown.sh stop
 fi
 rm -f /etc/systemd/system/dns-lockdown.service /usr/local/sbin/dns-lockdown.sh /etc/default/dns-lockdown
+# Log rotation and the boot-time permission fix; the root-only permissions themselves are kept
+rm -f /etc/logrotate.d/ctrld /etc/tmpfiles.d/ctrld-logs.conf
 echo "Removed"
 
 say "ctrld drop-ins"
