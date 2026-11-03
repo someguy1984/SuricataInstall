@@ -1,0 +1,121 @@
+# Observe-only: log when something unexpected opens the keyboard/mouse,
+# camera, microphone, raw HID devices or the input-injection device.
+# Checked on open (security_file_open), not on every read, so normal use costs
+# nothing; one event per process+device per minute.
+#
+# Selectors are OR'ed; each one is a device class plus the programs that
+# normally open it:
+#   1. /dev/input/*   keyboards, mice, lid switch. On GNOME/Wayland logind opens
+#                     these and hands them to gnome-shell, so gnome-shell itself
+#                     never appears. Anything else = possible keylogger.
+#   2. /dev/video*    cameras. PipeWire/WirePlumber enumerate them at login and
+#                     stream them to apps via the camera portal. Any app that
+#                     opens the camera directly is logged (including Snapshot,
+#                     Firefox without the portal, etc.).
+#   3. /dev/snd/pcm*  audio playback/capture. Everything should go through
+#                     PipeWire; another program opening ALSA directly bypasses
+#                     it. Note: mic recording *through* PipeWire is not visible
+#                     here, as PipeWire is the one opening the device.
+#   4. /dev/hidraw*   raw HID: security keys (FIDO2) and some vendor devices.
+#                     Can read keystrokes from some keyboards.
+#   5. /dev/uinput    creates virtual keyboards/mice (input injection). Nothing
+#                     on this machine uses it, so every open is logged.
+#
+# Expect a few events right after installing (devices already open are not
+# re-logged, but hotplug and logins are). Add genuine programs to the matching
+# NotPrefix list and re-run local_install.sh.
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "device-access"
+spec:
+  kprobes:
+  - call: "security_file_open"
+    syscall: false
+    return: true
+    message: "Sensitive device opened"
+    args:
+    - index: 0
+      type: "file" # (struct file *) used for getting the path
+    returnArg:
+      index: 0
+      type: "int"
+    selectors:
+    # 1. Keyboards, mice, switches
+    - matchArgs:
+      - index: 0
+        operator: "Prefix"
+        values:
+        - "/dev/input/"
+      matchBinaries:
+      - operator: "NotPrefix"
+        values:
+        - "/usr/lib/systemd/systemd-logind"
+        - "/usr/lib/systemd/systemd-udevd"
+        - "/usr/lib/udev/" # udev helper programs
+        - "/usr/libexec/upowerd" # lid switch
+      matchActions:
+      - action: Post
+        rateLimit: "1m"
+        rateLimitScope: "process"
+    # 2. Cameras
+    - matchArgs:
+      - index: 0
+        operator: "Prefix"
+        values:
+        - "/dev/video"
+      matchBinaries:
+      - operator: "NotPrefix"
+        values:
+        - "/usr/bin/pipewire"
+        - "/usr/bin/wireplumber"
+        - "/usr/lib/systemd/systemd-udevd"
+        - "/usr/lib/udev/" # v4l_id
+      matchActions:
+      - action: Post
+        rateLimit: "1m"
+        rateLimitScope: "process"
+    # 3. Microphone / speakers (raw ALSA PCM)
+    - matchArgs:
+      - index: 0
+        operator: "Prefix"
+        values:
+        - "/dev/snd/pcm"
+      matchBinaries:
+      - operator: "NotPrefix"
+        values:
+        - "/usr/bin/pipewire"
+        - "/usr/bin/wireplumber"
+        - "/usr/sbin/alsactl"
+      matchActions:
+      - action: Post
+        rateLimit: "1m"
+        rateLimitScope: "process"
+    # 4. Raw HID
+    - matchArgs:
+      - index: 0
+        operator: "Prefix"
+        values:
+        - "/dev/hidraw"
+      matchBinaries:
+      - operator: "NotPrefix"
+        values:
+        - "/usr/lib/systemd/systemd-udevd"
+        - "/usr/lib/udev/"
+        - "/usr/libexec/upowerd" # battery level of wireless mice/keyboards
+        - "/usr/lib/openssh/ssh-sk-helper" # ssh with a FIDO2 key
+        - "/snap/firefox/" # WebAuthn security keys
+      matchActions:
+      - action: Post
+        rateLimit: "1m"
+        rateLimitScope: "process"
+    # 5. Input injection
+    - matchArgs:
+      - index: 0
+        operator: "Equal"
+        values:
+        - "/dev/uinput"
+      matchActions:
+      - action: Post
+        rateLimit: "1m"
+        rateLimitScope: "process"
