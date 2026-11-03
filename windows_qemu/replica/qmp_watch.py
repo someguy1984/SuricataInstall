@@ -15,7 +15,7 @@ With no event for --timeout seconds the same snapshot is taken as outcome "timeo
 Every QMP event goes to RUN_DIR/qmp-events.jsonl with host CLOCK_MONOTONIC (the ftrace instance uses trace_clock
 mono, so both line up). A screendump goes to RUN_DIR/screens/ every --screens seconds.
 """
-import argparse, json, os, re, socket, sys, time
+import argparse, json, os, re, select, socket, sys, time
 from pathlib import Path
 
 PANIC_HINT = {  # the usual suspects for an early-boot bugcheck on a firmware change
@@ -78,13 +78,11 @@ class Qmp:
         return r.get("return", json.dumps(r.get("error")))
 
     def wait_event(self, timeout):
-        self.s.settimeout(timeout)
-        try:
-            return self._read()
-        except (socket.timeout, TimeoutError):
-            return None
-        finally:
-            self.s.settimeout(None)
+        # select(), not socket.settimeout(): a timeout inside makefile().readline() poisons the SocketIO object
+        # ("cannot read from timed out object") and every later QMP command fails. The file is unbuffered
+        # (buffering=0), so no line can sit in a Python-side buffer that select() would not see.
+        r, _, _ = select.select([self.s], [], [], timeout)
+        return self._read() if r else None
 
 
 def last_reset_write(trace_file: Path):
