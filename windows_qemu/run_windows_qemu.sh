@@ -12,7 +12,7 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 STATE_DIR=${STATE_DIR:-$SCRIPT_DIR/state}
 # By serial, not /dev/nvmeXn1: the two NVMe drives swap names between boots on this machine.
 DISK=${WIN_DISK:-/dev/disk/by-id/nvme-WD_BLACK_SN8100_2000GB_25264U801019}
-MEM=8G
+MEM=16G
 CPUS=8
 SNAPSHOT=0
 SECUREBOOT=1

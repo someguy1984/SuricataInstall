@@ -12,7 +12,7 @@ board firmware can't boot Windows: it tells you whether Windows itself is health
 
 ## What the VM is
 
-- q35 + KVM, `-cpu host` with Hyper-V enlightenments, 8 vCPUs / 8 GiB by default.
+- q35 + KVM, `-cpu host` with Hyper-V enlightenments, 8 vCPUs / 16 GiB by default.
 - Ubuntu's OVMF Secure Boot build with the Microsoft key set (includes *Windows UEFI CA 2023*,
   which signs this disk's `bootmgfw.efi`). `--no-secureboot` for plain OVMF.
 - swtpm TPM 2.0 (CRB), state kept in `state/tpm/` so Windows sees the same TPM every run.
