@@ -274,7 +274,7 @@ alert history: none of the normal traffic seen would have been blocked.
 - **Suricata down → traffic passes.** The NFQUEUE rules use `--queue-bypass`: if Suricata is
   stopped, restarting or crashed, traffic flows uninspected rather than being blocked, so a failed
   start can't cut the network (or an SSH session). To keep that window short, systemd restarts
-  Suricata 5 s after it exits for any reason, and apt is pinned to 8.x so an upgrade can't leave it
+  Suricata 1 s after it exits for any reason, and apt is pinned to 8.x so an upgrade can't leave it
   unable to start.
 - **Sandboxed.** Suricata runs with systemd hardening (read-only system, no kernel or namespace
   access) and Landlock (once started it can only touch its logs, `/var/lib/suricata` and `/run`).
