@@ -1,3 +1,10 @@
+To apply
+
+sudo ./install.sh
+(cd controld && sudo ./install.sh)
+tetragon/local_install.sh
+(cd watch && sudo ./install.sh)
+sudo ./status.sh
 # Laptop security kit for Ubuntu: Suricata IPS, Control D DNS lockdown, Tetragon, alerting
 
 Four kits that work on their own and are stronger together. Each has its own installer,
