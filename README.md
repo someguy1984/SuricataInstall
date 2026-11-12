@@ -26,7 +26,7 @@ uninstaller and health check, and each can be re-run safely.
 ├── tetragon/                  Tetragon                ./local_install.sh, sudo ./check.sh, ./local_uninstall.sh
 ├── watch/                     alerting                sudo ./install.sh, sudo ./uninstall.sh
 ├── status.sh                  all health checks at once    sudo ./status.sh [--quiet]
-├── Makefile, tests/           make lint, sudo make test, make vm-test
+├── Makefile, tests/           make lint, sudo make test, sudo tests/dry-run.sh <installer>, make vm-test
 └── README.md
 ```
 
@@ -44,6 +44,36 @@ Any order works, but this one needs no second pass:
 Changing something later: edit the file in this repo and re-run that kit's installer. The repo is
 the source of truth; files edited in place under `/etc` are overwritten (the installers say so and
 keep a copy when they replace one that had local edits).
+
+To see what an installer would do before letting it, rehearse it. It runs for real, but against
+copy-on-write copies of the system directories, with service restarts only recorded:
+
+    sudo tests/dry-run.sh ./install.sh          # likewise controld/install.sh, tetragon/local_install.sh
+
+### What an install or re-install does to your connection
+
+Everything here is built to fail open: when a step goes wrong you are left with less protection,
+not without a network.
+
+| Installer | What you may notice | If it goes wrong |
+|-----------|---------------------|------------------|
+| `install.sh` | Nothing. Suricata keeps inspecting while the new config is prepared and tested, then restarts once: about a minute in which traffic passes uninspected. Open connections survive. | Before the test has passed: the previous files are put back and Suricata is never touched. After: traffic passes uninspected until Suricata is back (`--queue-bypass`). If the firewall rules can't be built they are removed, which also means uninspected, not blocked. |
+| `controld/install.sh` | DNS lookups fail for a few seconds while ctrld restarts, and only if its sandbox file changed. Browsers pick up their policy the next time they start. | A sandbox that ctrld doesn't come back under is replaced by the previous one automatically. If the firewall chain can't be built it is removed: DNS works, but is not locked. |
+| `tetragon/local_install.sh` | Nothing; Tetragon only observes. Nothing is recorded for the seconds it takes to restart. | The network is not involved. |
+| `watch/install.sh` | One test notification. | The network is not involved. |
+
+Two things do change what is allowed, by design. The first time the DNS lockdown goes in (or its
+resolver list grows), a program that brings its own DNS-over-HTTPS to a public resolver loses that
+route; most fall back to the system resolver, and one that can't stops resolving names. And every
+rule update can turn a new signature into a drop: see [Tuning](#tuning).
+
+If DNS or the network does break, these undo progressively more:
+
+    sudo dns-lockdown.sh pause 30          # lift the DNS lockdown for 30 minutes
+    sudo systemctl restart ctrld           # ctrld itself is stuck
+    sudo systemctl stop suricata-nfqueue   # take Suricata out of the traffic path (start it to put it back)
+    (cd controld && sudo ./uninstall.sh)   # remove the DNS lockdown, leave ctrld
+    sudo ./uninstall.sh --keep-logs        # remove Suricata
 
 ### How the kits fit together
 
@@ -383,13 +413,17 @@ What it puts in place:
   and containers routed through this machine.
 - **Suricata rules**, if Suricata is installed: see above. Without Suricata only the firewall layer
   exists; `../install.sh` adds the rules when it is run afterwards.
-- **One resolver list** for both: `files/doh-resolvers.conf`. Add a hostname or IP there and re-run
+- **One resolver list** for both: `controld/files/doh-resolvers.conf`. Add a hostname or IP there and re-run
   `install.sh`; hostnames become Suricata SNI rules, IPs become firewall rules.
 - **Browsers**: Firefox and the Chromium family (Chromium, and Chrome, Brave and Edge if installed)
   get their own DoH switched off and locked by policy, so they use the system resolver, i.e. ctrld.
   The policy files are world-readable, so they deliberately do not contain the Control D profile URL.
-- **ctrld itself**: binary, config and logs made root-only; a systemd sandbox that is removed again
-  automatically if ctrld stops resolving under it.
+- **ctrld itself**: binary, config and logs made root-only, and a systemd sandbox
+  (`controld/files/ctrld-60-hardening.conf`). ctrld is restarted only when that file changed. If it doesn't
+  come back resolving, both on `127.0.0.1` and through `/etc/resolv.conf`, the previous sandbox is
+  put back (or the sandbox is removed, if there was none) and the installer carries on.
+  `MemoryDenyWriteExecute` is deliberately not in it: the ctrld release binary unpacks itself into
+  executable memory at start and crashes under that option.
 
 ### Captive portals
 
@@ -488,12 +522,23 @@ you add it. `sudo tetragon/check.sh --canary` is an end-to-end test: it reads on
     sudo ./status.sh         # every kit's health check, with a summary
     make lint                # syntax of every script, unit, policy and config; changes nothing
     sudo make test           # the two firewall scripts, in a throwaway network namespace
+    sudo tests/dry-run.sh X  # rehearse installer X against copies of the system directories
     make vm-test             # install -> check -> uninstall in a fresh Ubuntu VM (needs multipass)
 
 `make lint` uses `shellcheck` and PyYAML when they are installed and says what it skipped when they
 are not. `sudo make test` builds and tears down the real `SURICATA-NFQ`, `DNSLOCK` and pause rules
 (including the upgrade from the older rule layout) in a network namespace with its own empty
 firewall, so this machine's rules are never touched.
+
+`tests/dry-run.sh` runs an installer in a private mount namespace where `/etc`, `/usr/local`,
+`/var/lib` and `/var/log` are overlays, and replaces `systemctl` (for anything but queries), `apt-get`
+and the notification commands with stubs that record the call. The installer downloads, generates
+and tests exactly as it would; at the end you get the list of service changes it would have made and
+the files it would have written. It cannot show whether services come back after a restart, since
+none happens. `controld/verify.sh` still sends its real probes and reports on the lockdown as it is.
+
+`make vm-test` is new and has not been run yet (it was written on a machine without multipass);
+treat its first run as a test of the script too.
 
 ## Rolling out to a new machine
 

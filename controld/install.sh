@@ -35,6 +35,8 @@ CR_POLICY_DIRS=(
 say()  { printf '\n==> %s\n' "$*"; }
 die()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 resolves() { [ -n "$(dig +time=3 +tries=2 +short @127.0.0.1 "$TEST_DOMAIN" 2>/dev/null | grep -v '^;')" ]; }
+# The same through /etc/resolv.conf, i.e. what every program on the machine actually uses
+system_resolves() { [ -n "$(dig +time=3 +tries=2 +short "$TEST_DOMAIN" 2>/dev/null | grep -v '^;')" ]; }
 
 [ "$(id -u)" -eq 0 ] || die "run as root"
 [ "$MODE" = block ] || [ "$MODE" = redirect ] || die "MODE must be 'block' or 'redirect'"
@@ -106,22 +108,49 @@ fi
 
 if [ "$HARDEN" = 1 ]; then
     say "Sandboxing ctrld"
-    install -m 0644 -o root -g root "$HERE/files/ctrld-60-hardening.conf" "$CTRLD_DROPIN/60-hardening.conf"
-    systemctl daemon-reload
-    systemctl restart ctrld || true
-    sleep 3
-    if systemctl is-active --quiet ctrld && resolves; then
-        echo "ctrld restarted under the sandbox and is resolving"
+    SANDBOX="$CTRLD_DROPIN/60-hardening.conf"
+    # PrivateIPC is one of this drop-in's settings: "yes" means systemd has it loaded
+    if cmp -s "$HERE/files/ctrld-60-hardening.conf" "$SANDBOX" && systemctl is-active --quiet ctrld \
+        && [ "$(systemctl show -p PrivateIPC --value ctrld)" = yes ]; then
+        # Restarting ctrld means a few seconds without DNS; don't when nothing would change
+        echo "The sandbox is already in place and unchanged: ctrld is not restarted"
     else
-        echo "ctrld failed under the sandbox; removing it and restarting ctrld without it"
-        journalctl -u ctrld -n 20 --no-pager || true
-        tail -n 20 /var/log/ctrld.err.log 2>/dev/null || true
-        rm -f "$CTRLD_DROPIN/60-hardening.conf"
+        # Keep whatever sandbox was there, so a new one that doesn't work is replaced by the
+        # old one that did rather than by nothing
+        rm -f "$STATE/60-hardening.conf.prev"
+        if [ -f "$SANDBOX" ]; then cp -p "$SANDBOX" "$STATE/60-hardening.conf.prev"; fi
+        install -m 0644 -o root -g root "$HERE/files/ctrld-60-hardening.conf" "$SANDBOX"
         systemctl daemon-reload
+        echo "Restarting ctrld (DNS lookups fail for a few seconds)"
         systemctl restart ctrld || true
         sleep 3
-        resolves || die "ctrld still not resolving after removing the sandbox; run ./uninstall.sh"
-        echo "Sandbox skipped; everything else is in place"
+        if systemctl is-active --quiet ctrld && resolves && system_resolves; then
+            echo "ctrld restarted under the sandbox and is resolving"
+        else
+            echo "ctrld failed under the new sandbox:"
+            journalctl -u ctrld -n 20 --no-pager || true
+            tail -n 20 /var/log/ctrld.err.log 2>/dev/null || true
+            if [ -f "$STATE/60-hardening.conf.prev" ]; then
+                echo "Putting the previous sandbox back and restarting ctrld"
+                install -m 0644 -o root -g root "$STATE/60-hardening.conf.prev" "$SANDBOX"
+            else
+                echo "Removing it and restarting ctrld without a sandbox"
+                rm -f "$SANDBOX"
+            fi
+            systemctl daemon-reload
+            systemctl restart ctrld || true
+            sleep 3
+            if ! { resolves && system_resolves; } && [ -f "$SANDBOX" ]; then
+                echo "Still not resolving; removing the sandbox altogether"
+                rm -f "$SANDBOX"
+                systemctl daemon-reload
+                systemctl restart ctrld || true
+                sleep 3
+            fi
+            resolves || die "ctrld still not resolving without the sandbox; run ./uninstall.sh"
+            echo "New sandbox skipped; everything else is in place"
+        fi
+        rm -f "$STATE/60-hardening.conf.prev"
     fi
 fi
 

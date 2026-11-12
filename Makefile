@@ -2,6 +2,7 @@
 #
 #   make lint            syntax of every script, unit, policy and config in the repo
 #   sudo make test       the firewall scripts, in a throwaway network namespace
+#   sudo tests/dry-run.sh <installer>   rehearse an installer without changing this machine
 #   make vm-test         full install -> check -> uninstall cycle in a fresh Ubuntu VM (needs multipass)
 
 SHELL := /bin/bash
@@ -12,7 +13,7 @@ SH_FILES := install.sh uninstall.sh check.sh status.sh \
 	tetragon/config.sh tetragon/local_install.sh tetragon/local_uninstall.sh \
 	tetragon/run.sh tetragon/stop.sh tetragon/check.sh \
 	watch/install.sh watch/uninstall.sh watch/files/ips-watch watch/files/ips-notify \
-	tests/firewall-netns.sh tests/vm-smoke.sh tests/lint.sh
+	tests/firewall-netns.sh tests/dry-run.sh tests/vm-smoke.sh tests/lint.sh
 PY_FILES := analyse.py tetragon/viewer/server.py watch/files/tetragon-notify.py
 
 .PHONY: lint test vm-test

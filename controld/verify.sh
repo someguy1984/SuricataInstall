@@ -83,9 +83,14 @@ for f in /var/log/ctrld.log /var/log/ctrld.err.log; do
         *) fail "$f is world-readable (it lists every domain looked up)" ;;
     esac
 done
-[ "$(systemctl show -p MemoryDenyWriteExecute --value ctrld)" = yes ] \
-    && pass "ctrld runs sandboxed (exposure $(systemd-analyze security ctrld.service 2>/dev/null | awk '/Overall exposure/ {print $(NF-2)}'))" \
-    || fail "ctrld's sandbox (60-hardening.conf) is not active"
+# PrivateIPC and the syscall filter are set by the current 60-hardening.conf only
+if [ "$(systemctl show -p PrivateIPC --value ctrld)" = yes ] && [ -n "$(systemctl show -p SystemCallFilter --value ctrld | tr -d '~ ')" ]; then
+    pass "ctrld runs sandboxed (exposure $(systemd-analyze security ctrld.service 2>/dev/null | awk '/Overall exposure/ {print $(NF-2)}'))"
+elif [ "$(systemctl show -p NoNewPrivileges --value ctrld)" = yes ]; then
+    fail "ctrld runs under an older or partial sandbox (re-run install.sh for the current 60-hardening.conf)"
+else
+    fail "ctrld's sandbox (60-hardening.conf) is not active"
+fi
 
 for f in /etc/firefox/policies/policies.json /etc/chromium-browser/policies/managed/dns-lockdown.json; do
     [ -r "$f" ] && pass "policy present: $f" || printf '  INFO  policy not installed: %s\n' "$f"
