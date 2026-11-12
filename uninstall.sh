@@ -5,6 +5,7 @@
 #   --keep-logs  keep /var/log/suricata (eve.json, fast.log, extracted files)
 set -uo pipefail
 
+SRC="$(dirname "$(readlink -f "$0")")/files"
 STATE_DIR=/var/lib/suricata-installer
 ASSUME_YES=0 KEEP_LOGS=0
 for arg in "$@"; do
@@ -28,20 +29,13 @@ step() { echo; echo "==> $*"; }
 
 # Firewall rules first, so traffic is never queued to a stopped Suricata
 step "Removing NFQUEUE firewall rules"
-systemctl disable --now suricata-rules-update.timer suricata-home-net.timer 2>/dev/null
+systemctl disable --now suricata-rules-update.timer suricata-home-net.timer suricata-filestore-prune.timer 2>/dev/null
 systemctl disable --now suricata-nfqueue.service 2>/dev/null
-for cmd in iptables ip6tables; do
-    command -v $cmd >/dev/null || continue
-    while $cmd -D OUTPUT -o lo -j ACCEPT 2>/dev/null; do :; done
-    for chain in OUTPUT FORWARD; do
-        while $cmd -D $chain -j NFQUEUE --queue-num 0 --queue-bypass 2>/dev/null; do :; done
-    done
-    while $cmd -t mangle -D INPUT -i lo -j ACCEPT 2>/dev/null; do :; done
-    while $cmd -t mangle -D OUTPUT -o lo -j ACCEPT 2>/dev/null; do :; done
-    for chain in INPUT OUTPUT FORWARD; do
-        while $cmd -t mangle -D $chain -j NFQUEUE --queue-num 0 --queue-bypass 2>/dev/null; do :; done
-    done
-done
+# In case the service was already gone but rules were left behind. The copy next to this
+# script also knows the layouts of earlier versions.
+if command -v iptables >/dev/null; then
+    bash "$SRC/suricata-nfqueue-apply.sh" stop
+fi
 
 step "Stopping Suricata"
 systemctl disable --now suricata.service 2>/dev/null
@@ -52,6 +46,8 @@ rm -f /etc/systemd/system/suricata-nfqueue.service \
       /etc/systemd/system/suricata-rules-update.timer \
       /etc/systemd/system/suricata-home-net.service \
       /etc/systemd/system/suricata-home-net.timer \
+      /etc/systemd/system/suricata-filestore-prune.service \
+      /etc/systemd/system/suricata-filestore-prune.timer \
       /etc/NetworkManager/dispatcher.d/90-suricata-home-net \
       /usr/local/sbin/suricata-home-net \
       /run/suricata-home-net.lock \
@@ -61,8 +57,9 @@ rm -f /etc/systemd/system/suricata-nfqueue.service \
       /usr/local/sbin/suricata-nfqueue-apply.sh.orig \
       /etc/logrotate.d/suricata
 rmdir /etc/systemd/system/suricata.service.d 2>/dev/null
+rm -rf /usr/local/lib/suricata-ips
 systemctl daemon-reload
-systemctl reset-failed suricata.service suricata-nfqueue.service suricata-rules-update.service suricata-home-net.service 2>/dev/null
+systemctl reset-failed suricata.service suricata-nfqueue.service suricata-rules-update.service suricata-home-net.service suricata-filestore-prune.service 2>/dev/null
 
 step "Removing the Suricata package"
 export DEBIAN_FRONTEND=noninteractive
@@ -83,8 +80,8 @@ step "Verifying"
 left=0
 for cmd in iptables ip6tables; do
     command -v $cmd >/dev/null || continue
-    if { $cmd -S; $cmd -t mangle -S; } 2>/dev/null | grep -q NFQUEUE; then
-        echo "WARNING: $cmd still has NFQUEUE rules:"; { $cmd -S; $cmd -t mangle -S; } | grep NFQUEUE
+    if { $cmd -S; $cmd -t mangle -S; } 2>/dev/null | grep -qE 'NFQUEUE|SURICATA-NFQ'; then
+        echo "WARNING: $cmd still has NFQUEUE rules:"; { $cmd -S; $cmd -t mangle -S; } | grep -E 'NFQUEUE|SURICATA-NFQ'
         left=1
     fi
 done

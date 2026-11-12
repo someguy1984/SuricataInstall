@@ -48,7 +48,7 @@ systemctl reset-failed tetragon tetragon-viewer tetragon-alerts 2>/dev/null || t
 
 echo "==> Removing binaries, BPF objects, viewer and configuration"
 rm -f /usr/local/bin/tetragon /usr/local/bin/tetra
-rm -rf /usr/local/lib/tetragon /usr/local/lib/tetragon-viewer /etc/tetragon
+rm -rf /usr/local/lib/tetragon /usr/local/lib/tetragon-viewer /usr/local/lib/tetragon-tools /etc/tetragon
 
 # Tetragon unpins its BPF maps/programs on a clean stop; clear leftovers from
 # a crash. Only when the Docker setup isn't running, since it shares these.

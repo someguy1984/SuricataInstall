@@ -1,0 +1,30 @@
+# Observe-only: log a program starting to accept TCP connections on an address
+# other machines can reach (a wildcard address or one of this machine's own).
+# A backdoor or bind shell has to do this; so do development servers and
+# published container ports, which is why it is worth knowing what is open.
+#
+# Listening on loopback only (127.0.0.0/8, ::1) is not logged. One event per
+# process per minute. tcp-connect.yaml covers the other direction (outbound).
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "tcp-listen"
+spec:
+  kprobes:
+  - call: "inet_csk_listen_start"
+    syscall: false
+    message: "Program started listening for network connections"
+    args:
+    - index: 0
+      type: "sock"
+    selectors:
+    - matchArgs:
+      - index: 0
+        operator: "NotSAddr"
+        values:
+        - "127.0.0.0/8"
+        - "::1/128"
+      matchActions:
+      - action: Post
+        rateLimit: "1m"
+        rateLimitScope: "process"

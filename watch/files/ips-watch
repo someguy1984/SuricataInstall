@@ -1,0 +1,136 @@
+#!/bin/bash
+# Scheduled look at the whole setup, run by ips-watch.timer. Notifies (ips-notify) when:
+#
+#   health    Suricata's check.sh or Tetragon's check.sh reports a failure, ctrld is down, or
+#             the DNS lockdown's firewall chain is missing. You are told when the set of
+#             problems changes, reminded while it lasts, and told when it clears.
+#   activity  analyse.py rates the last few minutes of Suricata's logs MEDIUM or worse.
+#             MEDIUM goes to the journal; NOTIFY_MIN and above also to the desktop.
+#
+# Each part is skipped if that kit isn't installed. Everything this runs is a root-owned
+# copy put in place by the installers, never a file from the checkout.
+# Settings: /etc/ips-watch.conf. Run by hand any time: sudo ips-watch
+set -uo pipefail
+
+CONF=/etc/ips-watch.conf
+STATE=/var/lib/ips-watch
+SURICATA_TOOLS=/usr/local/lib/suricata-ips
+TETRAGON_TOOLS=/usr/local/lib/tetragon-tools
+NOTIFY=/usr/local/sbin/ips-notify
+
+# Defaults; see files/ips-watch.conf for what they mean
+NOTIFY_MIN=HIGH
+WINDOW_MIN=15
+REMIND_HOURS=6
+REPEAT_MIN=60
+# shellcheck source=/dev/null
+[[ -r $CONF ]] && . "$CONF"
+
+[[ $EUID -eq 0 ]] || { echo "Run as root (sudo $0)"; exit 1; }
+mkdir -p "$STATE"
+
+# --- Health ---------------------------------------------------------------------------
+problems=()
+# The FAIL lines of a check script, each prefixed with the kit's name
+collect_failures() {
+    local label=$1 out line
+    shift
+    out=$("$@" 2>&1) && return 0
+    while IFS= read -r line; do
+        problems+=("$label: ${line#*FAIL }")
+    done < <(grep -E '^ +FAIL ' <<<"$out")
+    # Failed without saying why (crashed, wrong arguments): still worth knowing
+    grep -qE '^ +FAIL ' <<<"$out" || problems+=("$label: its health check could not run ($(tail -1 <<<"$out"))")
+}
+
+if [[ -x $SURICATA_TOOLS/check.sh ]]; then
+    collect_failures "Suricata" "$SURICATA_TOOLS/check.sh"
+fi
+if systemctl is-enabled --quiet dns-lockdown.service 2>/dev/null; then
+    systemctl is-active --quiet ctrld || problems+=("DNS: ctrld is not running (this machine has no DNS)")
+    # A captive-portal pause removes the chain on purpose and puts it back by itself
+    if [[ ! -e /run/dns-lockdown.paused ]] && ! iptables -S OUTPUT 2>/dev/null | grep -q -- '-j DNSLOCK$'; then
+        problems+=("DNS: the DNSLOCK firewall chain is missing (DNS is not forced through ctrld)")
+    fi
+fi
+if [[ -x $TETRAGON_TOOLS/check.sh ]]; then
+    collect_failures "Tetragon" "$TETRAGON_TOOLS/check.sh"
+fi
+
+current=$(printf '%s\n' "${problems[@]+"${problems[@]}"}" | sort)
+previous=$(cat "$STATE/health" 2>/dev/null)
+if [[ $current != "$previous" ]]; then
+    if [[ -n $current ]]; then
+        "$NOTIFY" critical "Security setup: ${#problems[@]} problem(s)" "$current"
+    else
+        "$NOTIFY" normal "Security setup: all clear" "The problems reported earlier are gone."
+    fi
+    printf '%s\n' "$current" > "$STATE/health"
+elif [[ -n $current ]]; then
+    age=$(( ($(date +%s) - $(stat -c %Y "$STATE/health")) / 3600 ))
+    if [[ $age -ge $REMIND_HOURS ]]; then
+        "$NOTIFY" critical "Security setup: still ${#problems[@]} problem(s)" "$current"
+        touch "$STATE/health"
+    fi
+fi
+[[ -n $current ]] && printf 'Health problems:\n%s\n' "$current" || echo "Health: no problems"
+
+# --- Activity -------------------------------------------------------------------------
+if [[ -x $SURICATA_TOOLS/analyse.py ]]; then
+    report=$("$SURICATA_TOOLS/analyse.py" --json --minutes "$WINDOW_MIN" 2>/dev/null)
+    # Reports the findings that are new: one already reported within REPEAT_MIN is left
+    # out, so something long-running isn't repeated on every run
+    printf '%s' "$report" | NOTIFY=$NOTIFY NOTIFY_MIN=$NOTIFY_MIN REPEAT_MIN=$REPEAT_MIN SEEN="$STATE/findings" python3 -I -c '
+import json, os, subprocess, sys, time
+
+RANK = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
+NAME = {v: k for k, v in RANK.items()}
+try:
+    report = json.load(sys.stdin)
+except ValueError:
+    sys.exit(0)                      # logs unreadable or empty: the health check covers that
+notify_min = RANK.get(os.environ["NOTIFY_MIN"].upper(), 1)
+repeat = float(os.environ["REPEAT_MIN"]) * 60
+seen_path, now = os.environ["SEEN"], time.time()
+seen = {}
+try:
+    for line in open(seen_path):
+        ts, _, title = line.rstrip("\n").partition(" ")
+        if now - float(ts) < repeat:
+            seen[title] = float(ts)
+except (OSError, ValueError):
+    pass
+
+def flat(text):
+    return " ".join(str(text).split())
+
+new = [f for f in report.get("findings", [])
+       if RANK.get(f.get("severity"), 4) <= RANK["MEDIUM"] and flat(f.get("title")) not in seen]
+for f in new:
+    seen[flat(f["title"])] = now
+with open(seen_path + ".tmp", "w") as out:
+    for title, ts in seen.items():
+        out.write(str(ts) + " " + title + "\n")
+os.replace(seen_path + ".tmp", seen_path)
+if not new:
+    print("Activity: nothing new at MEDIUM or above")
+    sys.exit(0)
+
+worst = min(RANK[f["severity"]] for f in new)
+level = "critical" if worst <= RANK["HIGH"] else "normal"
+if worst > notify_min:
+    level = "log"                    # below the desktop threshold: journal only
+lines = []
+for f in sorted(new, key=lambda f: RANK[f["severity"]])[:6]:
+    lines.append("[" + f["severity"] + "] " + flat(f["title"]))
+    if f.get("details"):
+        lines.append("    " + flat(f["details"][0])[:160])
+if len(new) > 6:
+    lines.append("... and " + str(len(new) - 6) + " more")
+lines.append("Full report: sudo /usr/local/lib/suricata-ips/analyse.py --minutes 60")
+title = "Suricata: " + str(len(new)) + " new finding(s), worst " + NAME[worst]
+subprocess.run([os.environ["NOTIFY"], level, title, "\n".join(lines)])
+print("Activity: " + title + " (" + level + ")")
+'
+fi
+exit 0

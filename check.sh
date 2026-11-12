@@ -41,6 +41,12 @@ if systemctl is-active --quiet suricata-rules-update.timer; then
 else
     warn "suricata-rules-update.timer is not active: rules won't update automatically"
 fi
+# The timer being active says nothing about whether the update it starts works
+if systemctl is-failed --quiet suricata-rules-update.service; then
+    fail "The last rule update failed: rules are not being updated (journalctl -u suricata-rules-update -n 30)"
+else
+    pass "The last rule update did not fail"
+fi
 since=$(systemctl show -p ActiveEnterTimestamp --value suricata.service)
 info "Suricata running since: ${since:-unknown}"
 if ps -o args= -C Suricata-Main 2>/dev/null | grep -q -- '-q 0'; then
@@ -57,14 +63,26 @@ else
 fi
 for cmd in iptables ip6tables; do
     rules=$($cmd -t mangle -S 2>/dev/null)
-    for chain in INPUT OUTPUT FORWARD; do
-        n=$(grep -c -- "^-A $chain -j NFQUEUE --queue-num 0 --queue-bypass" <<<"$rules")
-        if [[ $n -eq 1 ]]; then pass "$cmd mangle $chain -> NFQUEUE 0"
-        elif [[ $n -eq 0 ]]; then fail "$cmd mangle $chain has no NFQUEUE rule (traffic not inspected)"
-        else warn "$cmd mangle $chain has $n NFQUEUE rules (expected 1)"; fi
+    for hook in INPUT OUTPUT FORWARD; do
+        n=$(grep -c -- "^-A $hook -j SURICATA-NFQ\$" <<<"$rules")
+        if [[ $n -eq 1 ]]; then pass "$cmd mangle $hook -> SURICATA-NFQ"
+        elif [[ $n -eq 0 ]]; then fail "$cmd mangle $hook does not jump to SURICATA-NFQ (traffic not inspected; re-run ./install.sh)"
+        else warn "$cmd mangle $hook jumps to SURICATA-NFQ $n times (expected 1)"; fi
+        # Anything accepted ahead of the jump never reaches Suricata (the DNS lockdown's pause does this on purpose)
+        first=$(grep -m1 -- "^-A $hook " <<<"$rules")
+        [[ $n -eq 0 || $first == "-A $hook -j SURICATA-NFQ" ]] \
+            || warn "$cmd mangle $hook has a rule ahead of Suricata's: ${first#-A $hook }"
     done
-    grep -q -- '^-A INPUT -i lo -j ACCEPT' <<<"$rules" && grep -q -- '^-A OUTPUT -o lo -j ACCEPT' <<<"$rules" \
-        || warn "$cmd mangle loopback ACCEPT rules missing (loopback traffic will be queued)"
+    if grep -q -- '^-A SURICATA-NFQ -j NFQUEUE --queue-num 0 --queue-bypass$' <<<"$rules"; then
+        pass "$cmd SURICATA-NFQ -> NFQUEUE 0 (bypass if Suricata is down)"
+    else
+        fail "$cmd SURICATA-NFQ chain has no NFQUEUE rule (traffic not inspected)"
+    fi
+    grep -q -- '^-A SURICATA-NFQ -i lo -j RETURN' <<<"$rules" && grep -q -- '^-A SURICATA-NFQ -o lo -j RETURN' <<<"$rules" \
+        || warn "$cmd SURICATA-NFQ loopback rules missing (loopback traffic will be queued)"
+    if grep -qE -- '^-A (INPUT|OUTPUT|FORWARD) -j NFQUEUE' <<<"$rules"; then
+        warn "$cmd mangle still has NFQUEUE rules from the old layout (sudo systemctl restart suricata-nfqueue)"
+    fi
     if $cmd -S 2>/dev/null | grep -q NFQUEUE; then
         fail "$cmd filter table still has NFQUEUE rules (these bypass UFW)"
     else
@@ -108,19 +126,36 @@ systemctl is-active --quiet suricata-home-net.timer && pass "HOME_NET refresh ti
 [[ -x /etc/NetworkManager/dispatcher.d/90-suricata-home-net ]] && pass "NetworkManager hook refreshes HOME_NET on network changes" \
     || warn "NetworkManager hook not installed: HOME_NET only refreshes every 15 minutes"
 if cmp -s "$SRC/local.rules" /etc/suricata/local.rules; then
-    pass "local.rules matches $SRC/local.rules (plain DNS/DoT leaving the machine is dropped)"
+    pass "local.rules matches $SRC/local.rules"
 else
     warn "/etc/suricata/local.rules is missing or differs from $SRC/local.rules (re-run ./install.sh?)"
+fi
+# The DNS rules belong to the Control D lockdown: present with it, a placeholder without it
+dns_rules=$(grep -c '^drop ' /etc/suricata/dns-lockdown.rules 2>/dev/null)
+if systemctl is-enabled --quiet dns-lockdown.service 2>/dev/null; then
+    if grep -q 'sid:9000001;' /etc/suricata/dns-lockdown.rules 2>/dev/null; then
+        pass "DNS lockdown rules installed (${dns_rules} rules: plain DNS/DoT and public DoH resolvers are dropped)"
+    else
+        fail "The DNS lockdown is enabled but /etc/suricata/dns-lockdown.rules has no rules (re-run ./install.sh)"
+    fi
+elif [[ ${dns_rules:-0} -gt 0 ]]; then
+    warn "dns-lockdown.rules drops DNS but the lockdown service isn't enabled: without ctrld this machine has no DNS"
+elif [[ -f /etc/suricata/dns-lockdown.rules ]]; then
+    info "DNS lockdown (controld/) not installed: no DNS rules loaded"
+else
+    warn "/etc/suricata/dns-lockdown.rules is missing: Suricata will log a warning for it (re-run ./install.sh)"
 fi
 cmp -s "$SRC/suricata.apt-pin" /etc/apt/preferences.d/suricata-8 && pass "apt keeps Suricata on 8.x" \
     || warn "Suricata isn't pinned to 8.x: an upgrade to a new major version could stop it starting"
 grep -A1 '^  landlock:' "$CONF" | grep -qx '    enabled: yes' && pass "Landlock sandbox is enabled" \
     || warn "Landlock sandbox is not enabled"
-if cmp -s "$SRC/drop.conf" /etc/suricata/drop.conf; then
-    pass "drop.conf matches $SRC/drop.conf"
-else
-    warn "/etc/suricata/drop.conf differs from $SRC/drop.conf (re-run ./install.sh?)"
-fi
+for f in drop.conf disable.conf modify.conf; do
+    if cmp -s "$SRC/$f" /etc/suricata/$f; then
+        pass "$f matches $SRC/$f"
+    else
+        warn "/etc/suricata/$f is missing or differs from $SRC/$f (re-run ./install.sh?)"
+    fi
+done
 grep -qx '  fail-open: no' "$CONF" && pass "NFQ fails closed under overload (fail-open: no)" \
     || warn "NFQ fail-open is not 'no': overload passes packets uninspected"
 # Compare with the template, ignoring the lines install.sh fills in per machine
@@ -153,6 +188,8 @@ if [[ -f /etc/logrotate.d/suricata ]]; then
 else
     warn "No /etc/logrotate.d/suricata: logs will grow unbounded"
 fi
+systemctl is-active --quiet suricata-filestore-prune.timer && pass "Weekly filestore clean-up timer is active" \
+    || warn "suricata-filestore-prune.timer is not active: extracted files are never deleted (re-run ./install.sh)"
 if [[ $CONFIG_TEST -eq 1 ]]; then
     info "Running suricata -T (loads all rules)..."
     # -l to a temp dir so the test run doesn't append its own start-up lines to suricata.log

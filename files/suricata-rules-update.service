@@ -29,7 +29,10 @@ ProtectClock=yes
 ProtectHostname=yes
 RestrictNamespaces=yes
 RestrictRealtime=yes
-RestrictSUIDSGID=yes
+# Not used: RestrictSUIDSGID. /var/lib/suricata/rules is setgid (so the suricata group can
+# read what root writes there), and suricata-update backs the directory up with its modes
+# before every run. With RestrictSUIDSGID that copy fails with EPERM and the update aborts
+# before it downloads anything.
 LockPersonality=yes
 SystemCallArchitectures=native
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6

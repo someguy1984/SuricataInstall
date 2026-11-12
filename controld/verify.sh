@@ -15,6 +15,14 @@ answers() { [ -n "$(dig $Q "$@" 2>/dev/null | grep -vE '^;|timed out|refused|err
 
 echo "DNS lockdown checks (mode=$MODE)"
 
+# A captive-portal pause lifts the port-53 blocks on purpose, so those checks would fail
+PAUSED=0
+if [ -e /run/dns-lockdown.paused ]; then
+    PAUSED=1
+    printf '  NOTE  the lockdown is PAUSED until %s; the port-53 checks are skipped\n' "$(cat /run/dns-lockdown.paused)"
+    printf '        (re-lock now with: sudo dns-lockdown.sh resume)\n'
+fi
+
 systemctl is-active --quiet ctrld && pass "ctrld is running" || fail "ctrld is not running"
 # A failed ufw.service leaves its DROP policies without the before.rules accepts
 # (replies, loopback), which silently breaks ctrld
@@ -30,7 +38,9 @@ answers @127.0.0.1 "$TEST_DOMAIN" && pass "ctrld answers on 127.0.0.1:53" \
 answers "$TEST_DOMAIN" && pass "system resolver works (via resolv.conf)" \
     || fail "system resolver does not work"
 
-if [ "$MODE" = "redirect" ]; then
+if [ $PAUSED = 1 ]; then
+    :
+elif [ "$MODE" = "redirect" ]; then
     answers @8.8.8.8 "$TEST_DOMAIN" && pass "IPv4 plain DNS to 8.8.8.8 is redirected to ctrld" \
         || fail "IPv4 plain DNS to 8.8.8.8 got no answer (redirect not working)"
 else
@@ -41,8 +51,10 @@ else
 fi
 answers +tls @1.1.1.1 "$TEST_DOMAIN" && fail "DNS-over-TLS (853) to 1.1.1.1 still works" \
     || pass "DNS-over-TLS (853) to 1.1.1.1 is refused"
-answers @2001:4860:4860::8888 "$TEST_DOMAIN" && fail "IPv6 plain DNS to Google still works" \
-    || pass "IPv6 plain DNS to Google is refused (or no IPv6 route)"
+if [ $PAUSED = 0 ]; then
+    answers @2001:4860:4860::8888 "$TEST_DOMAIN" && fail "IPv6 plain DNS to Google still works" \
+        || pass "IPv6 plain DNS to Google is refused (or no IPv6 route)"
+fi
 
 # DoH bypass: any HTTPS answer at all from a public resolver means it's reachable
 doh_reachable() { [ "$(curl -s -o /dev/null -m 5 -w '%{http_code}' $1 2>/dev/null)" != 000 ]; }
@@ -78,6 +90,12 @@ done
 for f in /etc/firefox/policies/policies.json /etc/chromium-browser/policies/managed/dns-lockdown.json; do
     [ -r "$f" ] && pass "policy present: $f" || printf '  INFO  policy not installed: %s\n' "$f"
 done
+# The Firefox policy is world-readable, so it must not carry the Control D profile URL
+if grep -qs 'ProviderURL' /etc/firefox/policies/policies.json; then
+    fail "Firefox policy still holds a DoH provider URL (the profile ID is readable by everyone); re-run install.sh"
+fi
+[ -r /etc/dns-lockdown/doh-resolvers.conf ] && pass "resolver list installed (/etc/dns-lockdown/doh-resolvers.conf)" \
+    || fail "/etc/dns-lockdown/doh-resolvers.conf is missing: public DoH resolvers are not blocked by IP (re-run install.sh)"
 
 echo
 [ $fails -eq 0 ] && echo "All checks passed." || echo "$fails check(s) failed."

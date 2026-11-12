@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 # Start Tetragon in Docker plus a small web viewer for its events.
 #
+# This is the try-it-out path: nothing is installed or enabled at boot, which
+# makes it handy for testing a policy change. For a machine you rely on, use
+# local_install.sh instead. Compared with it, this has no boot gate (nothing
+# before you run it is recorded), no clean shutdown ordering, no second copy of
+# policy hits in the journal and no health check.
+#
 # Tetragon has to load eBPF programs into the host kernel, which rootless
 # Docker cannot do. So this starts a *private* rootful dockerd (as a transient
 # systemd unit) that is isolated from your everyday rootless Docker:
@@ -55,6 +61,20 @@ d rm -f tetragon tetragon-viewer >/dev/null 2>&1 || true
 sudo mkdir -p "$TETRAGON_LOG_DIR" "$TETRAGON_RUN_DIR"
 sudo rm -f "$TETRAGON_RUN_DIR/tetragon.sock"
 
+# The policies with @HOME@ filled in, and the viewer's token, in a root-only
+# directory: both are mounted into the containers from there, not from this checkout.
+POLICY_DIR="$DOCKERD_RUN/policies"
+TOKEN_FILE="$DOCKERD_RUN/viewer-token"
+rendered="$(mktemp -d)"
+render_policies "$rendered" || { rm -rf "$rendered"; exit 1; }
+sudo rm -rf "$POLICY_DIR"
+sudo install -d -m 0700 -o root -g root "$POLICY_DIR"
+sudo install -m 0600 -o root -g root "$rendered"/*.yaml "$POLICY_DIR/"
+rm -rf "$rendered"
+if ! sudo test -s "$TOKEN_FILE"; then
+	head -c 24 /dev/urandom | base64 | tr '+/' '-_' | sudo install -m 0600 -o root -g root /dev/stdin "$TOKEN_FILE"
+fi
+
 denylist="$(grep -vE '^\s*(#|$)' "$DIR/export-denylist.jsonl" || true)"
 
 echo "==> Starting Tetragon ($TETRAGON_IMAGE)"
@@ -63,13 +83,14 @@ d run -d --name tetragon \
 	-v /sys/kernel/btf/vmlinux:/var/lib/tetragon/btf:ro \
 	-v "$TETRAGON_LOG_DIR:/var/log/tetragon" \
 	-v "$TETRAGON_RUN_DIR:/var/run/tetragon" \
-	-v "$DIR/policies:/etc/tetragon/tetragon.tp.d:ro" \
+	-v "$POLICY_DIR:/etc/tetragon/tetragon.tp.d:ro" \
 	"$TETRAGON_IMAGE" \
 	--server-address unix:///var/run/tetragon/tetragon.sock \
 	--export-filename /var/log/tetragon/tetragon.log \
 	--export-file-max-size-mb "$TETRAGON_LOG_MAX_SIZE_MB" \
 	--export-file-max-backups "$TETRAGON_LOG_MAX_BACKUPS" \
 	--export-file-compress \
+	--export-file-perm 600 \
 	--tracing-policy-dir /etc/tetragon/tetragon.tp.d \
 	--enable-process-cred \
 	--export-denylist "$denylist" >/dev/null
@@ -120,15 +141,16 @@ d run -d --name tetragon-viewer \
 	--security-opt no-new-privileges \
 	-v "$TETRAGON_LOG_DIR:/logs:ro" \
 	-v "$DIR/viewer:/app:ro" \
+	-v "$TOKEN_FILE:/run/viewer-token:ro" \
 	"$VIEWER_IMAGE" \
 	python /app/server.py --log /logs/tetragon.log \
-	--bind 127.0.0.1 --port "$VIEWER_PORT" >/dev/null
+	--bind 127.0.0.1 --port "$VIEWER_PORT" --token-file /run/viewer-token >/dev/null
 
 cat <<EOF
 
 Tetragon is running.
 
-  Live report:  http://127.0.0.1:$VIEWER_PORT
+  Live report:  http://127.0.0.1:$VIEWER_PORT/#token=$(sudo cat "$TOKEN_FILE")
 
   Terminal view:
     sudo docker -H unix://$DOCKERD_SOCK exec -it tetragon \\

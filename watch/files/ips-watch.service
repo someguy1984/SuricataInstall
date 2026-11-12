@@ -1,0 +1,28 @@
+[Unit]
+Description=Check Suricata, the DNS lockdown and Tetragon, and notify about problems
+After=suricata.service tetragon.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/ips-watch
+StateDirectory=ips-watch
+# Reads a lot of log on each run; never at the expense of whatever you are doing
+Nice=10
+IOSchedulingClass=idle
+
+# Needs root to read the firewall and the logs, and to reach each user's session bus for
+# the notification, but writes nothing except its own state.
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native

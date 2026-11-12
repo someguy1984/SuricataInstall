@@ -7,6 +7,8 @@
 #   10.5.0.0/24          the-profit-center-wrapper compose network ("share")
 #   172.17.0.0/16        default Docker bridge
 # Connections to your LAN (192.168.x.x) and the internet are still logged.
+# The two container networks are specific to this machine: change them to match
+# yours (docker network inspect), or delete them to log container traffic too.
 apiVersion: cilium.io/v1alpha1
 kind: TracingPolicy
 metadata:

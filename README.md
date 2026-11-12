@@ -1,22 +1,62 @@
-# Suricata inline IPS for Ubuntu
+# Laptop security kit for Ubuntu: Suricata IPS, Control D DNS lockdown, Tetragon, alerting
 
-One-shot setup of Suricata 8.x as an inline IPS: all IPv4/IPv6 traffic is diverted through
-Suricata via iptables NFQUEUE rules in the mangle table (so UFW still applies afterwards).
+Four kits that work on their own and are stronger together. Each has its own installer,
+uninstaller and health check, and each can be re-run safely.
+
+| Kit | Folder | What it does |
+|-----|--------|--------------|
+| **Suricata IPS** | `.` (`install.sh`, `files/`) | All IPv4/IPv6 traffic goes through Suricata 8.x inline (NFQUEUE in the mangle table, so UFW still applies afterwards). High-confidence malicious traffic is dropped, the rest alerts. |
+| **Control D DNS lockdown** | `controld/` | Every DNS lookup has to go through `ctrld`: plain DNS, DoT and public DoH resolvers are refused in the firewall and dropped by Suricata; browsers' own DoH is switched off. |
+| **Tetragon** | `tetragon/` | Records what processes do on the machine itself (eBPF): every exec, plus policies for credential theft, persistence, privilege escalation, kernel tampering and tampering with this setup. |
+| **Alerting** | `watch/` | Tells you. A 15-minute health and activity check, and desktop notifications for Tetragon policy hits. Without it nothing here speaks up by itself. |
 
 ```
-suricata_scripts/
-├── install.sh      sudo ./install.sh [CIDR ...]
-├── uninstall.sh    sudo ./uninstall.sh [--yes] [--keep-logs]
-├── check.sh        sudo ./check.sh [--config-test] [--live]
-├── analyse.py      ./analyse.py [--minutes 5] [--end now|latest|TIME] [--json] [-v]
-├── README.md
-├── controld/       Control D (ctrld) DNS lockdown kit, installed separately (its own install.sh)
-└── files/          everything that gets installed (yaml, drop/modify.conf, units, NFQUEUE script, logrotate)
+├── install.sh, uninstall.sh   Suricata IPS            sudo ./install.sh [CIDR ...]
+├── check.sh                   its health check        sudo ./check.sh [--config-test] [--live]
+├── analyse.py                 report on recent logs   ./analyse.py [--minutes 5] [--json] [-v]
+├── files/                     everything the Suricata kit installs
+├── controld/                  DNS lockdown            sudo ./install.sh, ./verify.sh, sudo ./uninstall.sh
+├── tetragon/                  Tetragon                ./local_install.sh, sudo ./check.sh, ./local_uninstall.sh
+├── watch/                     alerting                sudo ./install.sh, sudo ./uninstall.sh
+├── status.sh                  all health checks at once    sudo ./status.sh [--quiet]
+├── Makefile, tests/           make lint, sudo make test, make vm-test
+└── README.md
 ```
 
 ## Quick start
 
-    sudo ./install.sh && sudo ./check.sh --live
+`ctrld` itself (Control D's client) is installed separately, from Control D; everything else is here.
+Any order works, but this one needs no second pass:
+
+    sudo ./install.sh                  # Suricata IPS
+    (cd controld && sudo ./install.sh) # DNS lockdown: needs ctrld running and answering first
+    tetragon/local_install.sh          # Tetragon (asks for sudo itself)
+    (cd watch && sudo ./install.sh)    # alerting: last, it watches whatever is installed
+    sudo ./status.sh                   # everything healthy?
+
+Changing something later: edit the file in this repo and re-run that kit's installer. The repo is
+the source of truth; files edited in place under `/etc` are overwritten (the installers say so and
+keep a copy when they replace one that had local edits).
+
+### How the kits fit together
+
+- **DNS has two layers.** The firewall chain (`DNSLOCK`, from `controld/`) refuses port 53/853 and
+  the fixed IPs of public DoH resolvers. Suricata drops the same traffic by content: plain DNS
+  that the firewall exempts for ctrld's own fallback, and TLS/QUIC to public resolvers by hostname.
+  Both are generated from one list, `controld/files/doh-resolvers.conf`.
+- **The Suricata DNS rules belong to the lockdown.** They drop every plain DNS packet leaving the
+  machine, so they are installed only when `ctrld` and the lockdown are in place
+  (`/etc/suricata/dns-lockdown.rules`; a placeholder otherwise). Installing Suricata alone on a
+  machine without ctrld leaves DNS working.
+- **Tetragon watches the other two.** The `stack-tamper` policy logs changes to Suricata's and the
+  lockdown's config, rules and root-run scripts, as `tetragon-tamper` does for Tetragon itself.
+- **Scheduled jobs never run code from this checkout.** The installers put root-owned copies of the
+  check scripts in `/usr/local/lib/suricata-ips` and `/usr/local/lib/tetragon-tools`, and `watch/`
+  uses those. A checkout in your home directory is writable by anything running as you.
+
+---
+
+# Suricata IPS
 
 ## Install
 
@@ -28,31 +68,38 @@ What it does:
 1. Checks the machine is Ubuntu, runs `apt update` and adds the OISF PPA (`ppa:oisf/suricata-stable`)
    if it isn't already configured. The yaml is written for Suricata 8.x; Ubuntu's own archive is
    often on 7.x. An apt pin (`/etc/apt/preferences.d/suricata-8`) keeps it on 8.x.
-2. Installs `suricata`, `iptables`, `curl` and `python3`, then stops Suricata (the package starts it
-   in af-packet IDS mode).
-3. Saves the existing config once to `/var/lib/suricata-installer/suricata.yaml.orig`, then installs
-   `files/suricata.yaml` with this machine's default-route interface filled in (`@DEFAULT_IFACE@`).
-   HOME_NET is set to this machine's own addresses (see [HOME_NET](#home_net)); CIDRs passed as
-   arguments are written to `/etc/suricata/home-net.extra` and always kept in it. Installs
-   `drop.conf`, `modify.conf` and `local.rules`.
+2. Installs `suricata`, `iptables`, `curl` and `python3`. On a first install it stops Suricata (the
+   package starts it in af-packet IDS mode); on a re-run Suricata keeps inspecting traffic.
+3. Saves the existing config once to `/var/lib/suricata-installer/suricata.yaml.orig`, then builds
+   the new one as a **candidate** (`/etc/suricata/suricata.yaml.new`) from `files/suricata.yaml`,
+   with this machine's default-route interface and HOME_NET filled in (see [HOME_NET](#home_net)).
+   CIDRs passed as arguments are written to `/etc/suricata/home-net.extra` and always kept in
+   HOME_NET. Installs `drop.conf`, `disable.conf`, `modify.conf`, `local.rules` and the DNS
+   lockdown's rules (or their placeholder).
 4. Enables the rule sources in `files/rule-sources.conf` (disabling any no longer listed), then runs
-   `suricata-update` to download them and convert the high-confidence rules to drop.
-5. Runs `suricata -T`. If the test fails it restores the previous config and stops **before touching
-   the firewall**.
-6. Installs the NFQUEUE firewall script and unit, the systemd override that runs Suricata inline
-   (`-q 0`) and sandboxed, logrotate, the daily rule-update timer and the HOME_NET updater, then
-   starts everything and waits until Suricata has attached to the queue.
+   `suricata-update` to download them, convert the high-confidence rules to drop and leave out the
+   categories listed in `disable.conf`.
+5. Runs `suricata -T` on the candidate. **If anything fails up to here, the previous files are put
+   back and Suricata is left running as it was**; the firewall is not touched.
+6. Makes the candidate live, installs the NFQUEUE firewall script and unit, the systemd override
+   that runs Suricata inline (`-q 0`) and sandboxed, logrotate, the daily rule-update timer, the
+   weekly filestore clean-up and the HOME_NET updater, and copies `check.sh`, `analyse.py` and
+   `files/` to `/usr/local/lib/suricata-ips`. Then it restarts Suricata, or only reloads the rules
+   if neither the yaml nor the service settings changed, and waits until it is attached to the queue.
 
 `install.sh` is safe to re-run, e.g. after editing anything in `files/`. A re-run restarts Suricata
-once; `stream.midstream` keeps already-open connections alive through the restart.
+at most once, at the end; `stream.midstream` keeps already-open connections alive through it.
 
 ### HOME_NET
 
 This is a laptop, so "home" is this machine, not whatever network it's on. HOME_NET holds:
 
-- this machine's exact IPv4 addresses, on every interface (Wi-Fi, VPN, libvirt/docker bridges)
+- this machine's exact IPv4 addresses, on every interface (Wi-Fi, VPN)
 - the `/64` of each global or ULA IPv6 address (temporary privacy addresses rotate inside it,
   so it can't be narrower), and this machine's exact link-local addresses
+- the whole subnet of each bridge this machine routes for (libvirt, Docker), so the VMs and
+  containers behind it are covered by the outbound rules too. A bridge that carries the default
+  route is the uplink and is treated like any other interface.
 - loopback, plus anything listed in `/etc/suricata/home-net.extra` (one CIDR per line)
 
 Everyone else, including other devices on the same café, hotel or home Wi-Fi, is `EXTERNAL_NET`,
@@ -71,8 +118,8 @@ rule reload (about a minute of CPU and briefly double the memory).
 What it does:
 
 1. Removes the NFQUEUE firewall rules **first**, so traffic is never sent to a stopped Suricata.
-2. Stops and disables Suricata, the NFQUEUE unit and the rule-update timer, and removes the units,
-   the override and the logrotate config.
+2. Stops and disables Suricata, the NFQUEUE unit and the timers, and removes the units,
+   the override, the logrotate config and `/usr/local/lib/suricata-ips`.
 3. Purges the `suricata` package and deletes `/etc/suricata`, `/var/lib/suricata` and
    `/var/log/suricata` (unless `--keep-logs`).
 4. Removes the OISF PPA **only if `install.sh` added it**. If it was already configured, it stays.
@@ -86,11 +133,12 @@ Packages pulled in as dependencies can then be removed with `sudo apt autoremove
     sudo ./check.sh --config-test   # also runs suricata -T (about a minute)
     sudo ./check.sh --live          # also sends a test request to confirm a known rule fires
 
-`check.sh` is read-only. It prints PASS/WARN/FAIL for the services, the rule-update timer, the
-NFQUEUE rules (IPv4 and IPv6, none left in the filter table where they'd bypass UFW), UFW, kernel
-queue overflows, config settings, rule age, logrotate, errors in `suricata.log`, flows seen in both
-directions, IPv6, and why packets were blocked (rules vs engine reasons). It exits non-zero if
-anything fails.
+`check.sh` is read-only. It prints PASS/WARN/FAIL for the services, the rule-update timer and
+whether its last run failed, the firewall rules (the `SURICATA-NFQ` chain hooked first in mangle
+INPUT/OUTPUT/FORWARD for IPv4 and IPv6, nothing left in the filter table where it would bypass UFW),
+UFW, kernel queue overflows, config settings, the DNS lockdown's rules, rule age, logrotate, errors
+in `suricata.log`, flows seen in both directions, IPv6, and why packets were blocked (rules vs engine
+reasons). It exits non-zero if anything fails.
 
 `--live` sends an HTTP request with an apt-style User-Agent to `archive.ubuntu.com`, which triggers
 SID 2013504 (an alert-only rule, never dropped) and confirms it appears in `eve.json`.
@@ -218,24 +266,28 @@ of root or of a user in the `suricata` group):
 
 | From `files/`                   | Installed to                                            |
 |---------------------------------|---------------------------------------------------------|
-| `suricata.yaml`                 | `/etc/suricata/suricata.yaml` (`@DEFAULT_IFACE@` filled in) |
-| `drop.conf`, `modify.conf`      | `/etc/suricata/` (rules converted to drop / tweaked by suricata-update) |
+| `suricata.yaml`                 | `/etc/suricata/suricata.yaml` (`@DEFAULT_IFACE@` and HOME_NET filled in) |
+| `drop.conf`, `disable.conf`, `modify.conf` | `/etc/suricata/` (rules converted to drop / left out / tweaked by suricata-update) |
 | `rule-sources.conf`             | not copied: the list of `suricata-update` sources to enable |
-| `suricata-nfqueue-apply.sh`     | `/usr/local/sbin/` (`start` adds / `stop` removes the NFQUEUE rules) |
+| `suricata-nfqueue-apply.sh`     | `/usr/local/sbin/` (`start` builds / `stop` removes the `SURICATA-NFQ` chain) |
 | `suricata-nfqueue.service`      | `/etc/systemd/system/` (applies the rules at boot, removes them on stop) |
 | `suricata-override.conf`        | `/etc/systemd/system/suricata.service.d/override.conf` (runs with `-q 0`) |
 | `suricata-rules-update.{service,timer}` | `/etc/systemd/system/` (daily sandboxed `suricata-update` + live reload) |
+| `suricata-filestore-prune.{service,timer}` | `/etc/systemd/system/` (weekly: deletes extracted files older than 30 days) |
 | `local.rules`                   | `/etc/suricata/local.rules` (this machine's own rules; suricata-update leaves it alone) |
+| (generated by `controld/`)      | `/etc/suricata/dns-lockdown.rules` (the DNS lockdown's rules, or a placeholder) |
 | `suricata-home-net.sh`          | `/usr/local/sbin/suricata-home-net` (keeps HOME_NET on this machine's addresses) |
 | `suricata-home-net.{service,timer}` | `/etc/systemd/system/` (runs it; timer every 15 min) |
 | `90-suricata-home-net`          | `/etc/NetworkManager/dispatcher.d/` (runs it on network changes) |
 | `suricata.apt-pin`              | `/etc/apt/preferences.d/suricata-8` (keeps apt on Suricata 8.x) |
 | `suricata.logrotate`            | `/etc/logrotate.d/suricata` (size-based, 200M x 5)       |
+| `check.sh`, `analyse.py`, `files/` | `/usr/local/lib/suricata-ips/` (root-owned copies for scheduled runs) |
 
 Config highlights vs the stock yaml: `stream.midstream: true`, HOME_NET = this machine only,
 checksum validation off (offloaded checksums otherwise cause false drops), NFQ `fail-open: no`,
 eve.json with payloads, community-id, drop and verdict logging, file-store for rule-matched files,
-Landlock sandbox on, stats every 60 s to eve.json only (no `stats.log`).
+Landlock sandbox on, core dumps off (a dump would hold inspected traffic), stats every 60 s to
+eve.json only (no `stats.log`).
 
 ## Rules and blocking policy
 
@@ -252,30 +304,37 @@ Converted to drop (`files/drop.conf`):
 
 - classtypes `trojan-activity`, `command-and-control`, `exploit-kit`, `domain-c2`, `credential-theft`
 - ET groups `emerging-malware`, `emerging-mobile_malware`, `emerging-coinminer`, `ciarmy`, `compromised`, `drop`
-- every ET rule rated `confidence High` with severity `Major` or `Critical`, except the INFO,
-  HUNTING, POLICY, GAMES, CHAT, P2P, DNS, DYN_DNS, TOR and USER_AGENTS categories
+- every ET rule rated `confidence High` with severity `Major` or `Critical`
 - all abuse.ch rules (SSLBL by message; Feodo Tracker and URLhaus are `trojan-activity`)
 
-Local rules (`files/local.rules`): plain DNS (53) and DNS-over-TLS/QUIC (853) leaving the machine
-are dropped. ctrld resolves over DoH (443), so this only stops leaks, such as ctrld's own plain-DNS
-fallback when its upstream fails, which the DNSLOCK firewall chain exempts. A captive portal that
-needs its own DNS won't resolve while this is in place. They also drop TLS (DoH) and QUIC (DoH3) connections whose
-SNI is a well-known public DoH resolver (dns.google, cloudflare-dns.com, quad9.net, NextDNS, AdGuard,
-Mullvad, ...), so apps can't bypass ctrld with their own resolver; `controld/` blocks the same
-resolvers' fixed IPs in the firewall, which also covers connections that hide their SNI.
+The ET categories that describe policy or informational activity rather than attacks (INFO, HUNTING,
+POLICY, GAMES, CHAT, P2P, DNS, DYN_DNS, TOR, USER_AGENTS) stay alert-only, for the classtype lines as
+well as the confidence line. The whole-group lines are not affected.
 
-Everything else alerts only. With all sources that's about 90k enabled rules, about 67k of them
-set to drop. Loading them takes about 50 s and about 800 MB of RAM, and a live reload briefly
-needs about double that. When `drop.conf` was introduced, it was checked against this machine's
-alert history: none of the normal traffic seen would have been blocked.
+Left out altogether (`files/disable.conf`): the ActiveX, retired and SCADA categories, which can't
+apply to this machine (about 700 rules). Three larger alert-only categories (web applications and
+web servers hosted here, dynamic-DNS lookups: about 13,000 rules) are listed there commented out;
+uncomment them if they are only noise for you. That is where most of the memory and reload time
+there is to save would come from.
+
+DNS lockdown rules (`/etc/suricata/dns-lockdown.rules`, installed with `controld/`): plain DNS (53)
+and DNS-over-TLS/QUIC (853) leaving the machine are dropped, as are TLS (DoH) and QUIC (DoH3)
+connections whose SNI is a well-known public DoH resolver. See [Control D DNS lockdown](#control-d-dns-lockdown).
+
+Everything else alerts only. With all sources that's about 110k enabled rules, most of them set to
+drop. Loading them takes about 50 s and well over 1 GB of RAM, and a live reload briefly needs about
+double that. When `drop.conf` was introduced, it was checked against this machine's alert history:
+none of the normal traffic seen would have been blocked.
 
 ## Safety
 
-- **Suricata down → traffic passes.** The NFQUEUE rules use `--queue-bypass`: if Suricata is
+- **Suricata down → traffic passes.** The NFQUEUE rule uses `--queue-bypass`: if Suricata is
   stopped, restarting or crashed, traffic flows uninspected rather than being blocked, so a failed
   start can't cut the network (or an SSH session). To keep that window short, systemd restarts
   Suricata 1 s after it exits for any reason, and apt is pinned to 8.x so an upgrade can't leave it
   unable to start.
+- **A failed install changes nothing.** The new config is tested as a candidate while Suricata keeps
+  running on the old one; on any failure the previous files are restored.
 - **Sandboxed.** Suricata runs with systemd hardening (read-only system, no kernel or namespace
   access) and Landlock (once started it can only touch its logs, `/var/lib/suricata` and `/run`).
   The daily `suricata-update` runs read-only except `/var/lib/suricata`, with no network admin or
@@ -284,18 +343,155 @@ alert history: none of the normal traffic seen would have been blocked.
   fills because Suricata can't keep up, packets are dropped rather than passed uninspected (TCP
   retransmits them). `check.sh` reports queue overflows; if they appear regularly, investigate
   load or set `fail-open: yes` in `files/suricata.yaml` and re-run `install.sh`.
-- The rules sit in the mangle table, so an ACCEPT verdict from Suricata still goes through UFW.
+- The rules sit in the mangle table, in a chain of their own (`SURICATA-NFQ`), so an ACCEPT verdict
+  from Suricata still goes through UFW and stop/start only ever touch rules this kit created.
 - The daily rule update tests the new ruleset and keeps the old one if the test fails, then reloads
-  rules live (no restart).
+  rules live (no restart). `check.sh` fails if the last update failed, not only if the rules are old.
 
 ## Tuning
 
 Something legitimate blocked? Find its SID in `/var/log/suricata/eve.json` (`"event_type":"drop"`
-or alerts with `"action":"blocked"`), add it to `/etc/suricata/disable.conf` (or to `files/modify.conf`
-as `<sid> "drop" "alert"`), then `sudo suricata-update && sudo systemctl reload suricata`.
-Changes made in `files/` are applied with `sudo ./install.sh`.
+or alerts with `"action":"blocked"`), add it to `files/disable.conf` (or to `files/modify.conf`
+as `<sid> "drop" "alert"` to keep the alert), then `sudo ./install.sh`. If nothing else changed, that
+reloads the rules without restarting Suricata.
+
+---
+
+# Control D DNS lockdown
+
+Needs `ctrld` installed, running and answering on `127.0.0.1:53` first (the installer checks and
+refuses otherwise, so DNS is never locked to a dead resolver).
+
+    cd controld
+    sudo ./install.sh                  # block direct DNS and public DoH, sandbox ctrld, lock browsers
+    sudo MODE=redirect ./install.sh    # redirect hard-coded IPv4 resolvers to ctrld instead of refusing
+    ./verify.sh                        # prove it: every bypass route is tried and must fail
+    sudo ./uninstall.sh
+
+What it puts in place:
+
+- **Firewall** (`/usr/local/sbin/dns-lockdown.sh`, `dns-lockdown.service`): a `DNSLOCK` chain, first
+  in filter OUTPUT and FORWARD, refusing 53, 853, mDNS and LLMNR to anything off-box and 443 to the
+  fixed IPs of public DoH resolvers. Loopback and ctrld's own cgroup are exempt. FORWARD covers VMs
+  and containers routed through this machine.
+- **Suricata rules**, if Suricata is installed: see above. Without Suricata only the firewall layer
+  exists; `../install.sh` adds the rules when it is run afterwards.
+- **One resolver list** for both: `files/doh-resolvers.conf`. Add a hostname or IP there and re-run
+  `install.sh`; hostnames become Suricata SNI rules, IPs become firewall rules.
+- **Browsers**: Firefox and the Chromium family (Chromium, and Chrome, Brave and Edge if installed)
+  get their own DoH switched off and locked by policy, so they use the system resolver, i.e. ctrld.
+  The policy files are world-readable, so they deliberately do not contain the Control D profile URL.
+- **ctrld itself**: binary, config and logs made root-only; a systemd sandbox that is removed again
+  automatically if ctrld stops resolving under it.
+
+### Captive portals
+
+A hotel or café login page only loads if the network's own DNS can be reached, which the lockdown
+forbids. Lift it for a few minutes:
+
+    sudo dns-lockdown.sh pause         # 10 minutes; `pause 30` for longer (60 at most)
+    sudo dns-lockdown.sh resume        # re-lock now
+    sudo dns-lockdown.sh status
+
+While paused, plain DNS on port 53 may leave the machine (the firewall chain is removed and port 53
+skips Suricata); DoT and the public DoH resolvers stay blocked. It re-locks by itself at the stated
+time, also straight after a suspend or reboot, and `verify.sh` and the alerting know it is deliberate.
+
+---
+
+# Tetragon
+
+    tetragon/local_install.sh               # install or upgrade, enable at boot, start
+    sudo tetragon/check.sh                  # health check; --canary also triggers a real alert
+    tetragon/local_uninstall.sh [--purge]   # --purge also deletes the event logs
+
+`local_install.sh` downloads the pinned release (checksum pinned in `config.sh`), installs it as a
+systemd service that starts before ordinary services at boot, and loads the policies in `policies/`.
+Its header documents every file it installs. `run.sh`/`stop.sh` run the same thing in Docker without
+installing anything, which is handy for trying a policy change but has no boot gate, journal copy
+or health check.
+
+Everything Tetragon sees goes to `/var/log/tetragon/tetragon.log` (root-only), minus what
+`export-denylist.jsonl` filters out. Policy hits are also copied into the journal
+(`journalctl -t tetragon-alerts`), a second record that deleting the log directory does not remove.
+
+| Policy | Logs |
+|--------|------|
+| `sensitive-files` | Reads of `/etc/shadow`, sudoers, SSH and GPG private keys, cloud and Docker credentials, browser password and cookie stores, the login keyring and CLI tokens, by anything other than the program that owns them |
+| `persistence` | Writes, symlinks (`systemctl enable`), hard links and renames into cron, systemd, autostart, shell start-up files, PAM, apt hooks and similar |
+| `privilege-escalation` | Processes switching to uid 0 |
+| `setuid-files` | A file being given the setuid bit |
+| `kernel-tampering`, `monitor-kernel-modules` | eBPF program loads, ptrace-style access to other processes, kernel module loads and unloads |
+| `suspicious-exec` | Programs run from `/dev/shm`. Programs with no file at all (memfd, deleted) are picked up from exec events by the journal copy |
+| `device-access` | Unexpected programs opening keyboards, cameras, microphones, HID devices |
+| `tcp-connect`, `tcp-listen` | Outbound TCP connections; programs starting to listen on a network-reachable address |
+| `tetragon-tamper`, `stack-tamper` | Changes to Tetragon's own logs, config and binaries; changes to Suricata's and the DNS lockdown's config, rules, scripts and logs |
+
+All policies observe only; nothing is blocked or killed.
+
+Per-machine settings:
+
+- **Whose home directory is watched.** Policy files say `@HOME@`; the installer fills in the home of
+  whoever runs it through sudo (`WATCH_USER=name ./local_install.sh` to choose).
+- **`export-denylist.jsonl`** and the container networks in `policies/tcp-connect.yaml` name this
+  machine's own containers and health checks. Adjust them to yours. Every denylist line must be
+  limited to exec events or one policy and tie arguments to a root-owned parent program, otherwise it
+  becomes a way to hide from the log; `make lint` and `check.sh` both check this.
+- **Excluded programs are matched by their real path**, not a symlink to it (on newer Ubuntu
+  `/usr/bin/sudo` is `/usr/lib/cargo/bin/sudo`).
+- `/etc/tetragon` is root-only, because the policies and denylist spell out what is and isn't
+  watched. This checkout is as private as wherever you keep it.
+
+The web viewer (`http://127.0.0.1:8099`) only serves the event stream to a browser that has the
+token: open the link in `sudo cat /etc/tetragon/viewer-url` once and the browser remembers it.
+
+A Tetragon limit worth knowing when editing policies: one policy can hold at most 8 prefix lists and
+8 exact-match lists across all its hooks, and 5 selectors per hook. `make lint` checks all three.
+
+---
+
+# Alerting
+
+    cd watch
+    sudo ./install.sh        # after the other kits
+    sudo ./uninstall.sh
+
+| Piece | What it does |
+|-------|--------------|
+| `ips-watch.timer` | Every 15 minutes runs Suricata's and Tetragon's health checks, checks ctrld and the `DNSLOCK` chain, and runs `analyse.py` over the last 15 minutes. Health problems notify when they appear, change or clear (and every 6 hours while they last). Suricata findings from MEDIUM up go to the journal; from HIGH up (`NOTIFY_MIN`) also to the desktop. |
+| `tetragon-notify.service` | A desktop notification for each Tetragon policy hit and fileless exec that isn't on the ignore list. The same policy and program notify at most once per 10 minutes, and at most 5 notifications per 5 minutes are shown. |
+| `ips-notify` | What both use: always writes to the journal (`journalctl -t ips-alert`), and notifies every logged-in desktop user. `sudo ips-notify normal "Test" "It works"` |
+
+Tuning lives in `watch/files/`: `ips-watch.conf` (thresholds) and `tetragon-ignore.conf` (which
+policy hits stay off the screen). The ignore list never removes anything from the journal or from
+Tetragon's log. To see what your machine produces and what the list drops:
+
+    journalctl -t tetragon-alerts --since -1d -o cat \
+      | /usr/local/lib/ips-watch/tetragon-notify.py --print | sort | uniq -c | sort -rn
+
+Expect to tune it during the first days: the shipped list covers a stock Ubuntu desktop with
+rootless Docker, and anything else that routinely trips a policy on your machine will notify until
+you add it. `sudo tetragon/check.sh --canary` is an end-to-end test: it reads one byte of
+`/etc/shadow` and a notification should appear.
+
+---
+
+# Checks and tests
+
+    sudo ./status.sh         # every kit's health check, with a summary
+    make lint                # syntax of every script, unit, policy and config; changes nothing
+    sudo make test           # the two firewall scripts, in a throwaway network namespace
+    make vm-test             # install -> check -> uninstall in a fresh Ubuntu VM (needs multipass)
+
+`make lint` uses `shellcheck` and PyYAML when they are installed and says what it skipped when they
+are not. `sudo make test` builds and tears down the real `SURICATA-NFQ`, `DNSLOCK` and pause rules
+(including the upgrade from the older rule layout) in a network namespace with its own empty
+firewall, so this machine's rules are never touched.
 
 ## Rolling out to a new machine
 
-1. Copy this folder to the machine and run `sudo ./install.sh && sudo ./check.sh --live`.
-2. Before relying on it widely, do one full install → check → uninstall cycle on a fresh Ubuntu VM.
+1. Install `ctrld` from Control D if you want the DNS lockdown.
+2. Copy this folder to the machine and follow [Quick start](#quick-start).
+3. Go through the per-machine settings under [Tetragon](#tetragon) and the notification ignore list.
+4. Before relying on it widely, run `make vm-test` (or do one full install → check → uninstall
+   cycle on a fresh Ubuntu VM by hand).

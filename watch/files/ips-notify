@@ -1,0 +1,45 @@
+#!/bin/bash
+# Tell the person at this machine that something needs looking at.
+#
+#   ips-notify LEVEL TITLE [BODY]
+#     LEVEL  log       journal only
+#            normal    journal + desktop notification
+#            critical  journal + desktop notification that stays until dismissed
+#
+# The journal entry (tag ips-alert) is always written, so there is a record even when
+# nobody is logged in: journalctl -t ips-alert
+# The desktop notification goes to every logged-in user who has a session bus.
+#
+# Installed as /usr/local/sbin/ips-notify by watch/install.sh. Used by ips-watch and
+# tetragon-notify; fine to call by hand to test: sudo ips-notify normal "Test" "It works"
+
+level=${1:-} title=${2:-} body=${3:-}
+case $level in
+    log | normal | critical) ;;
+    *) echo "Usage: $0 log|normal|critical TITLE [BODY]" >&2; exit 2 ;;
+esac
+[ -n "$title" ] || { echo "Usage: $0 log|normal|critical TITLE [BODY]" >&2; exit 2; }
+
+case $level in
+    critical) prio=daemon.crit ;;
+    normal) prio=daemon.warning ;;
+    *) prio=daemon.notice ;;
+esac
+# One journal line: the title, then the body with its line breaks flattened
+logger -t ips-alert -p "$prio" -- "$title${body:+: $(printf '%s' "$body" | tr '\n' '|' | sed 's/|/ | /g')}" 2>/dev/null
+
+[ "$level" = log ] && exit 0
+command -v notify-send >/dev/null || exit 0
+
+# Titles and bodies carry text that came off the network or out of a process's arguments.
+# Notification bodies understand a little markup, so make sure none of it is taken as such.
+body=$(printf '%s' "$body" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')
+
+loginctl list-users --no-legend 2>/dev/null | while read -r uid user _; do
+    case $uid in '' | *[!0-9]*) continue ;; esac
+    [ "$uid" -ge 1000 ] || continue
+    [ -S "/run/user/$uid/bus" ] || continue
+    timeout 5 runuser -u "$user" -- env DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+        notify-send -a "IPS watch" -u "$level" -i security-high -- "$title" "$body" 2>/dev/null
+done
+exit 0

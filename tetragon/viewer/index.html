@@ -234,9 +234,32 @@ document.getElementById("pause").onclick = e => {
   refreshEmpty();
 };
 
+// The event stream needs the token from the link the installer prints
+// (http://127.0.0.1:PORT/#token=...). Keep it for this origin, and take it out of the
+// address bar so it isn't left in the history or copied along with the URL.
+const TOKEN_KEY = "tetragon_viewer_token";
+function viewerToken() {
+  const m = /(?:^|[#?&])token=([\w-]+)/.exec(location.hash) || /(?:^|[#?&])token=([\w-]+)/.exec(location.search);
+  if (m) {
+    try { localStorage.setItem(TOKEN_KEY, m[1]); } catch {}
+    history.replaceState(null, "", location.pathname);
+    return m[1];
+  }
+  try { return localStorage.getItem(TOKEN_KEY) || ""; } catch { return ""; }
+}
+
 let pending = 0;
-function connect() {
-  const es = new EventSource("/events");
+async function connect() {
+  const query = "?token=" + encodeURIComponent(viewerToken());
+  try {
+    const r = await fetch("/auth" + query);
+    if (r.status === 403) {
+      statusEl.textContent = "not authorised: open the link printed by the installer (sudo cat /etc/tetragon/viewer-url)";
+      statusEl.className = "down";
+      return;
+    }
+  } catch {}  // server not reachable yet: EventSource below keeps retrying
+  const es = new EventSource("/events" + query);
   es.onopen = () => { statusEl.textContent = "live"; statusEl.className = "live"; };
   es.onerror = () => { statusEl.textContent = "disconnected, retrying…"; statusEl.className = "down"; };
   es.addEventListener("reset", () => {

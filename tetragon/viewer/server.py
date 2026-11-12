@@ -3,11 +3,20 @@
 
 Serves index.html and streams log lines to the browser with Server-Sent
 Events, following the file across Tetragon's log rotation.
+
+The event log is root-only, and this server would otherwise hand it to any
+local program that can open a socket to 127.0.0.1. With --token-file, the
+event stream is only served to requests that carry the token in that file
+(/events?token=...). The page itself holds no data and is served to anyone;
+it takes the token from the link (http://127.0.0.1:PORT/#token=...), keeps it
+in the browser's storage for this origin and sends it with the stream request.
 """
 import argparse
+import hmac
 import os
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlsplit
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 BACKLOG_LINES = 1000
@@ -65,16 +74,27 @@ def follow(path):
 class Handler(BaseHTTPRequestHandler):
     log_path = None
     allowed_hosts = set()
+    token = None  # None: no token configured, the stream is open to any local program
 
     def log_message(self, *args):
-        pass
+        pass  # also keeps the token (a query parameter) out of any log
+
+    def authorised(self, query):
+        if self.token is None:
+            return True
+        given = parse_qs(query).get("token", [""])[0]
+        return hmac.compare_digest(given.encode(), self.token.encode())
 
     def do_GET(self):
         # Reject other Host headers to block DNS-rebinding from web pages.
         if self.headers.get("Host", "") not in self.allowed_hosts:
             self.send_error(403)
             return
-        if self.path in ("/", "/index.html"):
+        url = urlsplit(self.path)
+        if url.path in ("/events", "/auth") and not self.authorised(url.query):
+            self.send_error(403, "Missing or wrong token")
+            return
+        if url.path in ("/", "/index.html"):
             with open(os.path.join(HERE, "index.html"), "rb") as f:
                 body = f.read()
             self.send_response(200)
@@ -82,7 +102,11 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
-        elif self.path == "/events":
+        elif url.path == "/auth":
+            # Lets the page tell "wrong token" from "server down" before it opens the stream
+            self.send_response(204)
+            self.end_headers()
+        elif url.path == "/events":
             self.stream()
         else:
             self.send_error(404)
@@ -116,15 +140,23 @@ def main():
     p.add_argument("--log", default="/var/log/tetragon/tetragon.log")
     p.add_argument("--bind", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8099)
+    p.add_argument("--token-file", help="file holding the token /events must be given; "
+                   "without it the event stream is open to every local program")
     args = p.parse_args()
 
+    if args.token_file:
+        with open(args.token_file) as f:
+            Handler.token = f.read().strip()
+        if not Handler.token:
+            raise SystemExit(f"{args.token_file} is empty")
     Handler.log_path = args.log
     Handler.allowed_hosts = {
         f"{h}:{args.port}" for h in ("127.0.0.1", "localhost", args.bind)
     }
     srv = ThreadingHTTPServer((args.bind, args.port), Handler)
     srv.daemon_threads = True
-    print(f"Tetragon viewer on http://{args.bind}:{args.port} (log: {args.log})", flush=True)
+    print(f"Tetragon viewer on http://{args.bind}:{args.port} (log: {args.log}, "
+          f"token {'required' if Handler.token else 'NOT required'})", flush=True)
     srv.serve_forever()
 
 

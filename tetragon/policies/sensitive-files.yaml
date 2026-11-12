@@ -8,8 +8,17 @@
 #      /etc/passwd and /etc/group, which everything reads but little writes
 #   3. any access to your own private keys and credentials by a program that
 #      is NOT the tool that owns them (catches credential stealers)
+#   4. any access to a browser's saved passwords and cookies by anything that
+#      is not that browser. These are the first thing an infostealer takes.
+#      Matched by profile directory plus file name, since profile names vary.
+#   5. any access to the login keyring and to command-line tools' saved tokens
+#      by a program that is NOT the tool that owns them
 # so routine reads by sudo and the PAM password helper are not logged.
 # ("/etc/sudoers" is a prefix, so it also covers /etc/sudoers.d/.)
+#
+# 3 to 5 are rate-limited to one event per process and file per minute. Expect
+# entries from backup tools and from snapd when it saves a snap's data on refresh.
+# @HOME@ is replaced by the watched user's home directory at install time.
 apiVersion: cilium.io/v1alpha1
 kind: TracingPolicy
 metadata:
@@ -19,6 +28,7 @@ spec:
   - call: "security_file_permission"
     syscall: false
     return: true
+    message: "Access to a credential or access-control file"
     args:
     - index: 0
       type: "file" # (struct file *) used for getting the path
@@ -41,6 +51,8 @@ spec:
       - operator: "NotIn"
         values:
         - "/usr/bin/sudo"
+        - "/usr/lib/cargo/bin/sudo" # sudo-rs: what /usr/bin/sudo points to on newer Ubuntu.
+                                    # Binaries are matched by their real path, not the symlink.
         - "/usr/sbin/unix_chkpwd"
         - "/usr/bin/su"
         - "/usr/bin/login"
@@ -65,12 +77,12 @@ spec:
       - index: 0
         operator: "Prefix"
         values:
-        - "/home/j/.ssh/id_"
-        - "/home/j/.gnupg/private-keys-v1.d/"
-        - "/home/j/.docker/config.json"
-        - "/home/j/.aws/credentials"
-        - "/home/j/.kube/config"
-        - "/home/j/.git-credentials"
+        - "@HOME@/.ssh/id_"
+        - "@HOME@/.gnupg/private-keys-v1.d/"
+        - "@HOME@/.docker/config.json"
+        - "@HOME@/.aws/credentials"
+        - "@HOME@/.kube/config"
+        - "@HOME@/.git-credentials"
       matchBinaries:
       - operator: "NotIn"
         values:
@@ -82,12 +94,71 @@ spec:
         - "/usr/bin/gpg-agent"
         - "/usr/bin/gnome-keyring-daemon"
         - "/usr/bin/docker"
+        - "/usr/libexec/docker/cli-plugins/docker-compose"
         - "/usr/bin/git"
         - "/usr/lib/git-core/git-remote-http" # git-remote-https symlinks here
         - "/usr/lib/git-core/git" # git-credential-* symlink here
+      matchActions:
+      - action: Post
+        rateLimit: "1m"
+    - matchArgs:
+      - index: 0
+        operator: "Prefix"
+        values:
+        - "@HOME@/snap/firefox/common/.mozilla/firefox/"
+        - "@HOME@/.mozilla/firefox/"
+        - "@HOME@/snap/chromium/common/chromium/"
+        - "@HOME@/.config/chromium/"
+        - "@HOME@/.config/google-chrome/"
+        - "@HOME@/.config/BraveSoftware/"
+        - "@HOME@/.config/microsoft-edge/"
+      - index: 0
+        operator: "Postfix"
+        values:
+        - "/logins.json"     # Firefox: saved passwords
+        - "/key4.db"         # Firefox: the key that decrypts them
+        - "/cookies.sqlite"  # Firefox: session cookies
+        - "/Login Data"      # Chromium family: saved passwords
+        - "/Cookies"         # Chromium family: session cookies
+        - "/Web Data"        # Chromium family: autofill, saved cards
+      matchBinaries:
+      - operator: "NotPrefix"
+        values:
+        - "/snap/firefox/"
+        - "/usr/lib/firefox/"
+        - "/snap/chromium/"
+        - "/usr/lib/chromium"
+        - "/opt/google/chrome/"
+        - "/opt/brave.com/"
+        - "/opt/microsoft/msedge/"
+      matchActions:
+      - action: Post
+        rateLimit: "1m"
+    - matchArgs:
+      - index: 0
+        operator: "Prefix"
+        values:
+        - "@HOME@/.local/share/keyrings/"
+        - "@HOME@/.config/gh/hosts.yml"
+        - "@HOME@/.netrc"
+        - "@HOME@/.npmrc"
+        - "@HOME@/.pypirc"
+        - "@HOME@/.config/composer/auth.json"
+        - "@HOME@/.composer/auth.json"
+        - "@HOME@/.config/gcloud/"
+      matchBinaries:
+      - operator: "NotIn"
+        values:
+        - "/usr/bin/gnome-keyring-daemon"
+        - "/usr/bin/gh"
+        - "/usr/lib/git-core/git-remote-http"
+      matchActions:
+      - action: Post
+        rateLimit: "1m"
   - call: "security_path_truncate"
     syscall: false
     return: true
+    message: "Truncation of a credential or access-control file"
     args:
     - index: 0
       type: "path" # (struct path *) used for getting the path

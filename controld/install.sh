@@ -2,7 +2,8 @@
 # Install the ctrld DNS lockdown. Run as root from this folder.
 #
 #   ./install.sh                  block direct DNS and public DoH resolvers, sandbox ctrld,
-#                                 lock browser DoH, make ctrld's config and logs root-only
+#                                 turn off the browsers' own DoH, make ctrld's config and
+#                                 logs root-only, add the DNS rules to Suricata if it is installed
 #   MODE=redirect ./install.sh    redirect hard-coded IPv4 resolvers to ctrld instead of refusing
 #   HARDEN=0 ./install.sh         skip the ctrld sandbox drop-in
 #   BROWSERS=0 ./install.sh       skip the Firefox/Chromium policies
@@ -19,7 +20,17 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 STATE=/var/lib/dns-lockdown
 CTRLD_DROPIN=/etc/systemd/system/ctrld.service.d
 FF_POLICY=/etc/firefox/policies/policies.json
-CR_POLICY=/etc/chromium-browser/policies/managed/dns-lockdown.json
+SURICATA_RULES=/etc/suricata/dns-lockdown.rules
+# Managed-policy directories of the Chromium family. The first is always written (the
+# Chromium snap reads it); the others only if that browser is installed.
+CR_POLICY_NAME=dns-lockdown.json
+CR_POLICY_DIRS=(
+    "/etc/chromium-browser/policies/managed:always"
+    "/etc/chromium/policies/managed:chromium"
+    "/etc/opt/chrome/policies/managed:google-chrome google-chrome-stable"
+    "/etc/brave/policies/managed:brave-browser"
+    "/etc/opt/edge/policies/managed:microsoft-edge microsoft-edge-stable"
+)
 
 say()  { printf '\n==> %s\n' "$*"; }
 die()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
@@ -59,6 +70,9 @@ ls -ld /etc/controld /var/log/ctrld*.log
 say "Firewall lockdown (mode=$MODE)"
 install -m 0755 -o root -g root "$HERE/files/dns-lockdown.sh" /usr/local/sbin/dns-lockdown.sh
 install -m 0644 -o root -g root "$HERE/files/dns-lockdown.service" /etc/systemd/system/dns-lockdown.service
+# The public DoH resolvers to block: IPs here in the firewall, hostnames in Suricata below
+install -d -m 0755 -o root -g root /etc/dns-lockdown
+install -m 0644 -o root -g root "$HERE/files/doh-resolvers.conf" /etc/dns-lockdown/doh-resolvers.conf
 echo "MODE=$MODE" > /etc/default/dns-lockdown
 mkdir -p "$CTRLD_DROPIN"
 install -m 0644 -o root -g root "$HERE/files/ctrld-50-dns-lockdown.conf" "$CTRLD_DROPIN/50-dns-lockdown.conf"
@@ -66,6 +80,29 @@ systemctl daemon-reload
 systemctl enable dns-lockdown.service
 systemctl restart dns-lockdown.service
 /usr/local/sbin/dns-lockdown.sh status
+
+say "Suricata DNS rules"
+# Second layer, by name: drops plain DNS/DoT that slips past the firewall (ctrld's own
+# fallback, which DNSLOCK exempts) and TLS/QUIC to the listed resolvers' hostnames.
+if [ -d /etc/suricata ] && getent group suricata >/dev/null; then
+    bash "$HERE/files/dns-lockdown-rules.sh" "$HERE/files/doh-resolvers.conf" > "$STATE/dns-lockdown.rules"
+    if cmp -s "$STATE/dns-lockdown.rules" "$SURICATA_RULES"; then
+        echo "$SURICATA_RULES is up to date"
+    else
+        install -m 0644 -o root -g suricata "$STATE/dns-lockdown.rules" "$SURICATA_RULES"
+        echo "Installed $SURICATA_RULES ($(grep -c '^drop ' "$SURICATA_RULES") rules)"
+        if ! grep -qs "^  - $SURICATA_RULES" /etc/suricata/suricata.yaml; then
+            echo "NOTE: Suricata's config doesn't load this file yet; run ../install.sh so it does"
+        elif systemctl is-active --quiet suricata; then
+            systemctl reload suricata
+            echo "Reloading Suricata's rules (takes about a minute to take effect)"
+        fi
+    fi
+    rm -f "$STATE/dns-lockdown.rules"
+else
+    echo "Suricata is not installed: only the firewall layer is in place."
+    echo "../install.sh adds these rules when it is run after this script."
+fi
 
 if [ "$HARDEN" = 1 ]; then
     say "Sandboxing ctrld"
@@ -90,10 +127,11 @@ fi
 
 if [ "$BROWSERS" = 1 ]; then
     say "Browser policies"
-    # Profile URL comes from your ctrld config rather than being stored in this folder
-    DOH_URL=$(grep -m1 -oP "^\s*endpoint\s*=\s*['\"]\Khttps://[^'\"]+" /etc/controld/local.toml || true)
-    [ -n "$DOH_URL" ] || die "couldn't read the https:// endpoint from /etc/controld/local.toml"
-    echo "Control D profile: $DOH_URL"
+    # Every browser gets its own DoH switched off and locked, so it uses the system
+    # resolver, i.e. ctrld. Firefox is not pointed at the Control D profile URL directly:
+    # this file has to be world-readable, and that URL holds the profile ID that
+    # /etc/controld is kept root-only to protect. It also keeps Firefox's lookups in
+    # ctrld's log and under its rules, like everything else.
 
     # Firefox: merge into any existing policies.json rather than overwrite it
     mkdir -p "$(dirname "$FF_POLICY")"
@@ -105,7 +143,7 @@ if [ "$BROWSERS" = 1 ]; then
             touch "$STATE/firefox-created"
         fi
     fi
-    DOH_URL="$DOH_URL" FF_POLICY="$FF_POLICY" python3 - <<'PY'
+    FF_POLICY="$FF_POLICY" python3 - <<'PY'
 import json, os
 path = os.environ["FF_POLICY"]
 data = {}
@@ -113,10 +151,8 @@ if os.path.exists(path) and os.path.getsize(path) > 0:
     with open(path) as f:
         data = json.load(f)
 data.setdefault("policies", {})["DNSOverHTTPS"] = {
-    "Enabled": True,
-    "ProviderURL": os.environ["DOH_URL"],
+    "Enabled": False,
     "Locked": True,
-    "Fallback": False,
 }
 with open(path + ".tmp", "w") as f:
     json.dump(data, f, indent=2)
@@ -127,10 +163,23 @@ PY
     echo "Firefox: $FF_POLICY (restart Firefox, then check about:policies)"
 
     # Chromium snap reads /etc/chromium-browser/policies via its system-files plug
-    mkdir -p "$(dirname "$CR_POLICY")"
-    install -m 0644 -o root -g root "$HERE/files/chromium-dns-lockdown.json" "$CR_POLICY"
-    echo "Chromium: $CR_POLICY (restart Chromium, then check chrome://policy)"
+    for entry in "${CR_POLICY_DIRS[@]}"; do
+        dir=${entry%%:*} found=0
+        for bin in ${entry#*:}; do
+            if [ "$bin" = always ] || command -v "$bin" >/dev/null; then found=1; fi
+        done
+        [ $found = 1 ] || continue
+        mkdir -p "$dir"
+        install -m 0644 -o root -g root "$HERE/files/chromium-dns-lockdown.json" "$dir/$CR_POLICY_NAME"
+        echo "Chromium family: $dir/$CR_POLICY_NAME (restart the browser, then check chrome://policy)"
+    done
+    echo "A browser installed later is covered by re-running this script."
 fi
 
 say "Verifying"
-sudo -u "${SUDO_USER:-j}" "$HERE/verify.sh" || true
+# verify.sh doesn't need root; run it as the person who called sudo when there is one
+if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ]; then
+    sudo -u "$SUDO_USER" "$HERE/verify.sh" || true
+else
+    "$HERE/verify.sh" || true
+fi

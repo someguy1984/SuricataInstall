@@ -17,6 +17,29 @@ TETRAGON_LOG_MAX_SIZE_MB=50
 TETRAGON_LOG_MAX_BACKUPS=40
 VIEWER_PORT="${VIEWER_PORT:-8099}"
 
+# Whose home directory the policies watch (shell start-up files, SSH keys, browser
+# and credential stores): the person running the installer, unless set here or in
+# the environment. Policy files say @HOME@ where that directory goes.
+WATCH_USER="${WATCH_USER:-${SUDO_USER:-$(id -un)}}"
+
+# Write ./policies into the directory $1 with @HOME@ filled in.
+render_policies() {
+	local dest="$1" home f
+	if [[ $WATCH_USER == root ]]; then
+		echo "error: can't tell whose home directory to watch when run as root without sudo;" >&2
+		echo "       set WATCH_USER=<your login name>" >&2
+		return 1
+	fi
+	home="$(getent passwd "$WATCH_USER" | cut -d: -f6)"
+	if [[ -z $home || ! -d $home ]]; then
+		echo "error: user '$WATCH_USER' has no home directory" >&2
+		return 1
+	fi
+	for f in "$DIR"/policies/*.yaml; do
+		sed "s|@HOME@|$home|g" "$f" >"$dest/$(basename "$f")" || return 1
+	done
+}
+
 # Private rootful dockerd, completely separate from your rootless Docker
 # (which lives at /run/user/$UID/docker.sock and is never touched).
 DOCKERD_UNIT="tetragon-dockerd"

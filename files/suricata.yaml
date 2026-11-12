@@ -1405,7 +1405,8 @@ security:
 # to be 'unlimited'.
 
 coredump:
-  max-dump: unlimited
+  # 0: no core dumps. A dump of Suricata's memory holds whatever traffic it was inspecting.
+  max-dump: 0
 
 # If the Suricata box is a router for the sniffed networks, set it to 'router'. If
 # it is a pure sniffing setup, set it to 'sniffer-only'.
@@ -2366,6 +2367,8 @@ rule-files:
   - suricata.rules
   # This machine's own rules (installed from files/local.rules), not touched by suricata-update
   - /etc/suricata/local.rules
+  # The Control D DNS lockdown's rules (controld/install.sh); a placeholder without it
+  - /etc/suricata/dns-lockdown.rules
 
 ##
 ## Auxiliary configuration files.

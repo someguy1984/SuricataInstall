@@ -3,18 +3,27 @@
 # lines are alternatives (OR). Lines starting with # are ignored by run.sh.
 # Field reference: docs/content/en/docs/concepts/events.md ("export filters").
 #
+# Rules for adding a line, so that this list can't be used to hide from the log:
+#   - always include "event_set": ["PROCESS_EXEC"], unless the line names one policy.
+#     A line without it also drops that process's policy hits, i.e. the evidence
+#     that it read a key or wrote to a start-up file.
+#   - anchor every regex at both ends (^...$). Arguments are whatever the process
+#     was started with, so never match on arguments alone: tie them to the
+#     root-owned program that starts the real thing (parent_binary_regex).
+#
 # Process exits: every exec already logs the process; exits double the volume.
 {"event_set": ["PROCESS_EXIT"]}
 #
 # Rootless Docker plumbing that runs every time a container or health check starts.
-{"binary_regex": ["^/usr/bin/runc$", "containerd-shim-runc-v2$"]}
+{"event_set": ["PROCESS_EXEC"], "binary_regex": ["^/usr/bin/runc$", "^/usr/bin/containerd-shim-runc-v2$"]}
 #
-# Docker health checks in the-profit-center-wrapper (mysql every 5s, mailpit every 15s).
-{"arguments_regex": ["SHOW DATABASES;", "^readyz$"]}
+# Docker health checks in the-profit-center-wrapper (mysql every 5s, mailpit every 15s),
+# only when started by the container runtime.
+{"event_set": ["PROCESS_EXEC"], "arguments_regex": ["SHOW DATABASES;", "^readyz$"], "parent_binary_regex": ["^/usr/bin/runc$", "^/usr/bin/containerd-shim-runc-v2$"]}
 #
 # GNOME's sandboxed image decoders (glycin), launched by bubblewrap.
-{"binary_regex": ["^/usr/libexec/glycin-loaders/"]}
-{"binary_regex": ["^/usr/bin/bwrap$"], "arguments_regex": ["/usr/libexec/glycin-loaders/"]}
+{"event_set": ["PROCESS_EXEC"], "binary_regex": ["^/usr/libexec/glycin-loaders/"]}
+{"event_set": ["PROCESS_EXEC"], "binary_regex": ["^/usr/bin/bwrap$"], "arguments_regex": ["/usr/libexec/glycin-loaders/"]}
 #
 # Firefox's own web traffic. Delete this line to see every site connection again.
 {"policy_names": ["tcp-connect"], "binary_regex": ["^/snap/firefox/"]}

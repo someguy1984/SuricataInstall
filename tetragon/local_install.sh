@@ -18,13 +18,23 @@
 #   /etc/systemd/system/tetragon.service.d/shutdown.conf
 #                                           clean stop late in shutdown
 #   /usr/local/libexec/tetragon-wait-ready  readiness check used by the gate
+#   /etc/tetragon/                          root-only (0700): the policies and the
+#                                           denylist say what is and isn't watched
 #   /etc/tetragon/tetragon.conf.d/          our option overrides
-#   /etc/tetragon/tetragon.tp.d/            mirror of ./policies (managed by this
-#                                           script: stray *.yaml there are removed)
+#   /etc/tetragon/tetragon.tp.d/            ./policies with @HOME@ filled in (managed
+#                                           by this script: stray *.yaml are removed)
+#   /etc/tetragon/viewer-token, viewer-url  the token the viewer's event stream
+#                                           needs, and the link that carries it
 #   /usr/local/lib/tetragon-viewer/         copy of ./viewer
+#   /usr/local/lib/tetragon-tools/          root-owned copy of check.sh and what it
+#                                           compares against (used by ../watch)
 #   /etc/systemd/system/tetragon-viewer.service   sandboxed, localhost only
-#   /etc/systemd/system/tetragon-alerts.service   copies policy hits into the
-#                                           journal (second, separate record)
+#   /etc/systemd/system/tetragon-alerts.service   copies policy hits and fileless
+#                                           execs into the journal (second,
+#                                           separate record)
+#
+# The policies watch one person's home directory: whoever runs this through
+# sudo, or WATCH_USER=<name> ./local_install.sh.
 #
 # Upgrading: set TETRAGON_VERSION in config.sh and replace the pinned
 # checksums/digests next to it with the values published for that release.
@@ -43,7 +53,8 @@ for arg in "$@"; do
 	--no-viewer) WITH_VIEWER=0 ;;
 	--no-boot-gate) WITH_BOOT_GATE=0 ;;
 	-h | --help)
-		sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'
+		# the comment block at the top of this file
+		awk 'NR > 1 && !/^#/ { exit } NR > 1 { sub(/^# ?/, ""); print }' "$0"
 		exit 0
 		;;
 	*)
@@ -64,6 +75,8 @@ source "$DIR/config.sh"
 ETC=/etc/tetragon
 UNIT_DIR=/etc/systemd/system
 VIEWER_DIR=/usr/local/lib/tetragon-viewer
+TOOLS_DIR=/usr/local/lib/tetragon-tools
+TOKEN_FILE=$ETC/viewer-token
 
 die() {
 	echo "error: $*" >&2
@@ -95,6 +108,10 @@ NAME="tetragon-${TETRAGON_VERSION}-${ARCH}"
 URL="https://github.com/cilium/tetragon/releases/download/${TETRAGON_VERSION}/${NAME}.tar.gz"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
+
+# Fill in the policies before touching anything, so a wrong WATCH_USER stops here
+mkdir "$WORK/policies"
+render_policies "$WORK/policies" || die "could not prepare the policies"
 
 echo "==> Downloading $NAME"
 curl -fsSL --proto '=https' --tlsv1.2 -o "$WORK/$NAME.tar.gz" "$URL"
@@ -136,18 +153,23 @@ install -m 0644 "$SRC/usr/local/lib/tetragon/systemd/tetragon.service" "$UNIT_DI
 # Each file in tetragon.conf.d is one command-line option (file name = flag,
 # contents = value). These sit on top of the defaults shipped in
 # /usr/local/lib/tetragon/tetragon.conf.d (socket, log file, compression ...).
+# Root only: the policies and the export denylist spell out exactly what is and
+# isn't watched, which is a map for staying out of sight. (This checkout is as
+# readable as wherever you keep it; that is yours to decide.)
 echo "==> Writing configuration to $ETC"
-install -d -m 0755 "$ETC" "$ETC/tetragon.conf.d" "$ETC/tetragon.tp.d"
+install -d -m 0700 -o root -g root "$ETC" "$ETC/tetragon.conf.d" "$ETC/tetragon.tp.d"
 echo true >"$ETC/tetragon.conf.d/enable-process-cred"
 echo "$TETRAGON_LOG_MAX_SIZE_MB" >"$ETC/tetragon.conf.d/export-file-max-size-mb"
 echo "$TETRAGON_LOG_MAX_BACKUPS" >"$ETC/tetragon.conf.d/export-file-max-backups"
 echo 600 >"$ETC/tetragon.conf.d/export-file-perm"
 grep -vE '^\s*(#|$)' "$DIR/export-denylist.jsonl" >"$ETC/tetragon.conf.d/export-denylist" || true
-chmod 0644 "$ETC/tetragon.conf.d/"*
+chmod 0600 "$ETC/tetragon.conf.d/"*
 
-echo "==> Syncing policies to $ETC/tetragon.tp.d"
+echo "==> Syncing policies to $ETC/tetragon.tp.d (watching $WATCH_USER's home directory)"
 find "$ETC/tetragon.tp.d" -maxdepth 1 -type f -name '*.yaml' -delete
-install -m 0644 "$DIR"/policies/*.yaml "$ETC/tetragon.tp.d/"
+install -m 0600 -o root -g root "$WORK"/policies/*.yaml "$ETC/tetragon.tp.d/"
+echo "$WATCH_USER" >"$ETC/watch-user" # check.sh fills in the policies the same way
+chmod 0600 "$ETC/watch-user"
 want=$(find "$ETC/tetragon.tp.d" -maxdepth 1 -name '*.yaml' | wc -l)
 
 # --- Boot gate --------------------------------------------------------------
@@ -275,23 +297,31 @@ fi
 
 # --- Second copy of policy hits in the journal --------------------------------
 # /var/log/tetragon is one directory an intruder with root can simply delete.
-# This streams every policy hit (not process exec/exit, so it stays small)
-# into journald as well: a separate store with its own retention, which can be
-# sealed (journalctl --setup-keys) or forwarded off the machine. tcp-connect is
-# left out: it is high-volume and not an alert on its own.
-echo "==> Installing tetragon-alerts.service (policy hits -> journal)"
-alert_policies="$(find "$ETC/tetragon.tp.d" -maxdepth 1 -name '*.yaml' -exec \
-	sed -n 's/^  name: *"\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' {} + |
-	grep -vx 'tcp-connect' | sort -u | paste -sd, -)"
+# This streams every policy hit (not ordinary process exec/exit, so it stays
+# small) into journald as well: a separate store with its own retention, which
+# can be sealed (journalctl --setup-keys) or forwarded off the machine. It reads
+# Tetragon's live stream, which the export denylist does not filter.
+#   - tcp-connect is left out: it is high-volume and not an alert on its own.
+#   - Execs of a program with no file behind it (memfd_create, or deleted while
+#     running: inode links = 0) are included; no policy can match those because
+#     they have no path. runc starts every container that way, so execs whose
+#     parent is runc are left out.
+# The filter is one CEL expression. It must not contain a comma or a double
+# quote: tetra splits the option's value on commas.
+echo "==> Installing tetragon-alerts.service (policy hits and fileless execs -> journal)"
+alerts_filter="(process_kprobe.policy_name != '' && process_kprobe.policy_name != 'tcp-connect')"
+alerts_filter+=" || (has(process_exec.process.binary_properties) && has(process_exec.process.binary_properties.file)"
+alerts_filter+=" && process_exec.process.binary_properties.file.inode.links == 0u"
+alerts_filter+=" && process_exec.parent.binary != '/usr/bin/runc')"
 cat >"$UNIT_DIR/tetragon-alerts.service" <<EOF
 # Installed by $DIR/local_install.sh
 [Unit]
-Description=Copy Tetragon policy hits into the systemd journal
+Description=Copy Tetragon policy hits and fileless execs into the systemd journal
 After=tetragon.service
 PartOf=tetragon.service
 
 [Service]
-ExecStart=/usr/local/bin/tetra --server-address unix://$TETRAGON_RUN_DIR/tetragon.sock getevents -o json --event-types PROCESS_KPROBE --policy-names $alert_policies
+ExecStart=/usr/local/bin/tetra --server-address unix://$TETRAGON_RUN_DIR/tetragon.sock getevents -o json --cel-expression "$alerts_filter"
 StandardOutput=journal
 SyslogIdentifier=tetragon-alerts
 Restart=always
@@ -339,6 +369,14 @@ if ((WITH_VIEWER)); then
 	echo "==> Installing web viewer service"
 	install -d -m 0755 "$VIEWER_DIR"
 	install -m 0644 "$DIR/viewer/server.py" "$DIR/viewer/index.html" "$VIEWER_DIR/"
+	# The event log is root-only; without a token the viewer would hand it to any
+	# local program that connects to 127.0.0.1. Kept across re-installs so the
+	# link stays valid; delete the file and re-run to change it.
+	if [[ ! -s $TOKEN_FILE ]]; then
+		(umask 077 && head -c 24 /dev/urandom | base64 | tr '+/' '-_' >"$TOKEN_FILE")
+	fi
+	echo "http://127.0.0.1:$VIEWER_PORT/#token=$(cat "$TOKEN_FILE")" >"$ETC/viewer-url"
+	chmod 0600 "$TOKEN_FILE" "$ETC/viewer-url"
 	cat >"$UNIT_DIR/tetragon-viewer.service" <<EOF
 # Installed by $DIR/local_install.sh
 [Unit]
@@ -347,7 +385,10 @@ After=tetragon.service
 Wants=tetragon.service
 
 [Service]
-ExecStart=/usr/bin/python3 -I $VIEWER_DIR/server.py --log $TETRAGON_LOG_DIR/tetragon.log --bind 127.0.0.1 --port $VIEWER_PORT
+# systemd reads the token before the sandbox below hides /etc/tetragon, and hands
+# the service a private copy (%d is its credentials directory)
+LoadCredential=viewer-token:$TOKEN_FILE
+ExecStart=/usr/bin/python3 -I $VIEWER_DIR/server.py --log $TETRAGON_LOG_DIR/tetragon.log --bind 127.0.0.1 --port $VIEWER_PORT --token-file %d/viewer-token
 Restart=on-failure
 RestartSec=5
 
@@ -395,6 +436,16 @@ EOF
 		echo "warning: viewer failed to start; check: journalctl -u tetragon-viewer" >&2
 fi
 
+# --- Root-owned copy of the health check --------------------------------------
+# For scheduled runs (../watch), which must not execute anything from a
+# checkout a normal user can write to.
+echo "==> Installing the health check to $TOOLS_DIR"
+rm -rf "$TOOLS_DIR"
+install -d -m 0700 -o root -g root "$TOOLS_DIR" "$TOOLS_DIR/policies"
+install -m 0700 "$DIR/check.sh" "$TOOLS_DIR/"
+install -m 0600 "$DIR/config.sh" "$DIR/export-denylist.jsonl" "$TOOLS_DIR/"
+install -m 0600 "$DIR"/policies/*.yaml "$TOOLS_DIR/policies/"
+
 cat <<EOF
 
 Tetragon $TETRAGON_VERSION is installed and enabled at boot.
@@ -405,8 +456,9 @@ Tetragon $TETRAGON_VERSION is installed and enabled at boot.
   Raw JSON log:  sudo tail -f $TETRAGON_LOG_DIR/tetragon.log
   Alerts copy:   journalctl -t tetragon-alerts -f
   Policies:      sudo tetra tracingpolicy list
+  Health check:  sudo $DIR/check.sh   (--canary also triggers a test alert)
 EOF
-((WITH_VIEWER)) && echo "  Web viewer:    http://127.0.0.1:$VIEWER_PORT"
+((WITH_VIEWER)) && echo "  Web viewer:    $(cat "$ETC/viewer-url")   (again later: sudo cat $ETC/viewer-url)"
 cat <<EOF
 
   Change policies or the denylist: edit them in $DIR, then re-run this script.
