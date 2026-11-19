@@ -408,9 +408,10 @@ refuses otherwise, so DNS is never locked to a dead resolver).
 What it puts in place:
 
 - **Firewall** (`/usr/local/sbin/dns-lockdown.sh`, `dns-lockdown.service`): a `DNSLOCK` chain, first
-  in filter OUTPUT and FORWARD, refusing 53, 853, mDNS and LLMNR to anything off-box and 443 to the
-  fixed IPs of public DoH resolvers. Loopback and ctrld's own cgroup are exempt. FORWARD covers VMs
-  and containers routed through this machine.
+  in filter OUTPUT, refusing 53, 853, mDNS and LLMNR to anything off-box and 443 to the fixed IPs of
+  public DoH resolvers. Loopback and ctrld's own cgroup are exempt. A twin chain, `DNSLOCK-FWD`, is
+  first in FORWARD and covers VMs and containers routed through this machine (it is separate because
+  the kernel does not allow a cgroup match on forwarded traffic).
 - **Suricata rules**, if Suricata is installed: see above. Without Suricata only the firewall layer
   exists; `../install.sh` adds the rules when it is run afterwards.
 - **One resolver list** for both: `controld/files/doh-resolvers.conf`. Add a hostname or IP there and re-run
@@ -434,11 +435,16 @@ forbids. Lift it for a few minutes:
     sudo dns-lockdown.sh resume        # re-lock now
     sudo dns-lockdown.sh status
 
-While paused, plain DNS on port 53 may leave the machine: the firewall chain is removed, port 53
-skips Suricata, and it is let past any "deny out 53" rule another firewall has of its own (`ufw deny
-out 53`, for example). DoT and the public DoH resolvers stay blocked. It re-locks by itself at the
-stated time, also straight after a suspend or reboot, and `verify.sh` and the alerting know it is
-deliberate.
+While paused, plain DNS on port 53 may leave the machine, and nothing else changes: port 53 is
+accepted ahead of the lockdown chain, of Suricata, and of any "deny out 53" rule another firewall has
+of its own (`ufw deny out 53`, for example). DoT and the public DoH resolvers stay blocked. It
+re-locks by itself at the stated time, also after a reboot, and `verify.sh` and the alerting know it
+is deliberate.
+
+The pause only opens the door. Programs still ask ctrld, and ctrld passes a lookup to the network's
+own DNS only when `leak_on_upstream_failure` is on in its config (its default on a desktop). With
+that option off, nothing uses the open port unless you point a lookup at the network's resolver
+yourself, for example `dig @192.0.2.1 login.example` with the address your DHCP lease gave you.
 
 ---
 

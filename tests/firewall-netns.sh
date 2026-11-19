@@ -90,24 +90,48 @@ echo "== dns-lockdown.sh"
 check "start succeeds" ns bash "$LOCK" start
 for cmd in iptables ip6tables; do
     has $cmd "" "-A OUTPUT -j DNSLOCK" "$cmd: OUTPUT jumps to DNSLOCK"
-    has $cmd "" "-A FORWARD -j DNSLOCK" "$cmd: FORWARD jumps to DNSLOCK"
+    has $cmd "" "-A FORWARD -j DNSLOCK-FWD" "$cmd: FORWARD jumps to DNSLOCK-FWD"
+    has $cmd "" "-A DNSLOCK-FWD -p udp -m udp --dport 853 -j REJECT --reject-with $([[ $cmd == iptables ]] && echo icmp-port-unreachable || echo icmp6-port-unreachable)" "$cmd: forwarded DoT is rejected"
     has $cmd "" "-A DNSLOCK -o lo -j RETURN" "$cmd: loopback is exempt"
 done
 has iptables "" "-A DNSLOCK -p udp -m udp --dport 53 -j REJECT --reject-with icmp-port-unreachable" "plain DNS is rejected"
 want4=$(grep -cE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' "$ROOT/controld/files/doh-resolvers.conf")
 want6=$(grep -cE '^[0-9A-Fa-f:]+:[0-9A-Fa-f:]*$' "$ROOT/controld/files/doh-resolvers.conf")
-[[ $(count iptables "" "--dport 443 -j REJECT --reject-with tcp-reset") -eq $want4 ]] \
-    && ok "every IPv4 resolver in the list is blocked on 443 ($want4)" || bad "IPv4 DoH rules don't match the list ($want4 expected)"
-[[ $(count ip6tables "" "--dport 443 -j REJECT --reject-with tcp-reset") -eq $want6 ]] \
-    && ok "every IPv6 resolver in the list is blocked on 443 ($want6)" || bad "IPv6 DoH rules don't match the list ($want6 expected)"
+# Once for this machine's own traffic and once for what it forwards
+for chain in DNSLOCK DNSLOCK-FWD; do
+    [[ $(rules iptables $chain | grep -c -- "--dport 443 -j REJECT --reject-with tcp-reset") -eq $want4 ]] \
+        && ok "$chain: every IPv4 resolver in the list is blocked on 443 ($want4)" || bad "$chain: IPv4 DoH rules don't match the list ($want4 expected)"
+    [[ $(rules ip6tables $chain | grep -c -- "--dport 443 -j REJECT --reject-with tcp-reset") -eq $want6 ]] \
+        && ok "$chain: every IPv6 resolver in the list is blocked on 443 ($want6)" || bad "$chain: IPv6 DoH rules don't match the list ($want6 expected)"
+done
 ns bash "$LOCK" start
 [[ $(count iptables "" "-A OUTPUT -j DNSLOCK") -eq 1 ]] && ok "start twice leaves one jump" || bad "start twice duplicated the jump"
+
+# With the resolver's cgroup present, as on a real machine. The cgroup match cannot be
+# reached from FORWARD (the kernel refuses the jump), which is why forwarded traffic has a
+# chain of its own; without this the whole lockdown failed to load wherever ctrld was running.
+# `ip netns exec` gives each command a /sys without the cgroup tree, so mount it first.
+echo "CGROUP=system.slice" > "$WORK/root/etc/default/dns-lockdown"
+nscg() { ns bash -c 'mount -t cgroup2 none /sys/fs/cgroup 2>/dev/null; exec "$@"' _ "$@"; }
+if nscg test -d /sys/fs/cgroup/system.slice; then
+    check "start succeeds with the resolver's cgroup exempted" nscg bash "$LOCK" start
+    for cmd in iptables ip6tables; do
+        has $cmd "" '-A DNSLOCK -m cgroup --path "system.slice" -j RETURN' "$cmd: the resolver's cgroup is exempt in OUTPUT"
+        has $cmd "" "-A FORWARD -j DNSLOCK-FWD" "$cmd: FORWARD is still covered with the exemption in place"
+        if rules $cmd DNSLOCK-FWD | grep -q -- '-m cgroup'; then bad "$cmd: the forward chain holds a cgroup match"; else ok "$cmd: the forward chain holds no cgroup match"; fi
+    done
+else
+    echo "  SKIP the cgroup exemption (no system.slice cgroup here)"
+fi
+rm -f "$WORK/root/etc/default/dns-lockdown"
+ns bash "$LOCK" start
 
 ns bash "$NFQ" start
 # Another firewall's own "deny out 53" (what `ufw deny out 53` adds): the pause has to get past it
 for cmd in iptables ip6tables; do ns $cmd -A OUTPUT -p udp --dport 53 -j DROP; done
 check "pause succeeds" ns bash "$LOCK" pause 5
-hasnt iptables "" "-A OUTPUT -j DNSLOCK" "pause lifts the firewall chain"
+has iptables "" "-A OUTPUT -j DNSLOCK" "pause leaves the rest of the lockdown in place"
+has iptables "" "-A DNSLOCK -p udp -m udp --dport 853 -j REJECT --reject-with icmp-port-unreachable" "pause: DoT stays rejected"
 [[ $(rules iptables OUTPUT mangle | sed -n 2p) == "-A OUTPUT -j DNSLOCK-PAUSE" ]] \
     && ok "pause: port 53 is accepted ahead of Suricata's queue" || bad "pause chain is not first in mangle OUTPUT"
 has iptables mangle "-A DNSLOCK-PAUSE -p udp -m udp --dport 53 -j ACCEPT" "pause accepts UDP 53 only by port"
@@ -125,9 +149,12 @@ dropped=$(ns iptables -L OUTPUT -v -n -x | awk '$3 == "DROP" && /udp dpt:53/ { p
 check "pause schedules the re-lock" grep -q "systemd-run .*--unit=dns-lockdown-rearm .*dns-lockdown.sh start" "$WORK/calls"
 check "pause leaves a marker for status/verify" test -s "$WORK/root/run/dns-lockdown.paused"
 ns bash "$LOCK" refresh
-hasnt iptables "" "-A OUTPUT -j DNSLOCK" "a ctrld restart during a pause does not re-lock early"
+for cmd in iptables ip6tables; do
+    [[ $(rules $cmd OUTPUT | sed -n 2p) == "-A OUTPUT -j DNSLOCK-PAUSE" && $(rules $cmd OUTPUT | sed -n 3p) == "-A OUTPUT -j DNSLOCK" ]] \
+        && ok "$cmd: a ctrld restart during a pause rebuilds the chain behind the pause" || bad "$cmd: a ctrld restart during a pause re-locked early"
+done
 check "resume succeeds" ns bash "$LOCK" resume
-has iptables "" "-A OUTPUT -j DNSLOCK" "resume re-locks"
+[[ $(rules iptables OUTPUT | sed -n 2p) == "-A OUTPUT -j DNSLOCK" ]] && ok "resume re-locks" || bad "resume: DNSLOCK is not first in OUTPUT"
 hasnt iptables mangle "-N DNSLOCK-PAUSE" "resume removes the pause chain"
 for cmd in iptables ip6tables; do
     hasnt $cmd "" "-N DNSLOCK-PAUSE" "$cmd: resume removes the filter pause chain"
@@ -141,6 +168,12 @@ has iptables "" "-A OUTPUT -j DNSLOCK" "a refused pause leaves the lockdown in p
 echo "MODE=redirect" > "$WORK/root/etc/default/dns-lockdown"
 ns bash "$LOCK" start
 has iptables nat "-A OUTPUT -j DNSLOCK" "redirect mode adds the nat chain"
+ns bash "$LOCK" pause 5
+hasnt iptables nat "-A OUTPUT -j DNSLOCK" "redirect mode: pause lifts the redirect (it would send the lookups back to ctrld)"
+ns bash "$LOCK" refresh
+hasnt iptables nat "-A OUTPUT -j DNSLOCK" "redirect mode: a ctrld restart during a pause does not bring the redirect back"
+ns bash "$LOCK" resume
+has iptables nat "-A OUTPUT -j DNSLOCK" "redirect mode: resume puts the redirect back"
 rm -f "$WORK/root/etc/default/dns-lockdown"
 
 rm -f "$WORK/root/etc/dns-lockdown/doh-resolvers.conf"
@@ -149,6 +182,7 @@ has iptables "" "-A DNSLOCK -p udp -m udp --dport 53 -j REJECT --reject-with icm
 
 check "stop succeeds" ns bash "$LOCK" stop
 hasnt iptables "" "-N DNSLOCK" "stop removes the chain"
+hasnt iptables "" "-N DNSLOCK-FWD" "stop removes the forward chain"
 hasnt iptables nat "-N DNSLOCK" "stop removes the nat chain"
 has iptables mangle "-A OUTPUT -j SURICATA-NFQ" "stop leaves Suricata's chain alone"
 

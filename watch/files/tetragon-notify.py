@@ -8,13 +8,14 @@ list only decides what pops up on screen.
 
 Each event is reduced to one line,
 
-    POLICY FUNCTION BINARY DETAIL
+    POLICY FUNCTION BINARY DETAIL <- PARENT
 
 for example
 
-    sensitive-files security_file_permission /usr/bin/cat /home/j/.ssh/id_ed25519
+    sensitive-files security_file_permission /usr/bin/cat /home/j/.ssh/id_ed25519 <- /usr/bin/bash
 
-and dropped if any pattern in the ignore file matches that line (Python regular
+(a script is named by its own path, not its interpreter's) and dropped if any pattern
+in the ignore file matches that line (Python regular
 expressions, one per line, searched anywhere in it). Run with --print to see the lines
 for the events on stdin without notifying, which is how to write a new pattern:
 
@@ -22,7 +23,12 @@ for the events on stdin without notifying, which is how to write a new pattern:
 
 Two limits keep a noisy program from flooding the screen: the same policy and binary
 notify once per --repeat seconds, and at most --burst notifications are shown per
---window seconds (one more then says that the rest were held back).
+--window seconds (one more then says that the rest were held back, and another says
+which policies they were once the burst is over).
+
+Tampering with the watchers themselves (ALWAYS below) is not subject to either: a
+different file is a different alert, and a burst of other alerts does not hold it back.
+It has a limit of its own, four times as high, so a reinstall cannot bury the screen.
 """
 import argparse
 import json
@@ -30,6 +36,11 @@ import re
 import subprocess
 import sys
 import time
+
+# Tampering with Tetragon or with the IPS: see the module comment
+ALWAYS = {"tetragon-tamper", "stack-tamper"}
+# Worth knowing, not worth a notification that stays on screen until dismissed
+QUIET = {"tcp-listen", "device-access"}
 
 
 def detail(args):
@@ -73,13 +84,15 @@ def describe(event):
     proc, parent = k.get("process", {}), k.get("parent", {})
     binary = proc.get("binary", "?")
     summary = " ".join(x for x in (policy, function, binary, extra) if x)
+    if parent.get("binary"):
+        summary += f' <- {parent["binary"]}'
     body = [f'{binary} (pid {proc.get("pid", "?")}, uid {proc.get("uid", "?")})']
     if extra:
         body.append(extra[:300])
     if parent.get("binary"):
         body.append(f'started by {parent["binary"]} {" ".join(str(parent.get("arguments", "")).split())}'[:200])
     body.append(f"journalctl -t tetragon-alerts | grep {policy}")
-    return summary, f"Tetragon: {what}", "\n".join(body), (policy, binary)
+    return summary, f"Tetragon: {what}", "\n".join(body), policy, binary
 
 
 def load_ignores(path):
@@ -111,19 +124,21 @@ def main():
     args = p.parse_args()
 
     ignores = load_ignores(args.ignore)
-    last = {}     # (policy, binary) -> time of its last notification
-    sent = []     # times of recent notifications, for the burst limit
-    held = False  # the "holding back" notice has been shown for the current burst
+    last = {}                        # dedup key -> time of its last notification
+    sent = {False: [], True: []}     # times of recent notifications: ordinary, ALWAYS
+    held = {}                        # policy -> how many were held back in this burst
+    announced = False                # the "holding back" notice has been shown for it
 
     for line in sys.stdin:
         try:
             event = json.loads(line)
-        except ValueError:
+            described = describe(event) if isinstance(event, dict) else None
+        except Exception as e:       # one odd event must not end the notifications
+            print(f"skipped an event that could not be read: {e!r}", file=sys.stderr, flush=True)
             continue
-        described = describe(event) if isinstance(event, dict) else None
         if not described:
             continue
-        summary, title, body, key = described
+        summary, title, body, policy, binary = described
         ignored = any(r.search(summary) for r in ignores)
         if args.print:
             print(("- " if ignored else "  ") + summary, flush=True)
@@ -131,23 +146,32 @@ def main():
         if ignored:
             continue
         now = time.monotonic()
+        always = policy in ALWAYS
+        key = (policy, summary) if always else (policy, binary)
         if now - last.get(key, -1e9) < args.repeat:
             continue
-        sent = [t for t in sent if now - t < args.window]
-        if len(sent) >= args.burst:
-            if not held:
-                held = True
+        for kind in sent:
+            sent[kind] = [t for t in sent[kind] if now - t < args.window]
+        if len(sent[always]) >= args.burst * (4 if always else 1):
+            held[policy] = held.get(policy, 0) + 1
+            if not announced:
+                announced = True
                 subprocess.run([args.notify, "normal", "Tetragon: more alerts are being held back",
                                 f"More than {args.burst} in {int(args.window / 60)} minutes. "
                                 "They are all in the journal: journalctl -t tetragon-alerts"])
             continue
-        held = False
+        if held and len(sent[False]) < args.burst:
+            # The burst is over: say what did not make it to the screen
+            what = ", ".join(f"{n} x {name}" for name, n in sorted(held.items()))
+            subprocess.run([args.notify, "normal", "Tetragon: alerts held back during the last burst",
+                            f"{what}. They are all in the journal: journalctl -t tetragon-alerts"])
+            held, announced = {}, False
         last[key] = now
-        sent.append(now)
+        sent[always].append(now)
         if len(last) > 5000:  # forget the oldest; nothing else bounds this
             for old in sorted(last, key=last.get)[:1000]:
                 del last[old]
-        subprocess.run([args.notify, "critical", title, body])
+        subprocess.run([args.notify, "normal" if policy in QUIET else "critical", title, body])
 
 
 if __name__ == "__main__":

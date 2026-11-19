@@ -48,9 +48,16 @@ if [[ -x $SURICATA_TOOLS/check.sh ]]; then
 fi
 if systemctl is-enabled --quiet dns-lockdown.service 2>/dev/null; then
     systemctl is-active --quiet ctrld || problems+=("DNS: ctrld is not running (this machine has no DNS)")
-    # A captive-portal pause removes the chain on purpose and puts it back by itself
-    if [[ ! -e /run/dns-lockdown.paused ]] && ! iptables -S OUTPUT 2>/dev/null | grep -q -- '-j DNSLOCK$'; then
+    # The chain stays in place during a captive-portal pause too (only port 53 is let past it)
+    if ! iptables -S OUTPUT 2>/dev/null | grep -q -- '-j DNSLOCK$'; then
         problems+=("DNS: the DNSLOCK firewall chain is missing (DNS is not forced through ctrld)")
+    fi
+    # A pause ends by itself. One that has outlived its time means the re-lock did not happen
+    if iptables -S OUTPUT 2>/dev/null | grep -q -- '-j DNSLOCK-PAUSE$'; then
+        until=$(cat /run/dns-lockdown.paused 2>/dev/null)
+        if [[ -z $until ]] || [[ $(date -d "$until" +%s 2>/dev/null || echo 0) -lt $(date +%s) ]]; then
+            problems+=("DNS: the lockdown pause did not end when it should have (plain DNS can still leave; run: dns-lockdown.sh resume)")
+        fi
     fi
 fi
 if [[ -x $TETRAGON_TOOLS/check.sh ]]; then
@@ -81,7 +88,7 @@ if [[ -x $SURICATA_TOOLS/analyse.py ]]; then
     # Reports the findings that are new: one already reported within REPEAT_MIN is left
     # out, so something long-running isn't repeated on every run
     printf '%s' "$report" | NOTIFY=$NOTIFY NOTIFY_MIN=$NOTIFY_MIN REPEAT_MIN=$REPEAT_MIN SEEN="$STATE/findings" python3 -I -c '
-import json, os, subprocess, sys, time
+import json, os, re, subprocess, sys, time
 
 RANK = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
 NAME = {v: k for k, v in RANK.items()}
@@ -104,10 +111,14 @@ except (OSError, ValueError):
 def flat(text):
     return " ".join(str(text).split())
 
+def same(title):
+    # The count at the end of a title changes from run to run; it is still the same finding
+    return re.sub(r" \(x\d+\)$", "", flat(title))
+
 new = [f for f in report.get("findings", [])
-       if RANK.get(f.get("severity"), 4) <= RANK["MEDIUM"] and flat(f.get("title")) not in seen]
+       if RANK.get(f.get("severity"), 4) <= RANK["MEDIUM"] and same(f.get("title")) not in seen]
 for f in new:
-    seen[flat(f["title"])] = now
+    seen[same(f["title"])] = now
 with open(seen_path + ".tmp", "w") as out:
     for title, ts in seen.items():
         out.write(str(ts) + " " + title + "\n")

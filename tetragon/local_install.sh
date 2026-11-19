@@ -167,6 +167,8 @@ echo 600 >"$ETC/tetragon.conf.d/export-file-perm"
 echo 127.0.0.1:6789 >"$ETC/tetragon.conf.d/health-server-address"
 grep -vE '^\s*(#|$)' "$DIR/export-denylist.jsonl" >"$ETC/tetragon.conf.d/export-denylist" || true
 chmod 0600 "$ETC/tetragon.conf.d/"*
+# Logs rotated before export-file-perm was 600 keep the mode they were written with
+chmod 0600 "$TETRAGON_LOG_DIR"/tetragon* 2>/dev/null || true
 
 echo "==> Syncing policies to $ETC/tetragon.tp.d (watching $WATCH_USER's home directory)"
 find "$ETC/tetragon.tp.d" -maxdepth 1 -type f -name '*.yaml' -delete

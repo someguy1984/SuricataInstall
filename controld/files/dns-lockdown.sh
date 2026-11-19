@@ -2,7 +2,7 @@
 # Force all DNS through ctrld.
 #
 # Builds a DNSLOCK chain in the filter table (IPv4 + IPv6), jumped to from position 1 of
-# OUTPUT and FORWARD, that refuses plain DNS (53), DoT/DoQ (853), mDNS (5353) and LLMNR
+# OUTPUT (and a twin, DNSLOCK-FWD, from FORWARD), that refuses plain DNS (53), DoT/DoQ (853), mDNS (5353) and LLMNR
 # (5355) to anything off-box, plus HTTPS/QUIC (443) to the fixed IPs of well-known public
 # DoH resolvers, so apps can't bypass ctrld with their own DNS-over-HTTPS. Loopback
 # (i.e. ctrld on 127.0.0.1:53) and ctrld's own cgroup are exempt. The resolver IPs come
@@ -24,14 +24,17 @@
 # never flushes chains it doesn't own, so this survives `ufw reload`.
 #
 # pause: a captive portal (hotel, café) only works if its own DNS can be reached. `pause`
-# lifts the lockdown for a few minutes (plain DNS on port 53 only: the firewall chain is
-# removed, port 53 skips Suricata, and it is let past any "deny out 53" another firewall
-# has of its own), then puts it back by itself. A reboot, `start` or `resume` re-locks at once.
+# lets plain DNS on port 53 out for a few minutes and nothing else: it is accepted ahead of
+# this chain, of Suricata's queue and of any "deny out 53" another firewall has of its own.
+# DoT, the DoH resolvers and the rest stay blocked. It ends by itself; a reboot, `start` or
+# `resume` ends it at once. (The pause only opens the door: programs still ask ctrld, which
+# uses the network's own DNS only if leak_on_upstream_failure is on in its config.)
 #
 # Usage: dns-lockdown.sh start|stop|refresh|status|resume
 #        dns-lockdown.sh pause [MINUTES]     (default 10, at most 60)
 
 CHAIN=DNSLOCK
+FWD_CHAIN=DNSLOCK-FWD
 PAUSE_CHAIN=DNSLOCK-PAUSE
 REARM_UNIT=dns-lockdown-rearm
 CGROUP=system.slice/ctrld.service
@@ -52,18 +55,24 @@ doh_ips() {
         fam == 6 && /:/ && /^[0-9A-Fa-f:]+$/ { print }' | paste -sd, -
 }
 
-remove_rules() {
-    for cmd in iptables ip6tables; do
-        for hook in OUTPUT FORWARD; do
-            while $cmd -D $hook -j $CHAIN 2>/dev/null; do :; done
-        done
-        $cmd -F $CHAIN 2>/dev/null
-        $cmd -X $CHAIN 2>/dev/null
-    done
+remove_nat() {
     while iptables -t nat -D OUTPUT -j $CHAIN 2>/dev/null; do :; done
     iptables -t nat -F $CHAIN 2>/dev/null
     iptables -t nat -X $CHAIN 2>/dev/null
     return 0
+}
+
+remove_rules() {
+    for cmd in iptables ip6tables; do
+        while $cmd -D OUTPUT -j $CHAIN 2>/dev/null; do :; done
+        while $cmd -D FORWARD -j $FWD_CHAIN 2>/dev/null; do :; done
+        while $cmd -D FORWARD -j $CHAIN 2>/dev/null; do :; done   # the layout before DNSLOCK-FWD
+        for chain in $CHAIN $FWD_CHAIN; do
+            $cmd -F $chain 2>/dev/null
+            $cmd -X $chain 2>/dev/null
+        done
+    done
+    remove_nat
 }
 
 is_paused() { iptables -t mangle -n -L $PAUSE_CHAIN >/dev/null 2>&1; }
@@ -85,27 +94,39 @@ remove_pause() {
 
 have_ctrld_cgroup() { [ -d "/sys/fs/cgroup/$CGROUP" ]; }
 
+# What may not leave, the same for this machine's own traffic and for what it forwards
+add_blocks() {
+    local cmd=$1 chain=$2 doh proto
+    for proto in udp tcp; do
+        $cmd -A $chain -p $proto --dport 53 -j REJECT || return 1
+        $cmd -A $chain -p $proto --dport 853 -j REJECT || return 1
+        $cmd -A $chain -p $proto --dport 5355 -j DROP || return 1
+    done
+    $cmd -A $chain -p udp --dport 5353 -j DROP || return 1
+    if [ "$cmd" = ip6tables ]; then doh=$(doh_ips 6); else doh=$(doh_ips 4); fi
+    if [ -n "$doh" ]; then
+        # tcp-reset / port-unreachable so a blocked DoH client fails over at once instead of hanging
+        $cmd -A $chain -p tcp --dport 443 -d "$doh" -j REJECT --reject-with tcp-reset || return 1
+        $cmd -A $chain -p udp --dport 443 -d "$doh" -j REJECT || return 1
+    fi
+}
+
 build_filter() {
-    local cmd=$1 doh
+    local cmd=$1
     $cmd -N $CHAIN || return 1
     $cmd -A $CHAIN -o lo -j RETURN || return 1
     if have_ctrld_cgroup; then
         $cmd -A $CHAIN -m cgroup --path $CGROUP -j RETURN || return 1
     fi
-    for proto in udp tcp; do
-        $cmd -A $CHAIN -p $proto --dport 53 -j REJECT || return 1
-        $cmd -A $CHAIN -p $proto --dport 853 -j REJECT || return 1
-        $cmd -A $CHAIN -p $proto --dport 5355 -j DROP || return 1
-    done
-    $cmd -A $CHAIN -p udp --dport 5353 -j DROP || return 1
-    if [ "$cmd" = ip6tables ]; then doh=$(doh_ips 6); else doh=$(doh_ips 4); fi
-    if [ -n "$doh" ]; then
-        # tcp-reset / port-unreachable so a blocked DoH client fails over at once instead of hanging
-        $cmd -A $CHAIN -p tcp --dport 443 -d "$doh" -j REJECT --reject-with tcp-reset || return 1
-        $cmd -A $CHAIN -p udp --dport 443 -d "$doh" -j REJECT || return 1
-    fi
+    add_blocks $cmd $CHAIN || return 1
+    # Forwarded traffic gets a chain of its own. The cgroup match only exists for packets
+    # this machine itself sends or receives, and the kernel refuses a jump from FORWARD into
+    # a chain that holds one ("RULE_INSERT failed (Invalid argument)"). Nothing forwarded
+    # belongs to ctrld anyway.
+    $cmd -N $FWD_CHAIN || return 1
+    add_blocks $cmd $FWD_CHAIN || return 1
     $cmd -I OUTPUT 1 -j $CHAIN || return 1
-    $cmd -I FORWARD 1 -j $CHAIN || return 1
+    $cmd -I FORWARD 1 -j $FWD_CHAIN || return 1
 }
 
 build_nat() {
@@ -134,11 +155,14 @@ apply_rules() {
         remove_rules
         return 1
     fi
-    if [ "$MODE" = "redirect" ] && ! build_nat; then
+    # Not while paused: the redirect would send the lookups the pause lets out back to ctrld
+    if [ "$MODE" = "redirect" ] && ! is_paused && ! build_nat; then
         log "failed to build nat redirect; removing all rules"
         remove_rules
         return 1
     fi
+    # Building the chain put its jump first; a pause in progress has to stay ahead of it
+    raise_pause
     log "active (mode=$MODE, ctrld exempt=$(have_ctrld_cgroup && echo yes || echo no))"
 }
 
@@ -155,6 +179,16 @@ build_pause() {
             $cmd -t $table -A $PAUSE_CHAIN -p $proto --dport 53 -j ACCEPT || return 1
         done
         $cmd -t $table -I OUTPUT 1 -j $PAUSE_CHAIN || return 1
+    done
+}
+
+# Put the filter pause chain back at the top of OUTPUT (no-op when not paused)
+raise_pause() {
+    local cmd
+    for cmd in iptables ip6tables; do
+        $cmd -n -L $PAUSE_CHAIN >/dev/null 2>&1 || continue
+        while $cmd -D OUTPUT -j $PAUSE_CHAIN 2>/dev/null; do :; done
+        $cmd -I OUTPUT 1 -j $PAUSE_CHAIN
     done
 }
 
@@ -178,13 +212,13 @@ pause_rules() {
         log "could not schedule the re-lock; not pausing"
         return 1
     fi
-    remove_rules
+    # The lockdown chain stays where it is: only port 53 is let past it
     if ! { build_pause iptables && build_pause ip6tables; }; then
-        log "failed to build the pause rules; re-locking"
+        log "failed to build the pause rules; staying locked"
         remove_pause
-        apply_rules
         return 1
     fi
+    remove_nat
     echo "$until" > "$PAUSE_MARK"
     log "PAUSED until $until: plain DNS (port 53) may leave this machine. Re-lock now with: $0 resume"
 }
@@ -201,8 +235,8 @@ case ${1:-start} in
         ;;
     refresh)
         # Called from ctrld's ExecStartPost: a restarted ctrld gets a new cgroup,
-        # so the exemption has to be rebuilt. No-op if the lockdown isn't active
-        # (or is paused: the re-lock builds it for the current cgroup anyway).
+        # so the exemption has to be rebuilt. No-op if the lockdown isn't active.
+        # During a pause the chain is rebuilt and the pause stays ahead of it.
         if iptables -n -L $CHAIN >/dev/null 2>&1; then
             apply_rules
         fi
@@ -217,6 +251,7 @@ case ${1:-start} in
         for cmd in iptables ip6tables; do
             echo "== $cmd filter"
             $cmd -n -v -L $CHAIN 2>/dev/null || echo "(not active)"
+            $cmd -n -v -L $FWD_CHAIN 2>/dev/null
         done
         echo "== iptables nat"
         iptables -t nat -n -v -L $CHAIN 2>/dev/null || echo "(not active)"
