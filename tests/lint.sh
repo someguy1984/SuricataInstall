@@ -116,8 +116,11 @@ for n, line in enumerate(open(sys.argv[1]), 1):
         for rx in f.get(key, []):
             if not rx.startswith("^"):
                 print(f"  FAIL  line {n}: {key} {rx!r} is not anchored with ^"); failed = True
+    # Arguments are whatever the process was started with: on their own they hide anything
+    if f.get("arguments_regex") and not (f.get("binary_regex") or f.get("parent_binary_regex")):
+        print(f"  FAIL  line {n}: arguments_regex without binary_regex or parent_binary_regex: {line[:80]}"); failed = True
 if not failed:
-    print("  ok    every line is limited to an event type or policy, and binary patterns are anchored")
+    print("  ok    every line is limited to an event type or policy, binary patterns are anchored, and none matches on arguments alone")
 sys.exit(failed)
 PY
 then :; else FAIL=1; fi

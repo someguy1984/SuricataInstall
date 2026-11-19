@@ -25,8 +25,8 @@
 #
 # pause: a captive portal (hotel, café) only works if its own DNS can be reached. `pause`
 # lifts the lockdown for a few minutes (plain DNS on port 53 only: the firewall chain is
-# removed and port 53 skips Suricata), then puts it back by itself. A reboot, `start` or
-# `resume` re-locks at once.
+# removed, port 53 skips Suricata, and it is let past any "deny out 53" another firewall
+# has of its own), then puts it back by itself. A reboot, `start` or `resume` re-locks at once.
 #
 # Usage: dns-lockdown.sh start|stop|refresh|status|resume
 #        dns-lockdown.sh pause [MINUTES]     (default 10, at most 60)
@@ -69,10 +69,13 @@ remove_rules() {
 is_paused() { iptables -t mangle -n -L $PAUSE_CHAIN >/dev/null 2>&1; }
 
 remove_pause() {
+    local cmd table
     for cmd in iptables ip6tables; do
-        while $cmd -t mangle -D OUTPUT -j $PAUSE_CHAIN 2>/dev/null; do :; done
-        $cmd -t mangle -F $PAUSE_CHAIN 2>/dev/null
-        $cmd -t mangle -X $PAUSE_CHAIN 2>/dev/null
+        for table in mangle filter; do
+            while $cmd -t $table -D OUTPUT -j $PAUSE_CHAIN 2>/dev/null; do :; done
+            $cmd -t $table -F $PAUSE_CHAIN 2>/dev/null
+            $cmd -t $table -X $PAUSE_CHAIN 2>/dev/null
+        done
     done
     rm -f "$PAUSE_MARK"
     # Only the timer: when the timer is what called us, its service is this very process
@@ -139,15 +142,20 @@ apply_rules() {
     log "active (mode=$MODE, ctrld exempt=$(have_ctrld_cgroup && echo yes || echo no))"
 }
 
-# Port 53 leaves the machine untouched while paused: ACCEPT in the mangle table ends that
-# table for the packet, so it never reaches Suricata's queue (and its drop rules) below
+# Port 53 leaves the machine untouched while paused. An ACCEPT only ends the table it is
+# in, so it takes one in each table that would otherwise stop the packet:
+#   mangle  ahead of Suricata's queue (and its drop rules)
+#   filter  ahead of everything else there, because a firewall may have a "deny out 53"
+#           of its own (UFW's `ufw deny out 53`, for one) that removing DNSLOCK does not lift
 build_pause() {
-    local cmd=$1
-    $cmd -t mangle -N $PAUSE_CHAIN || return 1
-    for proto in udp tcp; do
-        $cmd -t mangle -A $PAUSE_CHAIN -p $proto --dport 53 -j ACCEPT || return 1
+    local cmd=$1 table proto
+    for table in mangle filter; do
+        $cmd -t $table -N $PAUSE_CHAIN || return 1
+        for proto in udp tcp; do
+            $cmd -t $table -A $PAUSE_CHAIN -p $proto --dport 53 -j ACCEPT || return 1
+        done
+        $cmd -t $table -I OUTPUT 1 -j $PAUSE_CHAIN || return 1
     done
-    $cmd -t mangle -I OUTPUT 1 -j $PAUSE_CHAIN || return 1
 }
 
 pause_rules() {

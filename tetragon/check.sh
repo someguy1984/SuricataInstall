@@ -140,12 +140,23 @@ for line in open(sys.argv[1]):
 	fi
 fi
 
+# The health endpoint (:6789) answers on every interface unless local_install.sh pinned it
+if command -v ss >/dev/null; then
+	open=$(ss -Hltn 'sport = :6789' 2>/dev/null | awk '{ print $4 }' | grep -vE '^(127\.|\[::1\])' | paste -sd' ' -)
+	[[ -z $open ]] && pass "Tetragon's health endpoint is not reachable from the network" ||
+		warn "Tetragon's health endpoint listens on $open (re-run local_install.sh to keep it on 127.0.0.1)"
+fi
+
 section "Event log"
 LOG=$TETRAGON_LOG_DIR/tetragon.log
 if [[ -s $LOG ]]; then
 	age=$(($(date +%s) - $(stat -c %Y "$LOG")))
 	[[ $age -lt 600 ]] && pass "tetragon.log written ${age}s ago" || warn "tetragon.log not written for ${age}s"
 	[[ $(stat -c %a "$LOG") == 600 ]] && pass "tetragon.log is root-only (600)" || warn "tetragon.log is mode $(stat -c %a "$LOG"), expected 600"
+	# The rotated files hold the same command lines as the live one
+	loose=$(find "$TETRAGON_LOG_DIR" -maxdepth 1 -type f -name 'tetragon*' ! -perm 600 | wc -l)
+	[[ $loose -eq 0 ]] && pass "Every rotated log is root-only too" ||
+		warn "$loose log file(s) in $TETRAGON_LOG_DIR are not mode 600: chmod 600 $TETRAGON_LOG_DIR/tetragon*"
 	info "Size: $(du -sh "$TETRAGON_LOG_DIR" | cut -f1) in $TETRAGON_LOG_DIR ($(find "$TETRAGON_LOG_DIR" -maxdepth 1 -name 'tetragon*' | wc -l) file(s))"
 else
 	fail "$LOG is missing or empty"

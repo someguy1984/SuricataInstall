@@ -104,11 +104,24 @@ ns bash "$LOCK" start
 [[ $(count iptables "" "-A OUTPUT -j DNSLOCK") -eq 1 ]] && ok "start twice leaves one jump" || bad "start twice duplicated the jump"
 
 ns bash "$NFQ" start
+# Another firewall's own "deny out 53" (what `ufw deny out 53` adds): the pause has to get past it
+for cmd in iptables ip6tables; do ns $cmd -A OUTPUT -p udp --dport 53 -j DROP; done
 check "pause succeeds" ns bash "$LOCK" pause 5
 hasnt iptables "" "-A OUTPUT -j DNSLOCK" "pause lifts the firewall chain"
 [[ $(rules iptables OUTPUT mangle | sed -n 2p) == "-A OUTPUT -j DNSLOCK-PAUSE" ]] \
     && ok "pause: port 53 is accepted ahead of Suricata's queue" || bad "pause chain is not first in mangle OUTPUT"
 has iptables mangle "-A DNSLOCK-PAUSE -p udp -m udp --dport 53 -j ACCEPT" "pause accepts UDP 53 only by port"
+for cmd in iptables ip6tables; do
+    [[ $(rules $cmd OUTPUT | sed -n 2p) == "-A OUTPUT -j DNSLOCK-PAUSE" ]] \
+        && ok "$cmd pause: port 53 is accepted ahead of every other filter rule" || bad "$cmd: pause chain is not first in filter OUTPUT"
+    has $cmd "" "-A DNSLOCK-PAUSE -p tcp -m tcp --dport 53 -j ACCEPT" "$cmd pause: the filter chain accepts TCP 53 only by port"
+done
+# In practice: a lookup sent while paused is counted by the pause chain, not by the other firewall's DROP
+ns bash -c 'echo -n x > /dev/udp/192.0.2.53/53' 2>/dev/null
+passed=$(ns iptables -L DNSLOCK-PAUSE -v -n -x | awk '$3 == "ACCEPT" && /udp dpt:53/ { print $1 }')
+dropped=$(ns iptables -L OUTPUT -v -n -x | awk '$3 == "DROP" && /udp dpt:53/ { print $1 }')
+[[ ${passed:-0} -gt 0 && ${dropped:-1} -eq 0 ]] && ok "pause: a lookup gets past another firewall's deny-out-53" \
+    || bad "pause: a lookup was still stopped by the other firewall's rule (accepted=${passed:-?} dropped=${dropped:-?})"
 check "pause schedules the re-lock" grep -q "systemd-run .*--unit=dns-lockdown-rearm .*dns-lockdown.sh start" "$WORK/calls"
 check "pause leaves a marker for status/verify" test -s "$WORK/root/run/dns-lockdown.paused"
 ns bash "$LOCK" refresh
@@ -116,6 +129,11 @@ hasnt iptables "" "-A OUTPUT -j DNSLOCK" "a ctrld restart during a pause does no
 check "resume succeeds" ns bash "$LOCK" resume
 has iptables "" "-A OUTPUT -j DNSLOCK" "resume re-locks"
 hasnt iptables mangle "-N DNSLOCK-PAUSE" "resume removes the pause chain"
+for cmd in iptables ip6tables; do
+    hasnt $cmd "" "-N DNSLOCK-PAUSE" "$cmd: resume removes the filter pause chain"
+    has $cmd "" "-A OUTPUT -p udp -m udp --dport 53 -j DROP" "$cmd: resume leaves the other firewall's rule alone"
+    ns $cmd -D OUTPUT -p udp --dport 53 -j DROP
+done
 check "resume clears the marker" test ! -e "$WORK/root/run/dns-lockdown.paused"
 if ns bash "$LOCK" pause 600 >/dev/null 2>&1; then bad "pause accepts more than 60 minutes"; else ok "pause refuses more than 60 minutes"; fi
 has iptables "" "-A OUTPUT -j DNSLOCK" "a refused pause leaves the lockdown in place"

@@ -434,9 +434,11 @@ forbids. Lift it for a few minutes:
     sudo dns-lockdown.sh resume        # re-lock now
     sudo dns-lockdown.sh status
 
-While paused, plain DNS on port 53 may leave the machine (the firewall chain is removed and port 53
-skips Suricata); DoT and the public DoH resolvers stay blocked. It re-locks by itself at the stated
-time, also straight after a suspend or reboot, and `verify.sh` and the alerting know it is deliberate.
+While paused, plain DNS on port 53 may leave the machine: the firewall chain is removed, port 53
+skips Suricata, and it is let past any "deny out 53" rule another firewall has of its own (`ufw deny
+out 53`, for example). DoT and the public DoH resolvers stay blocked. It re-locks by itself at the
+stated time, also straight after a suspend or reboot, and `verify.sh` and the alerting know it is
+deliberate.
 
 ---
 
@@ -460,6 +462,7 @@ Everything Tetragon sees goes to `/var/log/tetragon/tetragon.log` (root-only), m
 |--------|------|
 | `sensitive-files` | Reads of `/etc/shadow`, sudoers, SSH and GPG private keys, cloud and Docker credentials, browser password and cookie stores, the login keyring and CLI tokens, by anything other than the program that owns them |
 | `persistence` | Writes, symlinks (`systemctl enable`), hard links and renames into cron, systemd, autostart, shell start-up files, PAM, apt hooks and similar |
+| `boot-config` | Writes, deletions and renames in the boot configuration: `/etc/default/grub`, `/etc/grub.d`, `/boot` (GRUB, EFI binaries, kernels, initrds) and the kernel hooks in `/etc/kernel`. Kernel updates and `update-grub` show up here; anything else is worth a look |
 | `privilege-escalation` | Processes switching to uid 0 |
 | `setuid-files` | A file being given the setuid bit |
 | `kernel-tampering`, `monitor-kernel-modules` | eBPF program loads, ptrace-style access to other processes, kernel module loads and unloads |
@@ -477,7 +480,10 @@ Per-machine settings:
 - **`export-denylist.jsonl`** and the container networks in `policies/tcp-connect.yaml` name this
   machine's own containers and health checks. Adjust them to yours. Every denylist line must be
   limited to exec events or one policy and tie arguments to a root-owned parent program, otherwise it
-  becomes a way to hide from the log; `make lint` and `check.sh` both check this.
+  becomes a way to hide from the log; `make lint` and `check.sh` both check this. Health checks are
+  matched by their whole command line. One written as a single string runs through a shell, and what
+  that shell starts cannot be tied to the container runtime, so it stays in the log: write health
+  checks in exec form (`test: ["CMD", "prog", "arg"]`) if you want them gone completely.
 - **Excluded programs are matched by their real path**, not a symlink to it (on newer Ubuntu
   `/usr/bin/sudo` is `/usr/lib/cargo/bin/sudo`).
 - `/etc/tetragon` is root-only, because the policies and denylist spell out what is and isn't

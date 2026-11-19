@@ -10,16 +10,32 @@
 #   - anchor every regex at both ends (^...$). Arguments are whatever the process
 #     was started with, so never match on arguments alone: tie them to the
 #     root-owned program that starts the real thing (parent_binary_regex).
+#   - a path is the path the process sees. Inside a container or a private mount
+#     namespace anything can sit at /usr/bin/runc, so these lines can at worst hide
+#     that a program STARTED. They never hide what it then does: every policy hit
+#     is still logged, which is why the first rule matters most.
 #
 # Process exits: every exec already logs the process; exits double the volume.
 {"event_set": ["PROCESS_EXIT"]}
 #
-# Rootless Docker plumbing that runs every time a container or health check starts.
+# Rootless Docker plumbing that runs every time a container or health check starts:
+# the runtime itself, the copy of itself that runc re-executes as "init", and the
+# busctl call rootless runc makes to find the user's systemd.
 {"event_set": ["PROCESS_EXEC"], "binary_regex": ["^/usr/bin/runc$", "^/usr/bin/containerd-shim-runc-v2$"]}
+{"event_set": ["PROCESS_EXEC"], "binary_regex": ["^/proc/self/fd/[0-9]+$"], "arguments_regex": ["^init$"], "parent_binary_regex": ["^/usr/bin/runc$"]}
+{"event_set": ["PROCESS_EXEC"], "binary_regex": ["^/usr/bin/busctl$"], "arguments_regex": ["^--user --no-pager status$"], "parent_binary_regex": ["^/usr/bin/runc$"]}
 #
-# Docker health checks in the-profit-center-wrapper (mysql every 5s, mailpit every 15s),
-# only when started by the container runtime.
-{"event_set": ["PROCESS_EXEC"], "arguments_regex": ["SHOW DATABASES;", "^readyz$"], "parent_binary_regex": ["^/usr/bin/runc$", "^/usr/bin/containerd-shim-runc-v2$"]}
+# Docker health checks, each matched by its WHOLE command line (^...$) and only when
+# the container runtime started it, so nothing else that runs in a container is hidden:
+#   the-profit-center-wrapper   mysql every 5 s (the password is whatever it is), mailpit every 15 s
+#   server_edr_solution/mock    hub and web every 5 s
+# Tetragon puts an argument that contains spaces in double quotes and does not escape
+# the quotes inside it, hence the doubled quote at the end of the mysql line.
+# What these lines cannot cover: a check written as one string runs through a shell, and
+# the commands that shell starts have the shell as their parent, not the runtime, so
+# they are still logged. Write a health check in exec form (test: ["CMD", "prog", "arg"])
+# and it is a single exec that a line here can match exactly.
+{"event_set": ["PROCESS_EXEC"], "arguments_regex": ["^-c \"/usr/bin/mysql --host=127\\.0\\.0\\.1 --user=root --password=\\S+ --execute \"SHOW DATABASES;\"\"$", "^readyz$", "^-c \"systemctl is-active --quiet mock-hub-placeholder\"$", "^-c \"systemctl is-active --quiet nginx php8\\.5-fpm && curl -fsS -o /dev/null http://127\\.0\\.0\\.1/\"$"], "parent_binary_regex": ["^/usr/bin/runc$", "^/usr/bin/containerd-shim-runc-v2$"]}
 #
 # GNOME's sandboxed image decoders (glycin), launched by bubblewrap.
 {"event_set": ["PROCESS_EXEC"], "binary_regex": ["^/usr/libexec/glycin-loaders/"]}

@@ -162,6 +162,9 @@ echo true >"$ETC/tetragon.conf.d/enable-process-cred"
 echo "$TETRAGON_LOG_MAX_SIZE_MB" >"$ETC/tetragon.conf.d/export-file-max-size-mb"
 echo "$TETRAGON_LOG_MAX_BACKUPS" >"$ETC/tetragon.conf.d/export-file-max-backups"
 echo 600 >"$ETC/tetragon.conf.d/export-file-perm"
+# Tetragon's health endpoint listens on every interface unless told otherwise
+# (:6789). Nothing off this machine has any business asking it.
+echo 127.0.0.1:6789 >"$ETC/tetragon.conf.d/health-server-address"
 grep -vE '^\s*(#|$)' "$DIR/export-denylist.jsonl" >"$ETC/tetragon.conf.d/export-denylist" || true
 chmod 0600 "$ETC/tetragon.conf.d/"*
 

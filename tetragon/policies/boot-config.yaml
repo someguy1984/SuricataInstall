@@ -1,0 +1,107 @@
+# Observe-only: log changes to the boot configuration: the kernel command line,
+# the bootloader and its menu, the kernels, initrds and EFI binaries in /boot, and
+# the hooks that run as root when a kernel is installed. Whoever can change these
+# decides what the next boot runs (for example by dropping a security module from
+# the kernel command line), and a file here can be removed or swapped for another
+# without ever being written to.
+#
+# Three ways of changing it are covered:
+#   security_file_permission  writing into a file (MAY_WRITE, 0x02). Every write()
+#                             call reaches the hook, hence the rate limit.
+#   security_path_unlink      deleting a file. Deleting /etc/default/grub, or a
+#                             drop-in next to it, changes the next boot without a
+#                             single write.
+#   security_path_rename      moving a file in or out. This is how update-grub
+#                             replaces grub.cfg, and how a file is swapped.
+#
+# Expected entries: kernel installs and removals, update-grub (grub.cfg.new ->
+# grub.cfg), update-initramfs, firmware updates, and grubenv being rewritten at
+# boot. Anything else is worth a look.
+#
+# The delete and rename hooks see a directory and a name, not a full path, so they
+# match the whole of /etc/default. Other packages keep their settings there too:
+# expect an entry when one of those files is replaced.
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "boot-config"
+spec:
+  kprobes:
+  - call: "security_file_permission"
+    syscall: false
+    return: true
+    message: "Write to the boot configuration"
+    args:
+    - index: 0
+      type: "file"
+    - index: 1
+      type: "int" # 0x04 is MAY_READ, 0x02 is MAY_WRITE
+    returnArg:
+      index: 0
+      type: "int"
+    selectors:
+    - matchArgs:
+      - index: 0
+        operator: "Prefix"
+        values:
+        - "/etc/default/grub"               # also covers the grub.d/ drop-ins
+        - "/etc/grub.d/"
+        - "/boot/"                          # grub, EFI binaries, kernels, initrds
+        - "/etc/kernel/"                    # postinst.d/ hooks run as root
+      - index: 1
+        operator: "Mask"
+        values:
+        - "2" # MAY_WRITE
+      matchActions:
+      - action: Post
+        rateLimit: "1m"
+
+  - call: "security_path_unlink"
+    syscall: false
+    message: "File deleted from the boot configuration"
+    args:
+    - index: 0 # const struct path *dir: the directory the file is removed from
+      type: "path"
+    - index: 1 # struct dentry *dentry: the file being removed
+      type: "string"
+      resolve: "d_name.name"
+      label: "file"
+    selectors:
+    - matchArgs:
+      - index: 0
+        operator: "Prefix"
+        values:
+        - "/etc/default"
+        - "/etc/grub.d"
+        - "/boot"
+        - "/etc/kernel"
+
+  - call: "security_path_rename"
+    syscall: false
+    message: "File moved in or out of the boot configuration"
+    args:
+    - index: 0 # const struct path *old_dir
+      type: "path"
+    - index: 1 # struct dentry *old_dentry
+      type: "string"
+      resolve: "d_name.name"
+      label: "old_file"
+    - index: 2 # const struct path *new_dir
+      type: "path"
+    selectors:
+    - matchArgs:
+      - index: 0
+        operator: "Prefix"
+        values:
+        - "/etc/default"
+        - "/etc/grub.d"
+        - "/boot"
+        - "/etc/kernel"
+    - matchArgs:
+      - index: 2
+        operator: "Prefix"
+        values:
+        - "/etc/default"
+        - "/etc/grub.d"
+        - "/boot"
+        - "/etc/kernel"
