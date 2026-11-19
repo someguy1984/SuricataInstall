@@ -88,7 +88,7 @@ the box and install from there (client section 7). The read-only repository moun
 | `--no-tetragon` | client | Tetragon cannot load in a container (see the table below) |
 | `--no-suricata` | client | When Suricata's af-packet cannot run on the veth, or to save memory |
 | `--no-web` | client | On the hub box, which has no nginx |
-| `--yes` | both | No prompts. The client install then confirms itself after its automated checks; the hub install waits for `install.sh --confirm` from a second shell (hub section 8) |
+| `--yes` | both | No prompts. The client install then confirms itself after its automated checks; over SSH the hub install waits for `install.sh --confirm` from a second SSH session; in a `mock.sh shell` there is no SSH session, so there is no timer and the firewall is enabled at once (hub section 8) |
 | `--plan` | both | Prints what would change; run it first and read it |
 
 The hub installer has none of the `--no-*` flags. Its plan lists no sysctl or module change; its firewall is the
@@ -116,7 +116,7 @@ Containers share this machine's kernel, so anything that changes the kernel itse
 | `IPAddressDeny` / `IPAddressAllow` | **no**. Under rootless Docker systemd has no BPF firewall and silently does not enforce them |
 | `MemoryMax`, `CPUQuota` | only if the box shows a real value in its `memory.max`; otherwise the limit is not enforced |
 | `edr-agent` install, local mode, uninstall | yes, against the placeholder |
-| Hub install, the `edr-hub` units, sockets and users, the `edr_hub` nftables table (load, rate meters, `--clients-only`) | yes, once the hub exists, inside the hub box's own network namespace. The `meta skuid` rule that stops `edr-hub` calling out is proven in a throwaway network namespace (client section 11, L1) and re-checked in a VM |
+| Hub install, the `edr-hub` units, sockets and users, the `edr_hub` nftables table (load, rate meters, `--clients-only`) | yes, once the hub exists, inside the hub box's own network namespace. The `meta skuid` rule that stops `edr-hub` calling out is proven in a throwaway network namespace (hub section 12, L1) and re-checked in a VM |
 | Hub `IPAddressDeny` and `MemoryMax` limits | **no**, for the same reasons as the two rows above; the rest of the hub's sandbox (`ProtectProc`, `PrivateNetwork`, users, sockets) yes |
 | Enrollment | **no**: needs the real hub (`:8444`, `/v1/ca`, `/v1/enroll`); the agent stays in local mode until then (client section 7) |
 | mTLS (client certificate required) | **not yet**: the placeholder does not ask for a client certificate; it becomes `-Verify 1 -CAfile` once the real CA exists |
