@@ -1,0 +1,34 @@
+# Observe-only: log programs started from places that only hold a program when
+# someone is trying not to leave one on disk.
+#
+#   /dev/shm/   shared memory, in RAM, world-writable and rarely looked at. A
+#               common place to stage a downloaded tool. Nothing on a normal
+#               system runs programs from it.
+#
+# The related trick, running a program that has no file at all (memfd_create,
+# or a binary deleted while it runs), cannot be matched here because such a
+# program has no path. Tetragon marks it on the exec event instead (inode links
+# = 0), and tetragon-alerts.service copies those execs into the journal next to
+# the policy hits. runc does this for every container it starts, so execs whose
+# parent is runc are left out there.
+#
+# /tmp and /var/tmp are not included: build tools, installers and AppImages run
+# from them all day on a development machine. Add them below if yours doesn't.
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "suspicious-exec"
+spec:
+  kprobes:
+  - call: "security_bprm_check"
+    syscall: false
+    message: "Program executed from shared memory"
+    args:
+    - index: 0
+      type: "linux_binprm" # (struct linux_binprm *) used for getting the path
+    selectors:
+    - matchArgs:
+      - index: 0
+        operator: "Prefix"
+        values:
+        - "/dev/shm/"

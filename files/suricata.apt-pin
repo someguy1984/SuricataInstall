@@ -1,0 +1,8 @@
+# Installed by install.sh as /etc/apt/preferences.d/suricata-8
+# files/suricata.yaml is written for Suricata 8.x. Keep apt on 8.x so an upgrade to a new
+# major version can't stop Suricata starting (traffic would then pass uninspected, because
+# the NFQUEUE rules use --queue-bypass). To move to a new major version, update
+# files/suricata.yaml, change the version here, and re-run install.sh.
+Package: suricata
+Pin: version 1:8.*
+Pin-Priority: 1001

@@ -1,0 +1,10 @@
+[Unit]
+Description=Regular check of Suricata, the DNS lockdown and Tetragon
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=15min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,13 @@
+[Unit]
+Description=Force DNS through ctrld (refuse direct DNS/DoT/mDNS/LLMNR egress)
+After=ufw.service ctrld.service suricata-nfqueue.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/dns-lockdown.sh start
+ExecReload=/usr/local/sbin/dns-lockdown.sh start
+ExecStop=/usr/local/sbin/dns-lockdown.sh stop
+
+[Install]
+WantedBy=multi-user.target

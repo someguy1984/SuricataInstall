@@ -1,0 +1,31 @@
+[Unit]
+Description=Desktop notifications for Tetragon policy hits
+After=tetragon-alerts.service systemd-journald.service
+ConditionPathExists=/etc/systemd/system/tetragon-alerts.service
+
+[Service]
+# -n 0: only what arrives from now on; a restart must not replay old alerts
+ExecStart=/bin/sh -c 'exec journalctl -t tetragon-alerts -f -n 0 -o cat --no-pager | exec /usr/bin/python3 -I /usr/local/lib/ips-watch/tetragon-notify.py'
+Restart=always
+RestartSec=5
+
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateNetwork=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

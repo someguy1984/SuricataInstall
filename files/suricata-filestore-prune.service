@@ -1,0 +1,33 @@
+[Unit]
+Description=Delete files Suricata extracted on rule matches once they are 30 days old
+ConditionPathIsDirectory=/var/log/suricata/filestore
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/suricatactl filestore prune --quiet --directory /var/log/suricata/filestore --age 30d
+
+# The stored files are whatever a rule flagged, i.e. possibly live malware: this only ever
+# needs to delete inside the filestore, as the user that owns it.
+User=suricata
+Group=suricata
+ProtectSystem=strict
+ReadWritePaths=/var/log/suricata/filestore
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateNetwork=yes
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=none

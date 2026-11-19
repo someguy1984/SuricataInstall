@@ -1,0 +1,12 @@
+[Unit]
+Description=Mock: self-signed certificate for the hub placeholder
+Before=mock-hub-placeholder.service
+ConditionPathExists=!/etc/ssl/mock/hub.key
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/mock-tls hub DNS:hub,DNS:hub.dev.local,IP:10.77.0.10
+
+[Install]
+WantedBy=multi-user.target

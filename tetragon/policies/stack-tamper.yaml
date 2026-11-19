@@ -1,0 +1,269 @@
+# Observe-only: log changes to the other two parts of this setup, the Suricata
+# IPS and the Control D DNS lockdown, the way tetragon-tamper.yaml does for
+# Tetragon itself. Switching off a rule, loosening the config or swapping one of
+# the root-run helper scripts is quieter than stopping a service.
+#
+# Watched (group A below):
+#   /etc/suricata, /var/lib/suricata/rules        config, rule policy, live ruleset
+#   /etc/controld, /usr/local/bin/ctrld           ctrld's config and binary
+#   /etc/dns-lockdown, /etc/default/dns-lockdown  resolver list and mode
+#   /etc/resolv.conf                              where the system resolver points
+#   /etc/ufw                                      the firewall Suricata sits in front of
+#   /etc/firefox/policies, /etc/chromium-browser/policies   the browser DoH locks
+#   /usr/local/sbin, /usr/local/lib/suricata-ips, /usr/local/lib/ips-watch
+#                                                 helper scripts that run as root
+#   /etc/ips-watch, /etc/ips-watch.conf           what the alerting notifies about
+# and Suricata's logs (group B: deletion, truncation and renames only, since
+# Suricata writes them constantly).
+#
+#   security_file_permission  writes into an open file
+#   security_path_truncate    truncation
+#   security_path_unlink      deletion
+#   security_path_rename      moving a file in or out (overwrite-by-rename)
+#
+# Expected entries, all from this setup's own automation:
+#   - the daily rule update (python3 writing /var/lib/suricata/rules)
+#   - HOME_NET following a network change (awk and mv on /etc/suricata/suricata.yaml)
+#   - ufw changing its own rule files when you run `ufw allow ...`
+#   - re-running any of the installers
+# ctrld is excluded by binary path (it rewrites /etc/resolv.conf and its own
+# config), and Suricata, logrotate, gzip and the filestore clean-up for the logs.
+#
+# Tetragon allows a policy 8 prefix lists in total, and this one uses all 8. The
+# one case left out to fit is a file moved into /var/log/suricata from somewhere
+# else; deleting, truncating, renaming or moving a log away is logged.
+#
+# Firewall rules changed directly with iptables/nft leave no file behind and are
+# not seen here; the exec of iptables/nft is in the event log, and check.sh
+# reports the rules themselves.
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "stack-tamper"
+spec:
+  kprobes:
+  - call: "security_file_permission"
+    syscall: false
+    message: "Write to the IPS or DNS lockdown's config, rules or scripts"
+    args:
+    - index: 0
+      type: "file"
+    - index: 1
+      type: "int" # 0x04 is MAY_READ, 0x02 is MAY_WRITE
+    selectors:
+    - matchArgs:
+      - index: 0
+        operator: "Prefix"
+        values:
+        - "/etc/suricata"
+        - "/var/lib/suricata/rules"
+        - "/etc/controld"
+        - "/usr/local/bin/ctrld"
+        - "/etc/dns-lockdown"
+        - "/etc/default/dns-lockdown"
+        - "/etc/resolv.conf"
+        - "/etc/ufw"
+        - "/etc/firefox/policies"
+        - "/etc/chromium-browser/policies"
+        - "/usr/local/sbin/"
+        - "/usr/local/lib/suricata-ips"
+        - "/usr/local/lib/ips-watch"
+        - "/etc/ips-watch" # the alerting's settings and ignore list
+      - index: 1
+        operator: "Mask"
+        values:
+        - "2" # MAY_WRITE
+      matchBinaries:
+      - operator: "NotIn"
+        values:
+        - "/usr/local/bin/ctrld"
+      matchActions:
+      - action: Post
+        rateLimit: "1m"
+
+  - call: "security_path_truncate"
+    syscall: false
+    message: "Truncation of the IPS or DNS lockdown's config, rules, scripts or logs"
+    args:
+    - index: 0
+      type: "path"
+    selectors:
+    - matchArgs:
+      - index: 0
+        operator: "Prefix"
+        values:
+        - "/etc/suricata"
+        - "/var/lib/suricata/rules"
+        - "/etc/controld"
+        - "/usr/local/bin/ctrld"
+        - "/etc/dns-lockdown"
+        - "/etc/default/dns-lockdown"
+        - "/etc/resolv.conf"
+        - "/etc/ufw"
+        - "/etc/firefox/policies"
+        - "/etc/chromium-browser/policies"
+        - "/usr/local/sbin/"
+        - "/usr/local/lib/suricata-ips"
+        - "/usr/local/lib/ips-watch"
+        - "/etc/ips-watch"
+      matchBinaries:
+      - operator: "NotIn"
+        values:
+        - "/usr/local/bin/ctrld"
+    - matchArgs:
+      - index: 0
+        operator: "Prefix"
+        values:
+        - "/var/log/suricata"
+      matchBinaries:
+      - operator: "NotIn"
+        values:
+        - "/usr/bin/suricata"
+        - "/usr/sbin/logrotate"
+        - "/usr/bin/gzip"
+        - "/usr/bin/suricatactl" # weekly filestore clean-up
+
+  - call: "security_path_unlink"
+    syscall: false
+    message: "File deleted from the IPS or DNS lockdown's config, rules, scripts or logs"
+    args:
+    - index: 0 # const struct path *dir: the directory the file is removed from
+      type: "path"
+    - index: 1 # struct dentry *dentry: the file being removed
+      type: "string"
+      resolve: "d_name.name"
+      label: "file"
+    selectors:
+    - matchArgs:
+      - args: [0]
+        operator: "Prefix"
+        values:
+        - "/etc/suricata"
+        - "/var/lib/suricata/rules"
+        - "/etc/controld"
+        - "/etc/dns-lockdown"
+        - "/etc/ufw"
+        - "/etc/firefox/policies"
+        - "/etc/chromium-browser/policies"
+        - "/usr/local/sbin"
+        - "/usr/local/lib/suricata-ips"
+        - "/usr/local/lib/ips-watch"
+        - "/etc/ips-watch"
+      matchBinaries:
+      - operator: "NotIn"
+        values:
+        - "/usr/local/bin/ctrld"
+    - matchArgs: # single files in shared directories
+      - args: [0]
+        operator: "Equal"
+        values:
+        - "/etc"
+        - "/etc/default"
+      - args: [1]
+        operator: "Equal"
+        values:
+        - "resolv.conf"
+        - "dns-lockdown"
+      matchBinaries:
+      - operator: "NotIn"
+        values:
+        - "/usr/local/bin/ctrld"
+    - matchArgs:
+      - args: [0]
+        operator: "Prefix"
+        values:
+        - "/var/log/suricata"
+      matchBinaries:
+      - operator: "NotIn"
+        values:
+        - "/usr/bin/suricata"
+        - "/usr/sbin/logrotate"
+        - "/usr/bin/gzip"
+        - "/usr/bin/suricatactl" # weekly filestore clean-up
+
+  - call: "security_path_rename"
+    syscall: false
+    message: "File renamed in or out of the IPS or DNS lockdown's config, rules, scripts or logs"
+    args:
+    - index: 0 # const struct path *old_dir
+      type: "path"
+      label: "from_dir"
+    - index: 1 # struct dentry *old_dentry
+      type: "string"
+      resolve: "d_name.name"
+      label: "from"
+    - index: 2 # const struct path *new_dir
+      type: "path"
+      label: "to_dir"
+    - index: 3 # struct dentry *new_dentry
+      type: "string"
+      resolve: "d_name.name"
+      label: "to"
+    selectors:
+    - matchArgs: # moved out of (or within) a watched directory
+      - args: [0]
+        operator: "Prefix"
+        values:
+        - "/etc/suricata"
+        - "/var/lib/suricata/rules"
+        - "/etc/controld"
+        - "/etc/dns-lockdown"
+        - "/etc/ufw"
+        - "/etc/firefox/policies"
+        - "/etc/chromium-browser/policies"
+        - "/usr/local/sbin"
+        - "/usr/local/lib/suricata-ips"
+        - "/usr/local/lib/ips-watch"
+        - "/etc/ips-watch"
+      matchBinaries:
+      - operator: "NotIn"
+        values:
+        - "/usr/local/bin/ctrld"
+    - matchArgs: # moved into a watched directory
+      - args: [2]
+        operator: "Prefix"
+        values:
+        - "/etc/suricata"
+        - "/var/lib/suricata/rules"
+        - "/etc/controld"
+        - "/etc/dns-lockdown"
+        - "/etc/ufw"
+        - "/etc/firefox/policies"
+        - "/etc/chromium-browser/policies"
+        - "/usr/local/sbin"
+        - "/usr/local/lib/suricata-ips"
+        - "/usr/local/lib/ips-watch"
+        - "/etc/ips-watch"
+      matchBinaries:
+      - operator: "NotIn"
+        values:
+        - "/usr/local/bin/ctrld"
+    - matchArgs: # a single file replaced by rename
+      - args: [2]
+        operator: "Equal"
+        values:
+        - "/etc"
+        - "/etc/default"
+        - "/usr/local/bin"
+      - args: [3]
+        operator: "Equal"
+        values:
+        - "resolv.conf"
+        - "dns-lockdown"
+        - "ctrld"
+      matchBinaries:
+      - operator: "NotIn"
+        values:
+        - "/usr/local/bin/ctrld"
+    - matchArgs: # a log moved away or renamed (a file moved in from elsewhere is not seen: see header)
+      - args: [0]
+        operator: "Prefix"
+        values:
+        - "/var/log/suricata"
+      matchBinaries:
+      - operator: "NotIn"
+        values:
+        - "/usr/bin/suricata"
+        - "/usr/sbin/logrotate"
+        - "/usr/bin/gzip"
+        - "/usr/bin/suricatactl" # weekly filestore clean-up

@@ -1,0 +1,7 @@
+# This machine's own rules. install.sh installs them as /etc/suricata/local.rules,
+# where suricata-update leaves them alone. SIDs 9000000-9099999 are reserved for local use
+# (9000001-9000299 are taken by /etc/suricata/dns-lockdown.rules).
+#
+# The rules that stop DNS leaving the machine are not here: they belong to the Control D
+# lockdown (controld/files/dns-lockdown-rules.sh) and are only installed when it is, because
+# without ctrld they would cut off all DNS.

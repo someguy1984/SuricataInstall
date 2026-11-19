@@ -1,0 +1,8 @@
+#!/bin/sh
+# NetworkManager dispatcher hook, installed as /etc/NetworkManager/dispatcher.d/90-suricata-home-net
+# Refreshes Suricata's HOME_NET when this machine's addresses change (new network, VPN up/down).
+case "$2" in
+    up|down|dhcp4-change|dhcp6-change|vpn-up|vpn-down|reapply)
+        systemctl start --no-block suricata-home-net.service ;;
+esac
+exit 0

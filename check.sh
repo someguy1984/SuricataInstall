@@ -41,6 +41,12 @@ if systemctl is-active --quiet suricata-rules-update.timer; then
 else
     warn "suricata-rules-update.timer is not active: rules won't update automatically"
 fi
+# The timer being active says nothing about whether the update it starts works
+if systemctl is-failed --quiet suricata-rules-update.service; then
+    fail "The last rule update failed: rules are not being updated (journalctl -u suricata-rules-update -n 30)"
+else
+    pass "The last rule update did not fail"
+fi
 since=$(systemctl show -p ActiveEnterTimestamp --value suricata.service)
 info "Suricata running since: ${since:-unknown}"
 if ps -o args= -C Suricata-Main 2>/dev/null | grep -q -- '-q 0'; then
@@ -57,14 +63,26 @@ else
 fi
 for cmd in iptables ip6tables; do
     rules=$($cmd -t mangle -S 2>/dev/null)
-    for chain in INPUT OUTPUT FORWARD; do
-        n=$(grep -c -- "^-A $chain -j NFQUEUE --queue-num 0 --queue-bypass" <<<"$rules")
-        if [[ $n -eq 1 ]]; then pass "$cmd mangle $chain -> NFQUEUE 0"
-        elif [[ $n -eq 0 ]]; then fail "$cmd mangle $chain has no NFQUEUE rule (traffic not inspected)"
-        else warn "$cmd mangle $chain has $n NFQUEUE rules (expected 1)"; fi
+    for hook in INPUT OUTPUT FORWARD; do
+        n=$(grep -c -- "^-A $hook -j SURICATA-NFQ\$" <<<"$rules")
+        if [[ $n -eq 1 ]]; then pass "$cmd mangle $hook -> SURICATA-NFQ"
+        elif [[ $n -eq 0 ]]; then fail "$cmd mangle $hook does not jump to SURICATA-NFQ (traffic not inspected; re-run ./install.sh)"
+        else warn "$cmd mangle $hook jumps to SURICATA-NFQ $n times (expected 1)"; fi
+        # Anything accepted ahead of the jump never reaches Suricata (the DNS lockdown's pause does this on purpose)
+        first=$(grep -m1 -- "^-A $hook " <<<"$rules")
+        [[ $n -eq 0 || $first == "-A $hook -j SURICATA-NFQ" ]] \
+            || warn "$cmd mangle $hook has a rule ahead of Suricata's: ${first#-A $hook }"
     done
-    grep -q -- '^-A INPUT -i lo -j ACCEPT' <<<"$rules" && grep -q -- '^-A OUTPUT -o lo -j ACCEPT' <<<"$rules" \
-        || warn "$cmd mangle loopback ACCEPT rules missing (loopback traffic will be queued)"
+    if grep -q -- '^-A SURICATA-NFQ -j NFQUEUE --queue-num 0 --queue-bypass$' <<<"$rules"; then
+        pass "$cmd SURICATA-NFQ -> NFQUEUE 0 (bypass if Suricata is down)"
+    else
+        fail "$cmd SURICATA-NFQ chain has no NFQUEUE rule (traffic not inspected)"
+    fi
+    grep -q -- '^-A SURICATA-NFQ -i lo -j RETURN' <<<"$rules" && grep -q -- '^-A SURICATA-NFQ -o lo -j RETURN' <<<"$rules" \
+        || warn "$cmd SURICATA-NFQ loopback rules missing (loopback traffic will be queued)"
+    if grep -qE -- '^-A (INPUT|OUTPUT|FORWARD) -j NFQUEUE' <<<"$rules"; then
+        warn "$cmd mangle still has NFQUEUE rules from the old layout (sudo systemctl restart suricata-nfqueue)"
+    fi
     if $cmd -S 2>/dev/null | grep -q NFQUEUE; then
         fail "$cmd filter table still has NFQUEUE rules (these bypass UFW)"
     else
@@ -92,12 +110,52 @@ section "Configuration"
 grep -qx '  midstream: true' "$CONF" && pass "stream.midstream is enabled" || warn "stream.midstream is not enabled (re-run ./install.sh?)"
 home=$(grep -m1 '^    HOME_NET:' "$CONF")
 info "${home#    }"
-grep -q 'fc00::/7' <<<"$home" && pass "HOME_NET includes IPv6 ranges" || warn "HOME_NET has no IPv6 ranges (re-run ./install.sh?)"
-if cmp -s "$SRC/drop.conf" /etc/suricata/drop.conf; then
-    pass "drop.conf matches $SRC/drop.conf"
+if [[ -x /usr/local/sbin/suricata-home-net ]]; then
+    if want_home=$(/usr/local/sbin/suricata-home-net --check); then
+        pass "HOME_NET matches this machine's current addresses"
+    else
+        warn "HOME_NET is out of date for this network; expected:"
+        info "${want_home#    }"
+        info "(fix: sudo systemctl start suricata-home-net.service)"
+    fi
 else
-    warn "/etc/suricata/drop.conf differs from $SRC/drop.conf (re-run ./install.sh?)"
+    fail "/usr/local/sbin/suricata-home-net is missing: HOME_NET won't follow network changes (re-run ./install.sh)"
 fi
+systemctl is-active --quiet suricata-home-net.timer && pass "HOME_NET refresh timer is active" \
+    || warn "suricata-home-net.timer is not active (re-run ./install.sh)"
+[[ -x /etc/NetworkManager/dispatcher.d/90-suricata-home-net ]] && pass "NetworkManager hook refreshes HOME_NET on network changes" \
+    || warn "NetworkManager hook not installed: HOME_NET only refreshes every 15 minutes"
+if cmp -s "$SRC/local.rules" /etc/suricata/local.rules; then
+    pass "local.rules matches $SRC/local.rules"
+else
+    warn "/etc/suricata/local.rules is missing or differs from $SRC/local.rules (re-run ./install.sh?)"
+fi
+# The DNS rules belong to the Control D lockdown: present with it, a placeholder without it
+dns_rules=$(grep -c '^drop ' /etc/suricata/dns-lockdown.rules 2>/dev/null)
+if systemctl is-enabled --quiet dns-lockdown.service 2>/dev/null; then
+    if grep -q 'sid:9000001;' /etc/suricata/dns-lockdown.rules 2>/dev/null; then
+        pass "DNS lockdown rules installed (${dns_rules} rules: plain DNS/DoT and public DoH resolvers are dropped)"
+    else
+        fail "The DNS lockdown is enabled but /etc/suricata/dns-lockdown.rules has no rules (re-run ./install.sh)"
+    fi
+elif [[ ${dns_rules:-0} -gt 0 ]]; then
+    warn "dns-lockdown.rules drops DNS but the lockdown service isn't enabled: without ctrld this machine has no DNS"
+elif [[ -f /etc/suricata/dns-lockdown.rules ]]; then
+    info "DNS lockdown (controld/) not installed: no DNS rules loaded"
+else
+    warn "/etc/suricata/dns-lockdown.rules is missing: Suricata will log a warning for it (re-run ./install.sh)"
+fi
+cmp -s "$SRC/suricata.apt-pin" /etc/apt/preferences.d/suricata-8 && pass "apt keeps Suricata on 8.x" \
+    || warn "Suricata isn't pinned to 8.x: an upgrade to a new major version could stop it starting"
+grep -A1 '^  landlock:' "$CONF" | grep -qx '    enabled: yes' && pass "Landlock sandbox is enabled" \
+    || warn "Landlock sandbox is not enabled"
+for f in drop.conf disable.conf modify.conf; do
+    if cmp -s "$SRC/$f" /etc/suricata/$f; then
+        pass "$f matches $SRC/$f"
+    else
+        warn "/etc/suricata/$f is missing or differs from $SRC/$f (re-run ./install.sh?)"
+    fi
+done
 grep -qx '  fail-open: no' "$CONF" && pass "NFQ fails closed under overload (fail-open: no)" \
     || warn "NFQ fail-open is not 'no': overload passes packets uninspected"
 # Compare with the template, ignoring the lines install.sh fills in per machine
@@ -130,6 +188,8 @@ if [[ -f /etc/logrotate.d/suricata ]]; then
 else
     warn "No /etc/logrotate.d/suricata: logs will grow unbounded"
 fi
+systemctl is-active --quiet suricata-filestore-prune.timer && pass "Weekly filestore clean-up timer is active" \
+    || warn "suricata-filestore-prune.timer is not active: extracted files are never deleted (re-run ./install.sh)"
 if [[ $CONFIG_TEST -eq 1 ]]; then
     info "Running suricata -T (loads all rules)..."
     # -l to a temp dir so the test run doesn't append its own start-up lines to suricata.log
@@ -169,6 +229,7 @@ else
 import sys, json, collections
 
 flows = both = v6 = 0
+oneway = collections.Counter()
 events = collections.Counter()
 alerts = collections.Counter()
 blocked = collections.Counter()
@@ -190,6 +251,8 @@ for line in sys.stdin:
             f = e.get("flow", {})
             if f.get("pkts_toserver", 0) and f.get("pkts_toclient", 0):
                 both += 1
+            else:
+                oneway[f'{e.get("dest_ip")}:{e.get("dest_port")}'] += 1
     elif t == "alert":
         a = e["alert"]
         key = (a.get("signature_id"), a.get("signature"))
@@ -209,6 +272,10 @@ if flows:
     pct = 100 * both // flows
     worst = max(worst, res(pct >= 90, f"{pct}% of {flows} recent TCP flows seen in both directions",
                            "FAIL" if pct < 50 else "WARN"))
+    if pct < 90:
+        # One destination soaking up the one-way flows is usually something retrying a host that
+        # never answers (e.g. a stale IP in a config), not Suricata missing the return traffic
+        info("Top one-way destinations: " + ", ".join(f"{k} ({v})" for k, v in oneway.most_common(3)))
 else:
     worst = max(worst, res(False, "No TCP flow records in recent eve.json", "FAIL"))
 worst = max(worst, res(v6 > 0, f"{v6} recent IPv6 flows (any protocol) seen"))

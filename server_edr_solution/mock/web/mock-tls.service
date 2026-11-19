@@ -1,0 +1,13 @@
+[Unit]
+Description=Mock: self-signed certificate for web.dev.local
+Before=nginx.service
+ConditionPathExists=!/etc/ssl/mock/web.dev.local.key
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/mock-tls web.dev.local DNS:web.dev.local,DNS:localhost,IP:127.0.0.1,IP:10.77.0.20
+
+[Install]
+WantedBy=multi-user.target
+RequiredBy=nginx.service

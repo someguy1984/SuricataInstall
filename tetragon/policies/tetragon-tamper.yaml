@@ -1,0 +1,136 @@
+# Observe-only: log anything other than Tetragon itself changing Tetragon's
+# event logs, configuration, policies or binaries. Erasing or editing the log
+# is the first thing an intruder does after noticing it.
+#
+#   security_file_permission  writes into an open file
+#   security_path_truncate    truncation (e.g. `> /var/log/tetragon/tetragon.log`)
+#   security_path_unlink      deletion
+#   security_path_rename      moving a file in or out (overwrite-by-rename)
+#
+# Tetragon's own writes, log rotation and backup pruning are excluded by
+# binary path (/usr/bin/tetragon inside the Docker image, /usr/local/bin/tetragon
+# for the native install). Re-running local_install.sh / stop.sh --purge shows
+# up here as well, which is expected.
+#
+# Limitation: an intruder deleting the log also deletes this event from it.
+# That is why local_install.sh copies policy hits into the journal too
+# (journalctl -t tetragon-alerts). Stopping Tetragon is recorded by systemd:
+# journalctl -u tetragon.
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "tetragon-tamper"
+spec:
+  kprobes:
+  - call: "security_file_permission"
+    syscall: false
+    message: "Write to Tetragon's logs, config or binaries"
+    args:
+    - index: 0
+      type: "file"
+    - index: 1
+      type: "int" # 0x04 is MAY_READ, 0x02 is MAY_WRITE
+    selectors:
+    - matchArgs:
+      - index: 0
+        operator: "Prefix"
+        values:
+        - "/var/log/tetragon"
+        - "/etc/tetragon"
+        - "/usr/local/bin/tetragon"
+        - "/usr/local/bin/tetra"
+        - "/usr/local/lib/tetragon"
+      - index: 1
+        operator: "Mask"
+        values:
+        - "2" # MAY_WRITE
+      matchBinaries:
+      - operator: "NotIn"
+        values:
+        - "/usr/bin/tetragon"
+        - "/usr/local/bin/tetragon"
+      matchActions:
+      - action: Post
+        rateLimit: "1m"
+  - call: "security_path_truncate"
+    syscall: false
+    message: "Truncation of Tetragon's logs, config or binaries"
+    args:
+    - index: 0
+      type: "path"
+    selectors:
+    - matchArgs:
+      - index: 0
+        operator: "Prefix"
+        values:
+        - "/var/log/tetragon"
+        - "/etc/tetragon"
+        - "/usr/local/bin/tetragon"
+        - "/usr/local/bin/tetra"
+        - "/usr/local/lib/tetragon"
+      matchBinaries:
+      - operator: "NotIn"
+        values:
+        - "/usr/bin/tetragon"
+        - "/usr/local/bin/tetragon"
+  - call: "security_path_unlink"
+    syscall: false
+    message: "File deleted from Tetragon's logs, config or binaries"
+    args:
+    - index: 0 # const struct path *dir: the directory the file is removed from
+      type: "path"
+    - index: 1 # struct dentry *dentry: the file being removed
+      type: "string"
+      resolve: "d_name.name"
+      label: "file"
+    selectors:
+    - matchArgs:
+      - index: 0
+        operator: "Prefix"
+        values:
+        - "/var/log/tetragon"
+        - "/etc/tetragon"
+        - "/usr/local/bin"
+        - "/usr/local/lib/tetragon"
+      matchBinaries:
+      - operator: "NotIn"
+        values:
+        - "/usr/bin/tetragon"
+        - "/usr/local/bin/tetragon"
+  - call: "security_path_rename"
+    syscall: false
+    message: "File renamed in or out of Tetragon's logs, config or binaries"
+    args:
+    - index: 0 # const struct path *old_dir
+      type: "path"
+    - index: 1 # struct dentry *old_dentry
+      type: "string"
+      resolve: "d_name.name"
+      label: "old_file"
+    - index: 2 # const struct path *new_dir
+      type: "path"
+    selectors:
+    - matchArgs:
+      - index: 0
+        operator: "Prefix"
+        values:
+        - "/var/log/tetragon"
+        - "/etc/tetragon"
+        - "/usr/local/lib/tetragon"
+      matchBinaries:
+      - operator: "NotIn"
+        values:
+        - "/usr/bin/tetragon"
+        - "/usr/local/bin/tetragon"
+    - matchArgs:
+      - index: 2
+        operator: "Prefix"
+        values:
+        - "/var/log/tetragon"
+        - "/etc/tetragon"
+        - "/usr/local/lib/tetragon"
+      matchBinaries:
+      - operator: "NotIn"
+        values:
+        - "/usr/bin/tetragon"
+        - "/usr/local/bin/tetragon"

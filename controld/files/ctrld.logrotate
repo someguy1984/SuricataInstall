@@ -1,0 +1,13 @@
+# Installed by controld/install.sh as /etc/logrotate.d/ctrld
+# ctrld's log holds the domains looked up, so keep it (and old copies) out of reach of
+# ordinary users. copytruncate: systemd holds the file open (StandardOutput=append:).
+/var/log/ctrld.log /var/log/ctrld.err.log {
+    size 10M
+    rotate 4
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    su root adm
+}

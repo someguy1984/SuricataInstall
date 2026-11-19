@@ -1,0 +1,25 @@
+# Stands in for edr-hub until server_hub/install.sh exists: a TLS 1.3 listener on the hub port, so
+# the private network, the port and TLS can be tested from the web box. Disable it before installing
+# the real hub:  systemctl disable --now mock-hub-placeholder
+[Unit]
+Description=Mock: TLS placeholder for edr-hub on :8443
+After=network-online.target mock-tls.service
+Requires=mock-tls.service
+
+[Service]
+DynamicUser=yes
+# the key is root-only; hand a copy to the dynamic user through a credential
+LoadCredential=hub.key:/etc/ssl/mock/hub.key
+ExecStart=/usr/bin/openssl s_server -quiet -accept 8443 -tls1_3 -www \
+    -cert /etc/ssl/mock/hub.crt -key ${CREDENTIALS_DIRECTORY}/hub.key
+Restart=on-failure
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target
