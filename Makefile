@@ -14,8 +14,11 @@ SH_FILES := install.sh uninstall.sh check.sh status.sh \
 	tetragon/run.sh tetragon/stop.sh tetragon/check.sh \
 	watch/install.sh watch/uninstall.sh watch/files/ips-watch watch/files/ips-notify \
 	tests/firewall-netns.sh tests/dry-run.sh tests/vm-smoke.sh tests/lint.sh \
-	server_edr_solution/mock/mock.sh server_edr_solution/mock/common/mock-tls.sh
-PY_FILES := analyse.py tetragon/viewer/server.py watch/files/tetragon-notify.py
+	server_edr_solution/mock/mock.sh server_edr_solution/mock/common/mock-tls.sh \
+	windows_qemu/inspect.sh windows_qemu/run_windows_qemu.sh windows_qemu/run_windows_sentinel_replica.sh
+PY_FILES := analyse.py tetragon/viewer/server.py watch/files/tetragon-notify.py \
+	windows_qemu/monitor.py windows_qemu/replica/analyze_run.py windows_qemu/replica/make_key_dmpstore.py \
+	windows_qemu/replica/qmp_watch.py
 
 .PHONY: lint test vm-test
 
