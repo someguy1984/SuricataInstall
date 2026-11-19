@@ -1,0 +1,93 @@
+# Mock environment for server_edr_solution: a hub and a web droplet on a private network.
+#
+#   ./mock.sh up       build and start, then wait until both are healthy
+#   ./mock.sh test     smoke test (page on :80 and :443, PHP 8.5, hub reachable over the private network)
+#   ./mock.sh down     stop and remove (add --volumes to forget certificates)
+#
+# Networks
+#   edr_vpc     10.77.0.0/24, internal: the "DigitalOcean VPC". No route out; only hub <-> web.
+#               hub = 10.77.0.10 (hub, hub.dev.local), web = 10.77.0.20 (web, web.dev.local)
+#   edr_egress  ordinary bridge for package downloads and rule/feed updates, as a droplet has.
+#
+# Only the web box publishes ports, and only on the host's loopback: http://web.dev.local and
+# https://web.dev.local after adding "127.0.0.1 web.dev.local" to /etc/hosts.
+#
+# systemd runs as PID 1, which needs extra privileges. Under rootless Docker those privileges stay
+# inside your user namespace; under rootful Docker they are real root on the host (see README).
+
+name: edr-mock
+
+x-droplet: &droplet
+  privileged: true
+  cgroup: private
+  tmpfs:
+    - /run
+    - /run/lock
+    - /tmp
+  stop_signal: SIGRTMIN+3
+  stop_grace_period: 20s
+  restart: unless-stopped
+
+# Each service mounts the whole repo read-only at /opt/SuricataInstall, because the installers reuse
+# the laptop kit (tetragon/, controld/, files/), plus a volume for its mock certificate.
+
+services:
+  hub:
+    <<: *droplet
+    build:
+      context: .
+      target: hub
+    image: edr-mock-hub:26.04
+    hostname: hub
+    networks:
+      edr_vpc:
+        ipv4_address: 10.77.0.10
+        aliases: [hub.dev.local]
+      edr_egress: {}
+    volumes:
+      - ../..:/opt/SuricataInstall:ro
+      - hub_tls:/etc/ssl/mock
+    healthcheck:
+      test: ["CMD-SHELL", "systemctl is-active --quiet mock-hub-placeholder"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+
+  web:
+    <<: *droplet
+    build:
+      context: .
+      target: web
+    image: edr-mock-web:26.04
+    hostname: web
+    networks:
+      edr_vpc:
+        ipv4_address: 10.77.0.20
+        aliases: [web.dev.local]
+      edr_egress: {}
+    ports:
+      - "127.0.0.1:80:80"
+      - "127.0.0.1:443:443"
+    volumes:
+      - ../..:/opt/SuricataInstall:ro
+      - web_tls:/etc/ssl/mock
+    healthcheck:
+      test: ["CMD-SHELL", "systemctl is-active --quiet nginx php8.5-fpm && curl -fsS -o /dev/null http://127.0.0.1/"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+    depends_on:
+      hub:
+        condition: service_healthy
+
+networks:
+  edr_vpc:
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.77.0.0/24
+  edr_egress: {}
+
+volumes:
+  hub_tls: {}
+  web_tls: {}

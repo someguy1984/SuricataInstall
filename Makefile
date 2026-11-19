@@ -13,7 +13,8 @@ SH_FILES := install.sh uninstall.sh check.sh status.sh \
 	tetragon/config.sh tetragon/local_install.sh tetragon/local_uninstall.sh \
 	tetragon/run.sh tetragon/stop.sh tetragon/check.sh \
 	watch/install.sh watch/uninstall.sh watch/files/ips-watch watch/files/ips-notify \
-	tests/firewall-netns.sh tests/dry-run.sh tests/vm-smoke.sh tests/lint.sh
+	tests/firewall-netns.sh tests/dry-run.sh tests/vm-smoke.sh tests/lint.sh \
+	server_edr_solution/mock/mock.sh server_edr_solution/mock/common/mock-tls.sh
 PY_FILES := analyse.py tetragon/viewer/server.py watch/files/tetragon-notify.py
 
 .PHONY: lint test vm-test
