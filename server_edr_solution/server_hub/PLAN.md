@@ -162,7 +162,10 @@ written in the style of the existing ones.
   is stopped by the slot cap and the deadlines. A `ct count` cap was not tested; do not rely on it. A client replays
   its spool at one batch a second at most (client §4.5), so the meter never drops it.
 - **Optional `--clients-only`** (P3, off by default): a root oneshot (`edr-hub-clients.service`, §8) fills an nftables set of enrolled client
-  addresses, plus the address range given to `token create --source`, and 8443 accepts only that set. The enrollment port
+  addresses, plus the address range given to `token create --source`, and 8443 accepts only that set. While it is on,
+  `token create` **requires `--source`** (refused, exit 3, without it), and at enrollment the hub adds that operator-declared
+  range to the set in the same transaction as the host row, never an address the peer merely connected from. The
+  client retries its post-enrollment test call for up to 30 s while the oneshot catches up (client §4.6). The enrollment port
   stays open while a token is pending, and with no clients enrolled 8443 stays open. The default is open plus the
   meter, because the set drifts when a client's address changes.
 - **DigitalOcean Cloud Firewall equivalent:** an inbound rule for 8443 whose source is a droplet **tag** carried by
@@ -260,8 +263,10 @@ extension files** (`pki/strict/{ca,srv,cli}.ext`); `openssl` defaults differ bet
   printed as `--token-file` lines, ending in `sudo ./install.sh --hub IP:PORT --token-file FILE` to run from the
   unpacked tarball (client §4.6). The output also names the enrollment port (`--enroll-port`,
   default 8444); the installer uses it only for `/v1/ca` and `/v1/enroll`.
-- **Lifetime and binding.** TTL 15 minutes by default, 24 hours at most. `--name` is the unique `hosts.name` (the
-  client's hostname is a hint). `--source CIDR` is checked against the TCP peer; `--for HOST` binds an existing row.
+- **Lifetime and binding.** TTL 15 minutes by default, 24 hours at most; the default is kept short on purpose. A manual
+  first install that waits for a human confirmation can outlast it, so `token create` prints the hint "for a manual
+  install with the confirmation wait, use `--ttl 1h`" with every token (client §4.6, §7). `--name` is the unique `hosts.name` (the
+  client's hostname is a hint). `--source CIDR` is checked against the TCP peer, and is required while `clients_only` is on (§2 Limits); `--for HOST` binds an existing row.
 - **Single use is atomic.** In `BEGIN IMMEDIATE`: `UPDATE tokens SET used_at=? WHERE id=? AND used_at IS NULL`,
   rowcount checked, in the transaction that signs and writes the host row, so a failed signing spends nothing.
   The token keeps the CSR SHA-256 and the certificate: the same token and CSR within 10 minutes return the same
@@ -281,7 +286,7 @@ extension files** (`pki/strict/{ca,srv,cli}.ext`); `openssl` defaults differ bet
   with `Cache-Control: no-store`: no disk, no subprocess. The reply: UUID, certificate, CA, `hub_addresses` (bare IP literals) and `port` (the fleet port, a separate integer),
   expiry, state `pending`.
 - **Every enrollment is audited and alerted HIGH** ("host X enrolled from IP Y, token made by Z"); the always-send
-  rule is in §4 (Admin actions). The hub records `droplet_id` at
+  rule is in §4 (Admin actions). The hub records `droplet_id` (required, never null) at
   enrollment and in heartbeats; two ids on one certificate, or a change from enrollment, raise a HIGH "possible clone".
 
 **Host states** (the contract; runbooks are in §15):
@@ -338,8 +343,8 @@ SQLite in WAL mode, `/var/lib/edr-hub/hub.db`, mode `0640`, group shared with th
 
 | Table | Holds |
 |-------|-------|
-| `hosts` | uuid, name, ips (display), os, versions, current and pending certificate DER SHA-256 (the check) and serial (display), expiry, `droplet_id` (first seen at enrollment), state (`pending`, `active`, `moved`, `retired`, `revoked`, `orphan`) and `state_since`, clock skew, last seen, last `seq` and epoch, `boot_id`, `agent_sha256`, `schema` |
-| `events` | `id INTEGER PRIMARY KEY AUTOINCREMENT`, host, `event_id`, received_at, ts, source, severity, kind, summary, details, src_ip, `src_trust`, `dst_ip`, `dst_port`, `proto`, community_id, `epoch`, `seq`, `agent_ver`, count, first, last, replayed; `UNIQUE(host, event_id)`; columns follow the client Appendix B field names, except `severity` (from `sev`), `event_id` (from `id`, `<epoch>:<seq>`), and `first` and `last` (from `first_ts` and `last_ts`); `ts` is stored after skew correction (§2) and `src_trust` is `tcp`, `claimed` or `none`; indexes on (received_at), (host, received_at), (src_ip). `proc`, `context`, `boot_id`, `redacted` and `truncated` stay inside `details`, so no client field is dropped |
+| `hosts` | uuid, name, ips (display), os, versions, current and pending certificate DER SHA-256 (the check) and serial (display), expiry, `droplet_id` (first seen at enrollment), `policy_rev` and `policy_rev_since` (the revision last issued to the host and when it last changed, hub clock; see Policy document), state (`pending`, `active`, `moved`, `retired`, `revoked`, `orphan`) and `state_since`, clock skew, last seen, last `seq` and epoch, `boot_id`, `agent_sha256`, `schema` |
+| `events` | `id INTEGER PRIMARY KEY AUTOINCREMENT`, host, `event_id`, received_at, ts, source, severity, kind, summary, details, src_ip, `src_trust`, `dst_ip`, `dst_port`, `proto`, community_id, `epoch`, `seq`, `agent_ver`, count, first, last, replayed; `UNIQUE(host, event_id)`; columns follow the client Appendix B field names, except `severity` (from `sev`: the client's value, kept as sent and never rewritten), `hub_severity` and `rated_by` (the hub's rating, equal to `severity` unless a §4 rule rates the kind differently, and the rule that did; alerts and incidents use `hub_severity`), `event_id` (from `id`, `<epoch>:<seq>`), and `first` and `last` (from `first_ts` and `last_ts`); `ts` is stored after skew correction (§2) and `src_trust` is `tcp`, `claimed` or `none`; indexes on (received_at), (host, received_at), (src_ip). `proc`, `context`, `boot_id`, `redacted` and `truncated` stay inside `details`, so no client field is dropped |
 | `daily_counts` | day, host, source, kind, count: roll-up of LOW and INFO |
 | `heartbeats`, `inventory` | latest heartbeat per host plus a 5-minute sample for 24 h; latest inventory per host is the heartbeat's `inventory` object (client §4.5.1; `unknown` kept as `unknown`). `inventory.<check>` events carry findings only |
 | `bans`, `feeds` | bans: cidr, reason, source, created, expires, created_by; feeds: name, url, `status`, last fetch, count, checksum |
@@ -433,10 +438,14 @@ attributed to the certificate CN, never to a name in the body. The "next step" o
 
 **Attacks on a host**
 
+The hub owns every rating rule and never rewrites what the client sent: the stored event keeps the client's `sev` in
+`severity`, and the rating a rule below gives is recorded beside it in `hub_severity`, with the rule in `rated_by` (§3).
+
 | Rule | Kind or field | Severity | Action and next step |
 |------|---------------|----------|----------------------|
 | A web-user process execs, writes code or becomes uid 0 | `tetragon.nginx-exec`, `tetragon.web-exec`, `tetragon.web-write-code`, `tetragon.privilege-escalation` from a web-user tree | CRITICAL | Patch if vulnerable, snapshot, then restart nginx (not reload): Sigkill stops the exec, not code already in the worker |
 | An SCTP socket, or the `sctp` module loading | `tetragon.sctp-socket`, `tetragon.monitor-kernel-modules` (tag `sctp`) | CRITICAL from a web-user tree, else HIGH | NGINX2Root's root step ([Xint](https://xint.io/blog/nginx2root-remote-code-execution)) |
+| A plain-DNS refusal by the DNS lock (client §4.4): a web user, or another non-root uid | `edr.dnslock` (`what` `plain`, `self` or `doh`; `dst_ip`) with the host's inventory `resolver` addresses | HIGH (the client's `sev` is the ceiling: a non-web uid stays MEDIUM); **MEDIUM** when the refused destination is an nginx `resolver` address recorded in that host's inventory | nginx with an outside `resolver` makes these lookups legitimate: point it at `127.0.0.53` (client §4.4) |
 | `.env` read by an unexpected program; tampering; a decoy file read | `tetragon.env-read`, `tamper.*`, `canary.file` | HIGH | Assume `.env` was read: rotate `APP_KEY`, database and API secrets |
 | nginx worker crashes: 3 in 10 minutes on one host | `nginx.crash` | HIGH | Possible exploit attempts; low fidelity alone ([CERT-EU](https://cert.europa.eu/publications/security-advisories/2026-022/)) |
 | One :443 connection past 4 GiB | `edr.bigconn` | MEDIUM; HIGH if a crash follows in 30 min | The client bans the source on a repeat (client §4.2) |
@@ -455,18 +464,18 @@ attributed to the certificate CN, never to a name in the body. The "next step" o
 | **Attempt contained**: a crash, `edr.bigconn` or flow-control line, then a killed `nginx-exec` or `sctp-socket`, within 30 min | `nginx.crash`, `edr.bigconn`, `nginx.marker.window_update`, then `tetragon.nginx-exec` or `tetragon.sctp-socket` | CRITICAL | Restart nginx; hunt for persistence (`authorized_keys`, cron, `ld.so.preload`); patch |
 | **Worker survived the kill**: a fork-watch hit, then any web event from the same host within 10 min | `tetragon.fork-watch`, then `tetragon.web-exec`, `tetragon.web-write-code` or `tetragon.web-connect` | CRITICAL | Restart nginx (not reload); the hub tracks it as an open operator task, cleared when inventory shows worker start times newer than the hit |
 | **Possible success**: those first signals, then within 30 min a heartbeat gap, `tamper.*`, or a heartbeat showing Tetragon unhealthy | hub-side heartbeat gap; `tamper.*`; heartbeat `tetragon` | CRITICAL | Treat the host as lost: snapshot, rebuild, rotate every secret it held. One `signal 6` was all a lab RCE left ([Censys](https://raw.githubusercontent.com/Censys-Research/nginx2root/main/evidence/cve-2026-123007/RCE-CONFIRMED.md)) |
-| Enforcement gone: a policy set to enforce is disabled or missing in the heartbeat `tetragon` list, or the `kernel` changed without a passed canary, over 5 min after boot | `health.enforcement_gone`; heartbeat `tetragon` and `kernel` | HIGH | Read the heartbeat's policy list; restart Tetragon; run `edr-check` on the host |
+| Enforcement gone: the client reports a policy set to enforce that is not loaded, or a `kernel` change without a passed canary, over 5 min after boot | the client's `health.enforcement_gone` event (client §4.3); the heartbeat `tetragon` list and `kernel` are shown beside it, not evaluated | HIGH | Read the heartbeat's policy list (`name`, `mode`, `would_be_kills`); restart Tetragon; run `edr-check` on the host |
 | Agent silent (see "Engine"), unless in maintenance or retired | hub-side: time since the last heartbeat | HIGH; CRITICAL within 30 min of a rule above | Down, tampered with or blinded. Silent 14 days: a daily "retire it?" line, paging continues |
 | Reboot: notice then a new boot id within 10 min / a new boot id with no notice | heartbeat `shutdown` and `boot_id` | INFO / MEDIUM; HIGH within 30 min of a Sigkill hit | Check the console. Over 10 min of silence after a notice is the real alert |
 | Unknown or changed agent build | heartbeat `agent_sha256` and `agent_version` | HIGH | The hash is not in `agent-hashes.json` or a local `agent-hash add` override, or changed while the version did not (§17). Re-check the build; add it with `edr-hub agent-hash add SHA` if intended |
-| Duplicate identity: one certificate from two droplet ids, or two live boot ids | heartbeat `droplet_id` and `boot_id` | HIGH | A clone or a stolen key. Clone: enrol it with a plain token (new UUID, client §4.6) and retire the old row only if its droplet is gone. Stolen key: `host HOST revoke`, then re-enrol the real host with a token made `--for HOST` |
+| Duplicate identity: one certificate from two droplet ids, or two live boot ids (the id comparison is never skipped: `droplet_id` is required) | heartbeat `droplet_id` and `boot_id` | HIGH | A clone or a stolen key. Clone: enrol it with a plain token (new UUID, client §4.6) and retire the old row only if its droplet is gone. Stolen key: `host HOST revoke`, then re-enrol the real host with a token made `--for HOST` |
 | Disk guard tripped, or free space under 10%, on a client | `health.diskguard`, `health.disk_low` | CRITICAL | Sent from memory first, not from a spool on the full disk |
-| A host lags `policy_rev_applied` by over 5 min, or reports `last_apply_error` | heartbeat `policy_rev_applied`, `last_apply_error` | MEDIUM | The host is not applying bans |
+| A host's `policy_rev_applied` differs from its `policy_rev` for over 5 min (since `policy_rev_since`), or it reports `last_apply_error` | heartbeat `policy_rev_applied`, `last_apply_error`; `hosts.policy_rev`, `policy_rev_since` | MEDIUM | The host is not applying bans |
 | A pause is in force (`edr-agent pause`, at most 24 h) | heartbeat `paused_until` in the future | MEDIUM, once per pause | Bans, feeds, enforcement (except `edr-canary`) and the DNS lock are off until it ends or `edr-agent resume` (client §4.7); shown on the Fleet page. A pause does not silence agent-silent |
 | No daily canary result from a host in 26 h (P2) | absence of `canary.policy_check` | MEDIUM, once per host | The daily canary through `edr-policy-check` did not run (client §4.3) |
 | `inet edr` absent for 2 min | heartbeat `nft` (`table_present` false) | HIGH | The `edr-bans` timer did not rebuild it |
 | Conntrack use of 70% or more (90%: HIGH) | heartbeat `conntrack` (count, max) | MEDIUM | Raise `nf_conntrack_max` or check for a flood (client §4.2) |
-| Suricata kernel drops over 1% in a window | heartbeat `suricata_drops` | MEDIUM | Client §4.1 |
+| Suricata kernel drops over 1% in a window | heartbeat `suricata_drops` (`drops` over `packets`; not evaluated when `packets` is 0) | MEDIUM | Client §4.1 |
 | Suricata rules not updated for 3 days | `health.rules_stale` | MEDIUM | Client §4.1 |
 
 **Inventory, coverage and fleet**
@@ -482,8 +491,10 @@ attributed to the certificate CN, never to a name in the body. The "next step" o
 | Same IP with qualifying evidence from 2 distinct host certificates in 1 h (P3) | hub-side: `ban.local` votes | MEDIUM | Fleet ban ("Fleet bans") |
 
 **Admin actions** are notifications, not detections. They always send as HIGH, bypassing the minimum severity and
-dedup: token created or used, re-enrolment, host revoked or retired, never-ban or settings changed, new dashboard
-session (with its source), over 5 failed dashboard logins, and a ban of /16 or wider. A webhook change goes to the
+dedup: token created or used, re-enrolment, host revoked or retired, `host adopt`, `agent-hash add`, `reissue-cert`,
+never-ban or settings changed, new dashboard session (with its source), over 5 failed dashboard logins, a ban of /16 or
+wider, and every **root-only file operation**: `ca-export`, `backup` (run by hand), `restore` and any write to `secrets.json`
+(audited through `pending-audit.jsonl`, §5 Audit, so they alert even with the hub stopped, once it starts). A webhook change goes to the
 old channel too. A message never holds a token secret.
 
 **Hub self-health**, from the hub's daily job and the checks in "Watching the hub" (lifetimes are in §2):
@@ -499,8 +510,8 @@ old channel too. A message never holds a token secret.
 | CA under 2 years | `ca/ca.pem` `notAfter`, hub-side | MEDIUM | Replace the CA by year 8 (§2): CA rollover is a rehome of every client |
 | CA under 1 year | `ca/ca.pem` `notAfter`, hub-side | HIGH | The same |
 | A feed older than 2 days, or refused as anomalous | `feeds.status` | MEDIUM | Check the fetch (client entries expire on their timeout, client §4.2) |
-| Advisory table over 90 days old | date of the advisory table, hub-side | MEDIUM | Update the hub release |
-| Advisory table over 180 days old | date of the advisory table, hub-side | MEDIUM; status "unknown", never "fixed" | Update the hub release |
+| Advisory table over 90 days old | `updated` of `advisories.json`, hub-side | MEDIUM | Update the hub release |
+| Advisory table over 180 days old | `updated` of `advisories.json`, hub-side | MEDIUM; status "unknown", never "fixed" | Update the hub release |
 | Last good backup over 7 days old | `meta`, read from `/var/lib/edr-hub/last-backup` | HIGH | `edr-hub backup`; the marker is written by the backup job after a verified backup (§7, §8 step 8) |
 | Database over 80% of its cap, WAL over 256 MB | hub-side checks (§3) | MEDIUM | A pinned reader keeps the WAL growing (§3) |
 | Disk over 80% used | hub-side check | MEDIUM; HIGH at 90% | Thin the backups; see §15 |
@@ -561,6 +572,12 @@ commands and the Bans page are P3; in P2 the policy document carries peers only.
 
 - `GET /v1/policy` is a **full per-host document** `{rev, hub_time, hub_addresses, port, bans, feeds, peers}` (Appendix A); the ETag
   is that host's revision. In P2 only `peers` (and the hub addresses and port) are filled; `bans` and `feeds` are empty until P3. Ignore rules, thresholds and enforcement are local only (client §14).
+- **`rev` is stateless:** the first 16 lowercase hex characters of the SHA-256 of the canonical policy document without `hub_time`
+  (JSON, keys sorted, no spaces, UTF-8). It is a string, the same in the ETag, `GET /v1/policy` and the heartbeat reply's
+  `policy_rev`; two hosts with the same document share it. The `hosts` row keeps `policy_rev` and `policy_rev_since`, set
+  whenever the computed value differs from the stored one, so the 5-minute lag rule (§4 Rules) has its start time.
+  `min_client_schema` (heartbeat reply) is the previous event schema version, the current `v` minus one, so it matches
+  the `schema_too_old` rule (Appendix A, Versioning).
 - **Expiry is absolute** (`expires_at`). With `hub_time` the client computes the relative timeout nftables needs,
   `expires_at - hub_time`, so its own clock error cannot shift a ban.
 - An unban is absence from the next document. Reasons never name other hosts. A rehome keeps local bans (client §5).
@@ -573,6 +590,19 @@ commands and the Bans page are P3; in P2 the policy document carries peers only.
 origins and "no fix yet". `nginx -v` cannot show a distro fix, because Ubuntu backports keep the version
 ([Xint](https://xint.io/blog/nginx2root-remote-code-execution)). The table is `common/advisories.json`; files in
 `/var/lib/edr-hub/advisories.d/` override it and survive uninstall.
+
+- **File shape (the one definition; the client reads the same file, client §4.5.1).** Top level
+  `{"updated": "YYYY-MM-DD", "rows": [ ... ]}`. Each row is
+  `{"id", "origin", "release", "packages", "compare", "fixed_in", "cves", "needs_feature", "ref"}`:
+  `id` a unique string; `origin` and `release` the key below (`release` is the Ubuntu codename or `any`; for kernel
+  rows the series, `noble-6.8`, `noble-7.0` or `resolute`); `packages` a list of package names (empty for kernel rows);
+  `compare` one of `"dpkg"` (`dpkg --compare-versions` on the full version), `"upstream"` (upstream version only) or
+  `"kernel"` (the running kernel); `fixed_in` the first fixed version as a string, or null when no fix is known;
+  `cves` a list of strings; `needs_feature` a string naming the exposed feature the inventory reports, or null when the
+  version alone decides; `ref` a URL string. The table below is this data in prose. A file in `advisories.d/` has the
+  same shape, and a row with the same `id` **replaces** the shipped row; any other row is added. The staleness rules
+  (90 and 180 days, §4) read `updated` of the shipped file, never an override's. The lint schema check (§12) fails on a
+  missing key, a wrong type or a `compare` outside the three values.
 
 - **Rows are keyed by `(origin, os release)`** from `edr-inventory`. Ubuntu rows: `dpkg --compare-versions` on the
   full version. nginx.org: upstream version only (strip `-1~codename`). Any other origin or release gives
@@ -650,6 +680,14 @@ mode with `edr-notify`, not pointed at itself. Each agent journals every policy 
 `edr-hub host HOST maintenance --for 30m` (2 hours at most, as client §4.7; audited; INFO notification;
 `edr-agent maintenance` (client P3) sets the same state in the heartbeat; `edr-hub host HOST maintenance --end` ends it early) silences **only** agent-silent and the reboot rule for that host. Attack rules still
 alert. A planned reboot needs no window (a shutdown notice plus a new boot id is INFO).
+
+**The client's SCTP canary pages.** There is no test marker on events: a field saying "this is only a test" could be set by
+an intruder, so `tetragon.sctp-socket` from the canary is an ordinary CRITICAL event (it can also complete the "Attempt
+contained" chain after a crash or bigconn signal). `check.sh --live` and the post-upgrade self-test on an enforcing,
+enrolled host (client §4.3, §8) therefore page every channel. Open a window first (`host HOST maintenance --for 30m`): it does not
+suppress the page, but the incident and the alert carry "in a maintenance window set by X", so the operator reads it as
+expected. The client prints this warning before it runs the canaries. It raises no fleet ban, because fleet votes count
+only `ban.local` events (Fleet bans; §12 L0).
 
 ---
 
@@ -770,6 +808,18 @@ A local website, installed and running by default, separate from the client inge
 - **Tamper evidence:** `hash = sha256(prev_hash || canonical_json(row))`; `edr-hub audit verify` checks the chain.
   The head hash goes into the daily digest and the journal; a root attacker on the hub defeats the chain, the
   off-box copy is the defence. The 3-year prune writes a `prune` row with the last deleted hash.
+- **Root-only file operations leave a row too.** `ca-export`, `backup`, `restore` and every write to `secrets.json` use no
+  socket (§6), so the hub never sees them. The CLI therefore appends one JSON line (a random line id, `ts`, the
+  operation, its target file, `uid`, `SUDO_USER`, the CLI-supplied `loginuid`, and the outcome) to
+  `/var/lib/edr-hub/pending-audit.jsonl` **at the time**, before the operation starts and again with its outcome. The file is
+  `root:edr-hub 0640`: only root appends to it, the writer can read it, and nothing ever rewrites or truncates it.
+  The writer ingests new lines into the hash-chained audit table (`actor_kind` cli, a `file-op` marker in
+  `actor_detail`) at its next start or tick, keeping its read offset in `meta`; a repeated line id is ignored, so a
+  restore that brings back an older `meta` ingests nothing twice. It works with the hub stopped, which `restore`
+  requires. Each such row also raises a HIGH notification (the always-send list, §4) when it is ingested; the one
+  exception is the daily `edr-hub-backup.timer` job (§8 step 8), which leaves its row but would page every day: a
+  failed or missed one is the backup-age rule (§4). The file is
+  not in a backup (§7); a root attacker can still edit it, as with the chain itself (the off-box copy is the defence).
 - Denied socket commands, bad UI logins and bad enrollment tokens are recorded. Unauthenticated-failure rows
   (`actor_kind = client` with outcome denied or invalid) are one row per source per minute with a count (1000
   sources a minute, then `other`), capped at 10,000 a day and then one summary row with the count; they are pruned
@@ -787,7 +837,7 @@ A local website, installed and running by default, separate from the client inge
     edr-hub host UUID adopt                 # orphan UUID after a restore (§7)
     edr-hub events [--host H] [--since 1h] [--min-sev high] [--json]
     edr-hub incidents [--open] | incident ID | ack ID [--for 4h] | resolve ID    # ack: P3
-    edr-hub token create (--name web-1 | --names web-1,web-2,... | --for HOST[,HOST...]) [--ttl 1h] [--source CIDR]
+    edr-hub token create (--name web-1 | --names web-1,web-2,... | --for HOST[,HOST...]) [--ttl 1h] [--source CIDR]    # --source required with clients_only
                          | list | revoke ID
     edr-hub ui-login                        # one-time dashboard login URL (§5)
     edr-hub ban CIDR [--ttl 24h] [--reason …] | extend CIDR --ttl 24h | unban CIDR | bans    # P3
@@ -816,11 +866,11 @@ A local website, installed and running by default, separate from the client inge
 - **Backup and restore** are root-only file operations, not socket commands (§7): a backup holds the database,
   `settings.json` and the secrets but no CA key, so it is written 0600 and encrypted with the passphrase file
   `/etc/edr-hub/backup.pass` (schedule and restore: §7, §15). The CA key leaves only through `ca-export`, which asks for its own passphrase.
-  `restore` refuses unless `edr-hub` is stopped; `restore --drill` skips the secrets (§7). `export` writes JSON
+  `restore` refuses unless `edr-hub` is stopped; `restore --drill` skips the secrets (§7). Each of these, and every write to `secrets.json`, appends an audit line to `/var/lib/edr-hub/pending-audit.jsonl` and raises a HIGH notification (§5 Audit, §4). `export` writes JSON
   lines (P3), with `ensure_ascii=True` as in the output rules below.
 
 ### Which socket takes which command
-`ctl.sock` (root CLI) accepts every socket command (`backup`, `restore`, `ca-export` and `health` are file operations and use no socket). `ui.sock` (the dashboard) accepts only the rows marked UI. `out.sock`
+`ctl.sock` (root CLI) accepts every socket command (`backup`, `restore`, `ca-export` and `health` are file operations and use no socket; the first three are audited through `pending-audit.jsonl`, §5 Audit). `ui.sock` (the dashboard) accepts only the rows marked UI. `out.sock`
 (`edr-hub-out` only) accepts `outbox.take`, `outbox.result`, `feed.job` and `feed.result`; no admin verb is reachable
 on it. Reads do not use a socket: the CLI and the UI open the database read-only.
 
@@ -861,12 +911,17 @@ on it. Reads do not use a socket: the CLI and the UI open the database read-only
 - **`edr-hub ca-export`** writes the CA key once, as PKCS#8 encrypted with a passphrase
   (`openssl pkcs8 -topk8 -v2 aes-256-cbc`), for off-box storage. Run it once after install and after any CA change;
   the passphrase is separate from `backup.pass` and is kept offline. A restore on a new box needs both. Without
-  the CA key a backup restores history but not the CA, so every client must re-home (below).
+  the CA key a backup cannot be restored there: `restore` refuses (exit 3, nothing changed), and the way on is a
+  fresh hub ("With no backup, or no CA key" below). `ca-export`, `backup` and `restore` each leave an audit row and a HIGH
+  notification through `pending-audit.jsonl` (§5 Audit); the export is the most sensitive act the hub has.
 - Integrity checks and the restore drill are in §3 and §15 (a drill box has `edr-hub-out` disabled before `restore`,
   and `restore --drill` skips the secrets). The hub never restores or starts empty by itself.
 
 **Moving with a backup and the CA key.** `edr-hub restore FILE --ca-key FILE` runs on a new box after
-`server_hub/install.sh`, with `edr-hub` stopped, and replaces the fresh state:
+`server_hub/install.sh`, with `edr-hub` stopped, and replaces the fresh state. On the box the backup came from,
+with `/var/lib/edr-hub/ca` intact (P3: the key in `/var/lib/edr-hub-ca`), `--ca-key` may be left out: `restore` uses
+the key in place, after checking that it is the key of the `ca/ca.pem` in the backup. With no `--ca-key` and no such
+key, or with a key that does not match, it refuses with exit 3 and changes nothing. The steps:
 1. Decrypt, check the checksum, run `quick_check` on the database.
 2. **Every token is marked invalid** (a restored database would otherwise revive redeemed ones).
 3. Reissue the hub server certificate and key (`/var/lib/edr-hub/tls/server.pem` and `server.key`) from the restored CA, with a new random serial and the SAN from the stored
@@ -888,7 +943,7 @@ on it. Reads do not use a socket: the CLI and the UI open the database read-only
   against the token, enrolls, makes a test request, and switches only then (client §5).
 
 **With no backup, or no CA key.** Install a fresh hub with a new CA and re-home every client with plain tokens
-(new UUIDs; history starts over). Old pins and tokens do not match. Replacing the CA on purpose (year 8) or after theft:
+(new UUIDs; history starts over). A backup whose CA key is lost is not restored into it: `restore` refuses. Old pins and tokens do not match. Replacing the CA on purpose (year 8) or after theft:
 runbook in §15 (CA compromise).
 
 Decommissioning a host (uninstall, rehome, destroyed droplet, suspected compromise) is the §2 Host states
@@ -928,7 +983,7 @@ firewall is the only step that can lock you out, so it comes last (step 10). Exi
 
    | Path | Owner:group, mode | Holds |
    |------|-------------------|-------|
-   | `/var/lib/edr-hub` | `edr-hub:edr-hub-ui`, `2750` | `hub.db`, `-wal`, `-shm` (`0640`, group inherited), `settings.json`, `advisories.d/`, `webhook-ca.pem` (the `--webhook-ca` file, copied here by the installer; a public certificate), `last-backup` (`0644`, written by the backup job, §7) |
+   | `/var/lib/edr-hub` | `edr-hub:edr-hub-ui`, `2750` | `hub.db`, `-wal`, `-shm` (`0640`, group inherited), `settings.json`, `advisories.d/`, `webhook-ca.pem` (the `--webhook-ca` file, copied here by the installer; a public certificate), `last-backup` (`0644`, written by the backup job, §7), `pending-audit.jsonl` (`root:edr-hub`, `0640`, appended by the root CLI, ingested into the audit chain by the writer, §5 Audit) |
    | `/var/lib/edr-hub/ca` | `edr-hub`, `0700` | CA key and certificate, `revoked.txt` (P3: the key moves to `/var/lib/edr-hub-ca`, the signer's own `StateDirectory`, owner `edr-hub-ca`, `0400`; the certificate and `revoked.txt` stay here) |
    | `/var/lib/edr-hub/tls` | `edr-hub`, `0700` | Hub server certificate `server.pem` and key `server.key` (`0600`); reissued at runtime (§2), not backed up (§7), kept on uninstall (§9) |
    | `/var/lib/edr-hub-out` | `edr-hub-out`, `0700` | `channels.json` (the outbound worker's `StateDirectory`), kept on uninstall (§9) |
@@ -1010,7 +1065,7 @@ firewall is the only step that can lock you out, so it comes last (step 10). Exi
    - With no admin address the installer emits `tcp dport 22 accept` in place of the two admin lines.
    - **`--clients-only` (P3).** The table gains the sets `clients4` and `clients6`, and the accept for 8443 is limited to
      them (8444 stays as it is). `edr-hub` writes the enrolled addresses and each pending token's `--source` range to
-     `/run/edr-hub/clients.json`; a root oneshot, `edr-hub-clients.service` (started by a path unit on that file and by a
+     `/run/edr-hub/clients.json` (the enrolled host's range is the token's `--source`, written in the enrollment transaction); a root oneshot, `edr-hub-clients.service` (started by a path unit on that file and by a
      60 s timer), validates IP literals only and fills the sets, treating the file as hostile exactly as the client's
      `edr-bans` treats its input (client §4.2). With no client enrolled the limit is not applied.
    - An accept here never overrides a drop in UFW or a DigitalOcean Cloud Firewall. Cloud Firewall: §2.
@@ -1069,7 +1124,7 @@ pointed at itself.
    `systemctl stop systemd-journald@edr-hub`) and `/etc/apt/apt.conf.d/52edr-hub`, and restore any prior value the
    manifest holds. A file the manifest does not list is left alone and printed. Then remove `/etc/edr-hub`
    except `secrets.json` and `backup.pass`.
-5. **Keep `/var/lib/edr-hub`** (database, CA, server certificate and key in `tls/`, settings, `last-backup`), `/var/lib/edr-hub-out` (`channels.json`) and, in P3, `/var/lib/edr-hub-ca` (the CA key), `/etc/edr-hub/secrets.json`, `/etc/edr-hub/backup.pass` and
+5. **Keep `/var/lib/edr-hub`** (database, CA, server certificate and key in `tls/`, settings, `last-backup`, `pending-audit.jsonl`), `/var/lib/edr-hub-out` (`channels.json`) and, in P3, `/var/lib/edr-hub-ca` (the CA key), `/etc/edr-hub/secrets.json`, `/etc/edr-hub/backup.pass` and
    `/var/backups/edr-hub`, so running
    `install.sh` again brings back the same hub and clients keep working without re-enrolling.
 
@@ -1080,7 +1135,7 @@ pointed at itself.
 - **No package is removed.** `unattended-upgrades` stays on; the manifest lists any package the installer added.
 - A DigitalOcean Cloud Firewall and the DNS or Reserved IP records are yours: remove them by hand.
 
-**`--purge`** also deletes `/var/lib/edr-hub`, `/var/lib/edr-hub-out`, `/var/lib/edr-hub-ca` (P3), `/etc/edr-hub`, `/var/backups/edr-hub` and then the four users and groups. Before it
+**`--purge`** also deletes `/var/lib/edr-hub` (`pending-audit.jsonl` with it), `/var/lib/edr-hub-out`, `/var/lib/edr-hub-ca` (P3), `/etc/edr-hub`, `/var/backups/edr-hub` and then the four users and groups. Before it
 does anything it warns, in this order, that:
 - the CA key is deleted, and a backup holds none (§7), so offer `edr-hub ca-export` first;
 - every enrolled client then needs a new token from a new hub (`rehome`, client §5) and old pins will not match;
@@ -1123,7 +1178,7 @@ locally (§4, Watching the hub); a client uninstall does not need the hub (clien
 
 **Installed paths and modes:** §8 steps 2 and 3. Beyond that table: `critical-overflow.jsonl` and `advisories.d/` in
 `/var/lib/edr-hub/`, the server certificate and key in `/var/lib/edr-hub/tls/` (§2), `last-backup` written by the
-backup job (§7), `/etc/edr-hub/secrets.json` and `backup.pass` (§14), one previous code copy
+backup job (§7), `pending-audit.jsonl` (§5 Audit), `/etc/edr-hub/secrets.json` and `backup.pass` (§14), one previous code copy
 `/usr/local/lib/edr-hub.prev` (§17) and, in P3, `/run/edr-hub-ca/sign.sock`. `ctl.sock`, `ui.sock` and `out.sock` are all in
 `/run/edr-hub/` (§8 step 2). State survives uninstall and is what a backup covers (§7, §9).
 
@@ -1145,7 +1200,9 @@ it needs. The test tiers are in §12.
 - **P2:** slow-client and flood tests pass (§12); a revoked, moved or retired certificate is refused; a 60-minute hub
   outage and a hub restart lose no HIGH or CRITICAL event (spool at most 50 MB, delivered within 5 minutes after); the
   restore drill (§12) works onto a second hub and a client `rehome`s to it; `ca-export` has been run and a restore with
-  both secrets works; the previous client protocol version works against the new hub.
+  both secrets works; from the **second release on**, the previous client protocol version works against the new hub. At the
+  first release there is no earlier protocol or tag, so unit tests cover a synthetic N-1 event schema version (accepted)
+  and `X-EDR-Proto: 0` answered 426 instead.
 - **P3:** the two-host fleet-ban round trip takes under 2 minutes; a fleet ban never comes from a canary; the
   per-reporter budget and the dry-run week pass; the restore drill is repeated on the schedule the operator set (§15).
 - **P4:** the settings view shows a changed `local.conf` hash and enforcement modes and offers no way to change them.
@@ -1180,7 +1237,7 @@ side:
 | Validators | CIDR and never-ban (minimum prefix, UI ban cap); settings keys and the secrets split: a secret is written by the root CLI straight to `secrets.json`, never over `ctl.sock`, and the settings history records only that it changed |
 | Storage | A duplicate (host, `id`) is `INSERT OR IGNORE` and counted, the host coming from the certificate; skew correction and the 5-minute clamp; replayed events never feed fleet bans; pruning order and HIGH and CRITICAL never pruned; roll-ups sum `count` |
 | Rules and alerts | Every row of the §4 rule tables names a kind or heartbeat key that Appendix A or client Appendix B defines; a rule counts `sum(count)` and distinct certificate CNs; escaping per channel; the sanitiser on hostile fields; a canary never raises a fleet ban; the outbox retries and a failing channel is flagged |
-| Dashboard and CLI | Host and Origin checks, single-use login codes, session expiry, CSP header, terminal-safe output, audit chain `verify` |
+| Dashboard and CLI | Host and Origin checks, single-use login codes, session expiry, CSP header, terminal-safe output, audit chain `verify`; `pending-audit.jsonl` ingest (hub stopped, a repeated line id, a HIGH notification per root-only file operation) |
 
 ### L1: network namespace (root)
 
@@ -1207,10 +1264,12 @@ Each row of the §2 Limits table and each flood rule in §2 and §3 gets a test 
   numbered list holds, then a client `rehome`s with a `--for HOST` token and keeps its UUID and history. The server certificate is reissued,
   not restored. A client certificate the restored database does not know (signed by the CA, not in `revoked.txt`,
   serial absent from `hosts`) makes the host `orphan`. A drill box has `edr-hub-out` disabled before `restore`, and
-  `restore --drill` skips the secrets. Repeat with no CA key (new UUIDs) and onto an empty hub (a local ban survives).
-- **Old agent, new hub.** An agent built from the previous git tag (`AGENT_REF`) sends heartbeats and events to the new
+  `restore --drill` skips the secrets. Repeat on the original box with `ca/` intact and no `--ca-key` (restores), on a new box with no CA key
+  (refused, exit 3, nothing changed; then the fresh-hub path gives new UUIDs) and onto an empty hub (a local ban survives).
+- **Old agent, new hub.** From the second release, an agent built from the previous git tag (`AGENT_REF`) sends heartbeats and events to the new
   hub: protocol N-1 is accepted and unknown fields are dropped; older gets 426, a schema below the previous one gets 422
-  `schema_too_old`; the dashboard lists the lagging host. The hub refuses a database newer than its code. Before a schema migration the installer takes an encrypted backup and only then restarts the service; `restore` is the rollback.
+  `schema_too_old`; the dashboard lists the lagging host. At the first release no previous tag exists: unit tests send a
+  synthetic N-1 event schema version (accepted) and `X-EDR-Proto: 0` (426). The hub refuses a database newer than its code. Before a schema migration the installer takes an encrypted backup and only then restarts the service; `restore` is the rollback.
 - **Clock.** `libfaketime` on the agent: renewal at 30 days, a future timestamp clamped, an old one marked replayed.
 
 ### Two-VM flow (L3, with the client)
@@ -1239,6 +1298,15 @@ Memory and timing figures in §2 were taken on Python 3.14: re-measure on 3.12 (
 | Admin actions in the dashboard | Tokens, host revoke, never-ban, settings, backup: CLI only (§6 socket table); a UI compromise could otherwise enrol a rogue host or cut hosts off. The UI may only ban, unban and extend (P3), mark moved, set or end maintenance, and acknowledge (P3). Settings are read-only there |
 | Dashboard access | SSH tunnel only in v1. No TLS mode in v1 (§5) |
 | Operator identity | One shared admin identity in v1. Audit names the CLI login uid or the UI session (§5) |
+| Root-only file operations | `ca-export`, `backup`, `restore` and `secrets.json` writes are audited through `pending-audit.jsonl` and notify HIGH (§5 Audit, §4) |
+| `rev` and `min_client_schema` | `rev` is the first 16 hex of the SHA-256 of the policy document without `hub_time`; `min_client_schema` is the previous event schema version (§4 Policy document) |
+| Advisory file shape | `{updated, rows: [...]}`; an override row with the same `id` replaces the shipped one (§4 Advisory data) |
+| P2 exit, previous protocol | Applies from the second release; at the first, unit tests cover a synthetic N-1 schema and `X-EDR-Proto: 0` answered 426 (§11) |
+| `droplet_id` | Required and non-null in the API; off DigitalOcean the client passes `--droplet-id` (App. A, client §4.6) |
+| Client re-rating | The hub owns the rules and never rewrites `sev`; its rating is stored beside it (§3, §4) |
+| SCTP canary | No test marker: it pages as a CRITICAL event; the operator opens a maintenance window first (§4) |
+| `--clients-only` and enrollment | `--source` is required while it is on; the range joins the set in the enrollment transaction (§2) |
+| Token lifetime | Default 15 minutes kept; `--ttl 1h` hint for a manual install (§2 Tokens) |
 
 ### Defaults chosen for questions only the owner can settle
 amd64 only; no swap file is created; ntfy and a Slack-compatible webhook first; no
@@ -1360,8 +1428,8 @@ monthly.
   Free space: copy `/var/backups/edr-hub` off and thin it, lower `retention_days`
   or `max_db_size` (`edr-hub settings set`). The writer prunes and replays the overflow file (§3). Never delete
   `-wal` or `-shm` by hand.
-- **Corrupt:** see §3 Integrity. `systemctl stop edr-hub`, `edr-hub restore FILE --ca-key FILE` from the newest good
-  backup (§7), keep the moved-aside file. Clients replay their spool. Hosts enrolled after that backup show as
+- **Corrupt:** see §3 Integrity. `systemctl stop edr-hub`, `edr-hub restore FILE` from the newest good
+  backup (§7; add `--ca-key FILE` only if `ca/` was lost too), keep the moved-aside file. Clients replay their spool. Hosts enrolled after that backup show as
   `orphan`: check each, then `edr-hub host UUID adopt`.
 
 ### Restore drill (quarterly; schedule it yourself, nothing reminds you)
@@ -1484,8 +1552,8 @@ alert. A client two releases behind does, which doubles as a lag signal; upgrade
 **Rollback.** Migrations only go forward and the hub refuses a newer database, so rolling back needs the matching data.
 1. Stop `edr-hub`.
 2. Run `install.sh --force` from the previous tarball (a downgrade is refused without it).
-3. If the upgrade migrated the database, run `edr-hub restore FILE --ca-key FILE` with the backup that upgrade took
-   (step 2 above, §7); it needs the `ca-export` file. If it did not, the database is already right and there is
+3. If the upgrade migrated the database, run `edr-hub restore FILE` with the backup that upgrade took
+   (step 2 above, §7); the CA key on the box is used, so the `ca-export` file is needed only if `ca/` was lost. If it did not, the database is already right and there is
    nothing to restore.
 Events accepted after a migrating upgrade are lost from the database; HIGH and CRITICAL also went out as alerts. A
 restore needs a hub version no older than the backup's.
@@ -1497,7 +1565,7 @@ restore needs a hub version no older than the backup's.
 | 0 | done | final check PASS | all pass | done |
 | 1 | not used | not used | warnings only | warnings only (`status`, `alert test` with a channel down) |
 | 2 | failed | final check FAIL | any FAIL | failed (hub unreachable, `health` unhealthy, `audit verify` chain broken) |
-| 3 | pre-flight refused, nothing changed | nothing to remove, or a prompt declined | not used | refused before changing anything (validation, never-ban overlap, restore while running) |
+| 3 | pre-flight refused, nothing changed | nothing to remove, or a prompt declined | not used | refused before changing anything (validation, never-ban overlap, restore while running, restore without a usable CA key) |
 | 4 | failed after changes and rolled back: a migration failed, or the firewall rollback fired (§8 step 10) | not used | not used | not used |
 | 64 | usage error | usage error | usage error | usage error |
 
@@ -1540,7 +1608,9 @@ The contract between `edr-agent` and `edr-hub`. Limits and the reasons for them 
 - **Listener and auth:** enrollment; a token (`id.secret`). The order of checks and the token rules are in Tokens (§2).
 - **Request:** `{"token", "csr", "host_uuid"?, "hostname", "os", "ips", "droplet_id"}`. `token` is `id.secret` (the
   client keeps the `ca_sha256` part). `host_uuid`, `hostname`, `os` and `ips` are hints for display; the hub mints the
-  UUID and the token's name wins. `droplet_id` is stored with the host and compared with every heartbeat's.
+  UUID and the token's name wins. `droplet_id` is **required**, a non-empty string, never null (a missing or null value is 400): it is stored with the host and
+  compared with every heartbeat's, and that comparison is never skipped. Off DigitalOcean the client supplies it from
+  `--droplet-id` (client §4.6); the hub does not tell the two apart.
 - **Response:** `200 {"host_uuid", "certificate", "ca", "hub_addresses": ["203.0.113.5"], "port": 8443, "not_after",
   "state": "pending"}`. `hub_addresses` is a list of bare IP literals (IPv6 without brackets, at most 4; it is the stored `public_ip` list in stored order); `port` is the
   fleet port, a separate integer. The same token and CSR within 10 minutes gets the
@@ -1561,14 +1631,16 @@ The contract between `edr-agent` and `edr-hub`. Limits and the reasons for them 
 - **Listener and auth:** fleet; certificate.
 - **Request keys.** This list is the authority for every heartbeat key; client §4.5 describes the content and uses
   these names: `sent_at`, `agent_version`, `agent_sha256`, `schema`, `proto`,
-  `boot_id`, `uptime_s`, `kernel`, `droplet_id`, `seq` and `epoch`, `units`, `tetragon` (policy name, mode,
-  would_be_kills), `nft` (`table_present`, set sizes, counters), `conntrack` (count, max, drop, early_drop), `dns_lock` (`state`: `locked`, `open`, `paused` or `flapping`; `since`; re-lock count, client §4.4), `disk`,
-  `load`, `mem`, `suricata_drops`, `spool` (depth, drops by lane and source), `local_conf_sha256`, `cert_not_after`,
-  `maintenance_until`, `paused_until` (the pause, client §4.7), `policy_rev_applied`, `last_apply_error`,
+  `boot_id`, `uptime_s`, `kernel`, `droplet_id` (required, string), `seq` and `epoch`, `units`, `tetragon` (a list of
+  `{"name", "mode", "would_be_kills"}`: policy name, `monitor` or `enforce`, and the integer count of kills it would have made), `nft` (`table_present`, set sizes, counters), `conntrack` (count, max, drop, early_drop), `dns_lock` (`state`: `locked`, `open`, `paused` or `flapping`; `since`; re-lock count, client §4.4), `disk`,
+  `load`, `mem`, `suricata_drops` (an object `{"packets", "drops", "window_s"}`: kernel packets and kernel drops in the last
+  window and the window length in seconds, from the 60 s stats event, client §4.1), `spool` (depth, drops by lane and source), `local_conf_sha256`, `cert_not_after`,
+  `maintenance_until`, `paused_until` (the pause, client §4.7), `policy_rev_applied` (the 16-hex `rev` string last applied), `last_apply_error`,
   `ban_counts`, `inventory` (client §4.5.1). The heartbeat sent at system shutdown carries `"shutdown": true`
   (client §4.5); a new `boot_id` within 10 minutes of it is a planned reboot. There is no `settings` key: the hub
   shows only `local_conf_sha256` and the policy modes in `tetragon`.
-- **Response:** `200 {"hub_time", "policy_rev", "min_client_schema"}`. The client records the skew between `hub_time`
+- **Response:** `200 {"hub_time", "policy_rev", "min_client_schema"}`: `policy_rev` is the 16-hex string defined in §4 (Policy
+  document), `min_client_schema` an integer, the previous event schema version. The client records the skew between `hub_time`
   and its own clock and warns above 60 s; `check.sh` WARNs when its `v` is below `min_client_schema`. The client may
   skip a policy poll when `policy_rev` equals its `policy_rev_applied`.
 - **Statuses:** 400; 403; 413; 426; 429; 503. `agent_sha256` is checked against the hub's accepted hashes (§3, §4); the

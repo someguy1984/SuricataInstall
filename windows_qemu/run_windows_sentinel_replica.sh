@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2054   # QEMU's own option syntax uses commas inside one argument
 # Boot the installed Windows on the SENTINEL MM firmware (rev97 sources, QEMU build) instead of stock OVMF, to try to
 # reproduce the board's "Windows resets a few seconds into the kernel" (CF9 0xE) and catch what does it: which SW SMI
 # (value written to 0xB2) was raised from where, how long each vCPU sat in SMM, who wrote the reset, and the Windows
@@ -18,7 +19,10 @@ FW=${FW:-$SENTINEL/firmware/qemu/sentinel-mm-winreplica}
 KEYS=${KEYS:-$SENTINEL/efivars/rev_97}             # PK.esl KEK.esl db.esl dbx.esl = the live board store
 PK_KEY=$SENTINEL/secureboot_keys/PK.key  PK_CRT=$SENTINEL/secureboot_keys/PK.crt
 KEK_KEY=$SENTINEL/keys/KEK.key           KEK_CRT=$SENTINEL/keys/KEK.crt
-DISK=${WIN_DISK:-/dev/disk/by-id/nvme-WD_BLACK_SN8100_2000GB_25264U801019}
+# The disk is named in local.conf (not in git), as for run_windows_qemu.sh
+# shellcheck source=/dev/null
+[ -r "$SCRIPT_DIR/local.conf" ] && . "$SCRIPT_DIR/local.conf"
+DISK=${WIN_DISK:-}
 OUT=${OUT:-$SENTINEL/smm_research/studies/$(date +%F)-windows-sentinel-replica}
 MEM=16G; CPUS=8; ACCEL=kvm; TIMEOUT_MIN=20; DISPLAY_KIND=gtk; HOLD=0; NET=0; TPM=1; USE_DISK=1
 USB_DEV=""; BOOT_USB=0; RE_ENROL=0; BUILD=0; DRY_RUN=0; KEEP_OVERLAY=0; TRACE_KB=16384; FORCE=0; EXTRA=()
@@ -88,6 +92,7 @@ while [ $# -gt 0 ]; do
   shift
 done
 
+[ "$USE_DISK" = 0 ] || [ -n "$DISK" ] || die "no disk named: put WIN_DISK=/dev/disk/by-id/... in $SCRIPT_DIR/local.conf, or pass --disk"
 [ "$(id -u)" = 0 ] || [ "$DRY_RUN" = 1 ] || die "run with sudo (raw disk, KVM tracing)"
 case "$ACCEL" in kvm) [ -e /dev/kvm ] || die "/dev/kvm missing" ;; tcg) ;; *) die "--accel kvm|tcg" ;; esac
 [ "$BOOT_USB" = 0 ] || [ -n "$USB_DEV" ] || die "--boot-usb needs --usb PATH"
@@ -224,9 +229,9 @@ fi
 WIN_BOOTINDEX=1; USB_BOOTINDEX=2
 [ "$BOOT_USB" = 1 ] && { WIN_BOOTINDEX=2; USB_BOOTINDEX=1; }
 [ "$USE_DISK" = 1 ] && args+=(-drive file="$RUN/windisk-overlay.qcow2",if=none,id=windisk,format=qcow2,cache=writeback,discard=unmap
-                             -device nvme,drive=windisk,serial=WINQEMU0001,bootindex=$WIN_BOOTINDEX)
+                             -device nvme,drive=windisk,serial=WINQEMU0001,bootindex="$WIN_BOOTINDEX")
 [ -n "$USB_REAL" ] && args+=(-drive file="$USB_REAL",if=none,id=usbstick,format=raw,readonly=on,cache=none
-                             -device usb-storage,bus=xhci.0,drive=usbstick,removable=on,bootindex=$USB_BOOTINDEX)
+                             -device usb-storage,bus=xhci.0,drive=usbstick,removable=on,bootindex="$USB_BOOTINDEX")
 [ "$NET" = 1 ] && args+=(-nic user,model=e1000e) || args+=(-nic none)
 args+=("${EXTRA[@]}")
 

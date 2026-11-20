@@ -21,13 +21,14 @@
 # would have written.
 #
 # What this proves: the installer's own logic, downloads, generated files and config test.
+# (Inside the dry run /run/suricata is an empty directory of its own, so the test engine
+# cannot touch the running one's command socket.)
 # What it cannot: that the services come back after the restarts it skipped, or what the
 # firewall looks like afterwards. For the firewall scripts, see tests/firewall-netns.sh.
 # Anything an installer does to the network directly still happens for real: controld's
 # verify.sh sends its probes, and reports on the lockdown as it is now, not as it would be.
 set -uo pipefail
 
-ROOT="$(dirname "$(dirname "$(readlink -f "$0")")")"
 [[ $EUID -eq 0 ]] || { echo "Run as root (sudo $0 ...)"; exit 1; }
 [[ $# -ge 1 ]] || { sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 target=$1; shift
@@ -75,6 +76,10 @@ for d in etc usr/local var/lib var/log; do
     mkdir -p "$OVL/$k/upper" "$OVL/$k/work"
     mount -t overlay overlay -o "lowerdir=/$d,upperdir=$OVL/$k/upper,workdir=$OVL/$k/work" "/$d"
 done
+# /run is shared with the running system. An installer that tests a Suricata config starts a
+# second engine (suricata-update does too): give it an empty run directory of its own, so it
+# cannot reach the live engine's command socket.
+if [[ -d /run/suricata ]]; then mount -t tmpfs -o mode=0755 tmpfs /run/suricata; fi
 cd "$(dirname "$1")"
 exec "$@"
 EOF

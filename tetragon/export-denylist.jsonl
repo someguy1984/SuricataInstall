@@ -37,9 +37,10 @@
 # and it is a single exec that a line here can match exactly.
 {"event_set": ["PROCESS_EXEC"], "arguments_regex": ["^-c \"/usr/bin/mysql --host=127\\.0\\.0\\.1 --user=root --password=\\S+ --execute \"SHOW DATABASES;\"\"$", "^readyz$", "^-c \"systemctl is-active --quiet mock-hub-placeholder\"$", "^-c \"systemctl is-active --quiet nginx php8\\.5-fpm && curl -fsS -o /dev/null http://127\\.0\\.0\\.1/\"$"], "parent_binary_regex": ["^/usr/bin/runc$", "^/usr/bin/containerd-shim-runc-v2$"]}
 #
-# GNOME's sandboxed image decoders (glycin), launched by bubblewrap.
+# GNOME's sandboxed image decoders (glycin). The bubblewrap exec that launches each one
+# stays in the log: a line for it could only be matched on its arguments, which anything
+# can imitate to hide a bwrap of its own.
 {"event_set": ["PROCESS_EXEC"], "binary_regex": ["^/usr/libexec/glycin-loaders/"]}
-{"event_set": ["PROCESS_EXEC"], "binary_regex": ["^/usr/bin/bwrap$"], "arguments_regex": ["/usr/libexec/glycin-loaders/"]}
 #
 # Firefox's own web traffic. Delete this line to see every site connection again.
 {"policy_names": ["tcp-connect"], "binary_regex": ["^/snap/firefox/"]}

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2054   # QEMU's own option syntax uses commas inside one argument
 # Boot the installed Windows (the whole physical NVMe disk) under QEMU/KVM, with OVMF + Secure Boot
 # (Microsoft keys) and a software TPM 2.0. Nothing here touches the board's firmware or its NVRAM:
 # UEFI variables live in a private OVMF vars file and the TPM is swtpm, both under ./state/.
@@ -10,8 +11,11 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 STATE_DIR=${STATE_DIR:-$SCRIPT_DIR/state}
-# By serial, not /dev/nvmeXn1: the two NVMe drives swap names between boots on this machine.
-DISK=${WIN_DISK:-/dev/disk/by-id/nvme-WD_BLACK_SN8100_2000GB_25264U801019}
+# Which disk is this machine's own business: local.conf (not in git) sets WIN_DISK. Name the
+# disk by /dev/disk/by-id/..., not /dev/nvmeXn1: NVMe drives can swap names between boots.
+# shellcheck source=/dev/null
+[ -r "$SCRIPT_DIR/local.conf" ] && . "$SCRIPT_DIR/local.conf"
+DISK=${WIN_DISK:-}
 MEM=16G
 CPUS=8
 SNAPSHOT=0
@@ -43,7 +47,7 @@ Usage: sudo $0 [options]
   --no-tpm           no TPM (Windows 11 boots without one, but BitLocker/Hello will complain)
   --no-net           no network card
   --usb PATH         also attach a disk as a read-only USB stick (e.g. the Windows installer:
-                     /dev/disk/by-id/usb-Fanxiang_F397_DD56419883BA4-0:0)
+                     /dev/disk/by-id/usb-...)
   --boot-usb         boot from the --usb stick first
   --display KIND     gtk (default) | sdl | vnc (127.0.0.1:5900) | none (use the monitor socket)
   --no-reboot        exit QEMU instead of rebooting the guest (catches a reset/bugcheck loop)
@@ -81,6 +85,7 @@ while [ $# -gt 0 ]; do
   shift
 done
 
+[ -n "$DISK" ] || die "no disk named: put WIN_DISK=/dev/disk/by-id/... in $SCRIPT_DIR/local.conf, or pass --disk"
 [ "$(id -u)" = 0 ] || [ "$DRY_RUN" = 1 ] || die "run with sudo (QEMU needs raw access to $DISK)"
 command -v qemu-system-x86_64 >/dev/null || die "qemu-system-x86_64 not found (apt install qemu-system-x86)"
 [ -e /dev/kvm ] || die "/dev/kvm missing (KVM not available)"
@@ -166,8 +171,8 @@ args=(
   -global kvm-pit.lost_tick_policy=discard
   # Windows was installed on NVMe, so it gets an NVMe controller: stornvme is boot-start, no
   # INACCESSIBLE_BOOT_DEVICE.
-  -drive file="$WIN_DEV",if=none,id=windisk,format=raw,cache=none,aio=native,discard=unmap$SNAP_OPT
-  -device nvme,drive=windisk,serial=WINQEMU0001,bootindex=$WIN_BOOTINDEX
+  -drive file="$WIN_DEV",if=none,id=windisk,format=raw,cache=none,aio=native,discard=unmap"$SNAP_OPT"
+  -device nvme,drive=windisk,serial=WINQEMU0001,bootindex="$WIN_BOOTINDEX"
   -device qemu-xhci,id=xhci
   -device usb-tablet,bus=xhci.0
   -vga std
@@ -180,7 +185,7 @@ else
 fi
 if [ -n "$USB_REAL" ]; then
   args+=(-drive file="$USB_REAL",if=none,id=usbstick,format=raw,readonly=on,cache=none
-         -device usb-storage,bus=xhci.0,drive=usbstick,removable=on,bootindex=$USB_BOOTINDEX)
+         -device usb-storage,bus=xhci.0,drive=usbstick,removable=on,bootindex="$USB_BOOTINDEX")
 fi
 [ "$NO_REBOOT" = 1 ] && args+=(-no-reboot)
 if [ "$INSPECT" = 1 ]; then

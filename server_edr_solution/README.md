@@ -42,7 +42,7 @@ Each phase starts only when the one before has met its exit criteria (client §1
 | **P1a** | Thin core: Tetragon server policies, the SCTP module block, inventory from apt, the agent in local mode with a local alert path, health check, uninstall | no |
 | **P1b** | Network side: Suricata, nftables bans and never-ban list, the large-connection watch, and last the DNS lock with its fail-open watchdog | no |
 | **P2** | Hub MVP: enrollment, mutual-TLS transport, heartbeats, alerts, correlation rules and incidents, dashboard, backups, `rehome`; learning and optional enforcement of `web-exec`; the triage bundle (`collect`) | yes |
-| **P3** | Fleet bans and IP feeds, incident acknowledgement and repeating CRITICAL alerts, local `isolate`, web-root integrity | yes |
+| **P3** | Fleet bans and IP feeds, incident acknowledgement and repeating CRITICAL alerts, local `isolate`, web-root integrity, and the DNS lock if it was moved out of P1b | yes |
 | **P4** | Laravel log counters, ATT&CK ids on rules, a read-only view of each client's local settings | yes |
 
 ## Prior art

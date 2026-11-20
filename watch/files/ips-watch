@@ -1,8 +1,8 @@
 #!/bin/bash
 # Scheduled look at the whole setup, run by ips-watch.timer. Notifies (ips-notify) when:
 #
-#   health    Suricata's check.sh or Tetragon's check.sh reports a failure, ctrld is down, or
-#             the DNS lockdown's firewall chain is missing. You are told when the set of
+#   health    Suricata's check.sh or Tetragon's check.sh reports a failure, ctrld is down or
+#             not answering, or the DNS lockdown's firewall chain is missing. You are told when the set of
 #             problems changes, reminded while it lasts, and told when it clears.
 #   activity  analyse.py rates the last few minutes of Suricata's logs MEDIUM or worse.
 #             MEDIUM goes to the journal; NOTIFY_MIN and above also to the desktop.
@@ -23,6 +23,7 @@ NOTIFY_MIN=HIGH
 WINDOW_MIN=15
 REMIND_HOURS=6
 REPEAT_MIN=60
+DNS_TEST_DOMAIN=controld.com
 # shellcheck source=/dev/null
 [[ -r $CONF ]] && . "$CONF"
 
@@ -47,7 +48,14 @@ if [[ -x $SURICATA_TOOLS/check.sh ]]; then
     collect_failures "Suricata" "$SURICATA_TOOLS/check.sh"
 fi
 if systemctl is-enabled --quiet dns-lockdown.service 2>/dev/null; then
-    systemctl is-active --quiet ctrld || problems+=("DNS: ctrld is not running (this machine has no DNS)")
+    if ! systemctl is-active --quiet ctrld; then
+        problems+=("DNS: ctrld is not running (this machine has no DNS)")
+    elif command -v dig >/dev/null && [[ -n $(ip route show default 2>/dev/null; ip -6 route show default 2>/dev/null) ]] \
+        && [[ -z $(dig +time=3 +tries=2 +short @127.0.0.1 "$DNS_TEST_DOMAIN" 2>/dev/null | grep -v '^;') ]]; then
+        # The lockdown stays in place whatever ctrld does, so a ctrld that runs but cannot
+        # resolve means no DNS at all. Not asked without a default route: no network, no answer.
+        problems+=("DNS: ctrld is running but a lookup of $DNS_TEST_DOMAIN got no answer (behind a login page: sudo dns-lockdown.sh pause)")
+    fi
     # The chain stays in place during a captive-portal pause too (only port 53 is let past it)
     if ! iptables -S OUTPUT 2>/dev/null | grep -q -- '-j DNSLOCK$'; then
         problems+=("DNS: the DNSLOCK firewall chain is missing (DNS is not forced through ctrld)")
@@ -62,6 +70,18 @@ if systemctl is-enabled --quiet dns-lockdown.service 2>/dev/null; then
 fi
 if [[ -x $TETRAGON_TOOLS/check.sh ]]; then
     collect_failures "Tetragon" "$TETRAGON_TOOLS/check.sh"
+fi
+
+# The analyser runs here so that one that cannot run is reported with the health problems
+# instead of leaving the activity half silent
+report=''
+if [[ -x $SURICATA_TOOLS/analyse.py ]]; then
+    report=$("$SURICATA_TOOLS/analyse.py" --json --minutes "$WINDOW_MIN" 2>/dev/null)
+    rc=$?
+    if [[ $rc -gt 2 || -z $report ]]; then
+        problems+=("Activity: analyse.py could not run (exit status $rc): Suricata's findings are not being reported")
+        report=''
+    fi
 fi
 
 current=$(printf '%s\n' "${problems[@]+"${problems[@]}"}" | sort)
@@ -83,8 +103,7 @@ fi
 [[ -n $current ]] && printf 'Health problems:\n%s\n' "$current" || echo "Health: no problems"
 
 # --- Activity -------------------------------------------------------------------------
-if [[ -x $SURICATA_TOOLS/analyse.py ]]; then
-    report=$("$SURICATA_TOOLS/analyse.py" --json --minutes "$WINDOW_MIN" 2>/dev/null)
+if [[ -n $report ]]; then
     # Reports the findings that are new: one already reported within REPEAT_MIN is left
     # out, so something long-running isn't repeated on every run
     printf '%s' "$report" | NOTIFY=$NOTIFY NOTIFY_MIN=$NOTIFY_MIN REPEAT_MIN=$REPEAT_MIN SEEN="$STATE/findings" python3 -I -c '
@@ -111,14 +130,15 @@ except (OSError, ValueError):
 def flat(text):
     return " ".join(str(text).split())
 
-def same(title):
-    # The count at the end of a title changes from run to run; it is still the same finding
-    return re.sub(r" \(x\d+\)$", "", flat(title))
+def same(f):
+    # The counts in a title change from run to run; it is still the same finding. analyse.py
+    # gives each one a key without them (an older analyse.py has none: fall back to the title)
+    return flat(f.get("key") or re.sub(r" \(x\d+\)$", "", str(f.get("title"))))
 
 new = [f for f in report.get("findings", [])
-       if RANK.get(f.get("severity"), 4) <= RANK["MEDIUM"] and same(f.get("title")) not in seen]
+       if RANK.get(f.get("severity"), 4) <= RANK["MEDIUM"] and same(f) not in seen]
 for f in new:
-    seen[same(f["title"])] = now
+    seen[same(f)] = now
 with open(seen_path + ".tmp", "w") as out:
     for title, ts in seen.items():
         out.write(str(ts) + " " + title + "\n")

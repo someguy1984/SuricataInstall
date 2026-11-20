@@ -1,7 +1,7 @@
 # Checks that need nothing installed and change nothing on this machine.
 #
 #   make lint            syntax of the scripts, Python, Tetragon policies, export denylist, generated DNS rules, JSON and the kits' systemd units
-#   sudo make test       the firewall scripts, in a throwaway network namespace
+#   sudo make test       the firewall scripts in a throwaway network namespace; analyse.py and the alerting on synthetic input
 #   sudo tests/dry-run.sh <installer>   rehearse an installer without changing this machine
 #   make vm-test         Suricata kit install -> check -> uninstall cycle in a fresh Ubuntu VM (needs multipass)
 
@@ -13,7 +13,7 @@ SH_FILES := install.sh uninstall.sh check.sh status.sh \
 	tetragon/config.sh tetragon/local_install.sh tetragon/local_uninstall.sh \
 	tetragon/run.sh tetragon/stop.sh tetragon/check.sh \
 	watch/install.sh watch/uninstall.sh watch/files/ips-watch watch/files/ips-notify \
-	tests/firewall-netns.sh tests/analyse-smoke.sh tests/dry-run.sh tests/vm-smoke.sh tests/lint.sh \
+	tests/firewall-netns.sh tests/analyse-smoke.sh tests/watch-smoke.sh tests/dry-run.sh tests/vm-smoke.sh tests/lint.sh \
 	server_edr_solution/mock/mock.sh server_edr_solution/mock/common/mock-tls.sh \
 	windows_qemu/inspect.sh windows_qemu/run_windows_qemu.sh windows_qemu/run_windows_sentinel_replica.sh
 PY_FILES := analyse.py tetragon/viewer/server.py watch/files/tetragon-notify.py \
@@ -28,6 +28,7 @@ lint:
 test:
 	tests/firewall-netns.sh
 	tests/analyse-smoke.sh
+	tests/watch-smoke.sh
 
 vm-test:
 	tests/vm-smoke.sh

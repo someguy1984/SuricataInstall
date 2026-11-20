@@ -7,19 +7,37 @@
 #   ./mock.sh shell hub|web a root shell inside a box
 #   ./mock.sh logs hub|web  follow that box's journal
 #   ./mock.sh down [--volumes]   stop and remove (--volumes also forgets the mock certificates)
+#   MOCK_CAPS=1 ./mock.sh ...    the boxes without `privileged` (compose.caps.yaml; not boot-tested yet)
 #
-# Use rootless Docker only (see README.md; the boxes run privileged). If DOCKER_HOST is unset and the system socket is missing,
-# the current user's rootless socket ($XDG_RUNTIME_DIR/docker.sock) is used.
+# Use rootless Docker only (see README.md; the boxes run privileged): a rootful daemon is refused
+# unless MOCK_ALLOW_ROOTFUL=1 is set. If DOCKER_HOST is unset and the system socket is missing, the
+# current user's rootless socket ($XDG_RUNTIME_DIR/docker.sock) is used.
 set -euo pipefail
 
-cd "$(dirname "$(readlink -f "$0")")"
+SELF=$(readlink -f "$0")
+cd "$(dirname "$SELF")"
 
 if [[ -z ${DOCKER_HOST:-} && ! -S /var/run/docker.sock ]]; then
     rt=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
     [[ -S $rt/docker.sock ]] && export DOCKER_HOST=unix://$rt/docker.sock
 fi
 
-dc() { docker compose "$@"; }
+COMPOSE=(-f compose.yaml)
+if [[ ${MOCK_CAPS:-0} == 1 ]]; then COMPOSE+=(-f compose.caps.yaml); fi
+dc() { docker compose "${COMPOSE[@]}" "$@"; }
+
+# The boxes run privileged. On a rootful daemon that is root on this machine: the installers
+# tried in them would change the host's modules and sysctls, not the box's.
+refuse_rootful() {
+    local opts
+    [[ ${MOCK_ALLOW_ROOTFUL:-0} == 1 ]] && return 0
+    # No answer from the daemon: docker compose reports that better than this could
+    opts=$(docker info -f '{{.SecurityOptions}}' 2>/dev/null) || return 0
+    [[ $opts == *rootless* ]] && return 0
+    echo "mock: this Docker daemon is not rootless, and the boxes run privileged (see README.md)." >&2
+    echo "      Use rootless Docker. In a throwaway VM only: MOCK_ALLOW_ROOTFUL=1 $0 ${1:-}" >&2
+    exit 1
+}
 
 wait_healthy() {
     local svc state i
@@ -88,19 +106,21 @@ run_tests() {
 
 case ${1:-help} in
     up)
+        refuse_rootful up
         dc up -d --build
         wait_healthy
         echo "mock: up. Add '127.0.0.1 web.dev.local' to /etc/hosts to browse http(s)://web.dev.local"
         ;;
-    test) run_tests ;;
+    test) refuse_rootful test; run_tests ;;
     status)
+        refuse_rootful status
         dc ps
         for svc in hub web; do
             echo "-- $svc"; dc exec -T "$svc" ip -br -4 addr show scope global 2>/dev/null || true
         done
         ;;
-    shell) dc exec "${2:?shell hub|web}" bash ;;
-    logs) dc exec "${2:?logs hub|web}" journalctl -f ;;
+    shell) refuse_rootful shell; dc exec "${2:?shell hub|web}" bash ;;
+    logs) refuse_rootful logs; dc exec "${2:?logs hub|web}" journalctl -f ;;
     down) shift; dc down "$@" ;;
-    *) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+    *) sed -n '2,14p' "$SELF" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

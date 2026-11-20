@@ -30,7 +30,7 @@ import statistics
 import sys
 import time
 from collections import Counter, defaultdict
-from datetime import datetime
+from datetime import datetime, timezone
 from functools import lru_cache
 
 LOG_DIR = '/var/log/suricata'
@@ -372,8 +372,10 @@ class Analysis:
 
     # -- plumbing ---------------------------------------------------------------------------
 
-    def add(self, sev, cat, title, details=(), entities=(), ts=None):
-        self.findings.append({'severity': sev, 'category': cat, 'title': title,
+    def add(self, sev, cat, title, details=(), entities=(), ts=None, key=None):
+        # key: what the finding is about, without the counts a title carries, so a caller can
+        # tell "the same thing again" from something new (watch/files/ips-watch does)
+        self.findings.append({'severity': sev, 'category': cat, 'title': title, 'key': key or title,
                               'details': list(details), 'entities': sorted(set(entities)),
                               'time': ts})
 
@@ -485,7 +487,8 @@ class Analysis:
                 details.append(f'{self.label(s)} -> {self.label(d)}:{p}  x{n}')
             ents = {ip for s, d, _ in g['pairs'] for ip in (s, d) if not is_special(ip)}
             self.add(g['severity'], 'alert', f"[{action}] {g['sid']} {g['signature']} (x{g['count']})",
-                     details, ents, g['first'])
+                     details, ents, g['first'],
+                     key=f"alert:{g['sid']}:{'blocked' if g['blocked'] == g['count'] else 'allowed'}")
 
     def drops(self):
         drops = self.ev['drop']
@@ -501,7 +504,8 @@ class Analysis:
                      + ', '.join(f'{r} x{n}' for r, n in sorted(engine.items(), key=lambda x: -x[1])),
                      ['Usually broken/late TCP packets (e.g. RSTs after a flow closed); only a concern '
                       'if one destination dominates or users report breakage.',
-                      'Top peers: ' + ', '.join(f'{self.label(p)} x{n}' for p, n in peers.most_common(5))])
+                      'Top peers: ' + ', '.join(f'{self.label(p)} x{n}' for p, n in peers.most_common(5))],
+                     key='engine-drops')
 
     def anomalies(self):
         an = self.ev['anomaly']
@@ -514,7 +518,7 @@ class Analysis:
         self.add(sev, 'anomaly', f'{len(an)} protocol anomalies',
                  [', '.join(f'{k} x{n}' for k, n in kinds.most_common(5)),
                   'Top sources: ' + ', '.join(f'{self.label(s)} x{n}' for s, n in per_src.most_common(5))],
-                 [s for s, n in per_src.most_common(3) if n >= 20])
+                 [s for s, n in per_src.most_common(3) if n >= 20], key='anomalies')
 
     # -- flows -------------------------------------------------------------------------------
 
@@ -565,14 +569,14 @@ class Analysis:
                          f"{'Inbound' if ext else 'Internal'} port scan: {self.label(src)} -> {self.label(dst)} "
                          f'({len(ports)} unanswered ports)',
                          ['Ports: ' + ', '.join(map(str, sorted(ports)[:20])) + (' ...' if len(ports) > 20 else '')],
-                         [src, dst])
+                         [src, dst], key=f'portscan:{src}>{dst}')
         for (src, port), dsts in unanswered_hosts.items():
             if len(dsts) >= 15:
                 ext = is_external(src)
                 self.add('LOW' if ext else 'MEDIUM', 'scan',
                          f'Sweep: {self.label(src)} tried port {port} on {len(dsts)} hosts without reply',
                          ['Hosts: ' + ', '.join(sorted(dsts)[:10]) + (' ...' if len(dsts) > 10 else '')],
-                         [src])
+                         [src], key=f'sweep:{src}:{port}')
 
         for (dst, port), srcs in sorted(answered_inbound.items(), key=lambda x: -len(x[1])):
             svc = RISKY_INBOUND_PORTS.get(port)
@@ -581,16 +585,16 @@ class Analysis:
                      f"External hosts reached {self.label(dst)}:{port}{f' ({svc})' if svc else ''} "
                      f'from {len(srcs)} source(s)',
                      ['Sources: ' + ', '.join(self.label(s) for s in sorted(srcs)[:8])],
-                     [dst, *srcs])
+                     [dst, *srcs], key=f'exposure:{dst}:{port}')
 
         for (src, dst), n in ssh_in.items():
             if n >= 10:
                 self.add('MEDIUM', 'bruteforce', f'Possible SSH brute force: {self.label(src)} -> {dst} ({n} connections)',
-                         [], [src, dst])
+                         [], [src, dst], key=f'ssh-bruteforce:{src}>{dst}')
         for src, dsts in ssh_out.items():
             if len(dsts) >= 10:
                 self.add('MEDIUM', 'lateral', f'{src} opened SSH to {len(dsts)} different external hosts',
-                         [', '.join(sorted(dsts)[:10])], [src])
+                         [', '.join(sorted(dsts)[:10])], [src], key=f'ssh-fanout:{src}')
 
         for (dst, port), srcs in risky_out.items():
             self.add('MEDIUM', 'outbound', f'Outbound {RISKY_OUTBOUND_PORTS[port]} (port {port}) to {self.label(dst)} answered',
@@ -600,7 +604,7 @@ class Analysis:
             if n >= 100 * 1024 * 1024:
                 self.add('LOW', 'exfil', f'{src} uploaded {fmt_bytes(n)} to {self.label(dst)}',
                          ['Large outbound transfer in the window; expected for backups/sync, check otherwise.'],
-                         [src, dst])
+                         [src, dst], key=f'upload:{src}>{dst}')
 
         # Beaconing: regular connections from one host to one destination
         for (src, dst, port, proto), starts in beacons.items():
@@ -617,7 +621,7 @@ class Analysis:
                          f'Regular connections {src} -> {self.label(dst)}:{port}/{proto} every ~{mean:.0f}s',
                          [f'{len(starts)} flows, jitter {cv * 100:.0f}% - typical of keep-alives/polling, '
                           'or of malware check-ins if the destination is unfamiliar'],
-                         [src, dst])
+                         [src, dst], key=f'beacon:{src}>{dst}:{port}/{proto}')
 
     # -- protocols ---------------------------------------------------------------------------
 
@@ -659,21 +663,23 @@ class Analysis:
             if n >= 15 and n / max(responses[client], 1) >= 0.3 and len(nx_names[client]) >= 10:
                 self.add('MEDIUM', 'dns', f'{client}: {n} NXDOMAIN answers ({n * 100 // responses[client]}% of lookups)',
                          ['Many failed lookups can mean DGA malware searching for its C2. Examples: '
-                          + ', '.join(sorted(nx_names[client])[:6])], [client])
+                          + ', '.join(sorted(nx_names[client])[:6])], [client], key=f'nxdomain:{client}')
         for client, names in dga.items():
             self.add('MEDIUM' if len(names) >= 3 else 'LOW', 'dns',
                      f'{client} looked up {len(names)} random-looking domain(s)',
-                     ['High-entropy names are typical of DGA malware: ' + ', '.join(sorted(names)[:6])], [client])
+                     ['High-entropy names are typical of DGA malware: ' + ', '.join(sorted(names)[:6])], [client],
+                     key=f'dga:{client}')
         for (client, base), names in by_base.items():
             if len(names) >= 30 and statistics.mean(len(n) for n in names) >= 40:
                 self.add('MEDIUM', 'dns', f'Possible DNS tunnelling: {client} queried {len(names)} long subdomains of {base}',
-                         ['e.g. ' + ', '.join(sorted(names)[:3])], [client])
+                         ['e.g. ' + ', '.join(sorted(names)[:3])], [client], key=f'dns-tunnel:{client}:{base}')
         for client, n in txt.items():
             if n >= 50:
-                self.add('LOW', 'dns', f'{client} made {n} TXT lookups', ['TXT is a common DNS tunnelling channel'], [client])
+                self.add('LOW', 'dns', f'{client} made {n} TXT lookups', ['TXT is a common DNS tunnelling channel'], [client],
+                         key=f'dns-txt:{client}')
         for client, names in odd_tld.items():
             self.add('LOW', 'dns', f'{client} looked up {len(names)} domain(s) in abuse-heavy TLDs',
-                     [', '.join(sorted(names)[:8])], [client])
+                     [', '.join(sorted(names)[:8])], [client], key=f'odd-tld:{client}')
 
     def tls(self):
         old, expired, selfsigned, nosni = defaultdict(set), [], [], Counter()
@@ -687,7 +693,8 @@ class Analysis:
                 old[t['version']].add(who)
             if t.get('notafter'):
                 try:
-                    if parse_iso(t['notafter']) < e['_ts']:
+                    # Suricata writes certificate dates in UTC, without saying so
+                    if datetime.fromisoformat(t['notafter']).replace(tzinfo=timezone.utc).timestamp() < e['_ts']:
                         expired.append((who, t.get('subject', '')))
                 except ValueError:
                     pass
@@ -700,16 +707,18 @@ class Analysis:
 
         for ver, whos in old.items():
             self.add('LOW', 'tls', f'{len(whos)} connection(s) with obsolete {ver}', sorted(whos)[:5],
-                     [w.split(' ')[0] for w in whos])
+                     [w.split(' ')[0] for w in whos], key=f'tls-obsolete:{ver}')
         if expired:
             self.add('MEDIUM', 'tls', f'{len(expired)} TLS session(s) to servers with expired certificates',
-                     summarise(f'{w} [{s}]' for w, s in expired), [w.split(' ')[0] for w, _ in expired])
+                     summarise(f'{w} [{s}]' for w, s in expired), [w.split(' ')[0] for w, _ in expired],
+                     key='tls-expired')
         if selfsigned:
             self.add('LOW', 'tls', f'{len(selfsigned)} TLS session(s) to external self-signed certificates',
-                     summarise(f'{w} [{s}]' for w, s in selfsigned), [w.split(' ')[0] for w, _ in selfsigned])
+                     summarise(f'{w} [{s}]' for w, s in selfsigned), [w.split(' ')[0] for w, _ in selfsigned],
+                     key='tls-selfsigned')
         if nosni:
             self.add('INFO', 'tls', f'{sum(nosni.values())} TLS session(s) without SNI to external IPs',
-                     [f'{s} -> {self.label(d)} x{n}' for (s, d), n in nosni.most_common(5)])
+                     [f'{s} -> {self.label(d)} x{n}' for (s, d), n in nosni.most_common(5)], key='tls-nosni')
 
     def http(self):
         tool_out, tool_in, ip_host, attacks, errors4xx, odd_methods = (defaultdict(set) for _ in range(6))
@@ -738,12 +747,13 @@ class Analysis:
         for src, items in attacks.items():
             self.add('HIGH' if any(' -> 2' in i for i in items) else 'MEDIUM', 'web-attack',
                      f'{self.label(src)} sent {len(items)} attack-pattern request(s) to your hosts',
-                     sorted(items)[:6], [src])
+                     sorted(items)[:6], [src], key=f'web-attack:{src}')
         for src, uas in tool_in.items():
             self.add('MEDIUM', 'web-attack', f'Scanner/tool user-agent from {self.label(src)}', sorted(uas)[:3], [src])
         for src, n in err_count.items():
             if n >= 20:
-                self.add('MEDIUM', 'web-attack', f'{self.label(src)} caused {n} HTTP 4xx responses (content discovery?)', [], [src])
+                self.add('MEDIUM', 'web-attack', f'{self.label(src)} caused {n} HTTP 4xx responses (content discovery?)', [], [src],
+                         key=f'web-4xx:{src}')
         for src, items in odd_methods.items():
             self.add('LOW', 'web-attack', f'Unusual HTTP methods from {self.label(src)}', sorted(items)[:5], [src])
         for src, items in tool_out.items():
@@ -848,7 +858,7 @@ class Analysis:
                      f"{self.label(ip)} is involved in {len(x['categories'])} kinds of activity: "
                      + ', '.join(sorted(x['categories'])),
                      [f"- [{self.findings[i]['severity']}] {self.findings[i]['title']}" for i in x['findings'][:6]]
-                     + self.timeline(ip), [ip])
+                     + self.timeline(ip), [ip], key=f"correlated:{ip}:{','.join(sorted(x['categories']))}")
         self.entities = sorted(({'ip': ip, 'label': self.label(ip), 'score': x['score'], 'worst': x['worst'],
                                  'categories': sorted(x['categories']), 'home': is_home(ip)}
                                 for ip, x in ents.items() if x['score'] > 0),
@@ -935,7 +945,7 @@ class Analysis:
         if restarted:
             self.add('MEDIUM', 'engine', f"Suricata restarted {restarts} time(s) during the window", [
                 f"Uptime now {b.get('uptime', 0)}s; counters below are since the last restart. "
-                'Check suricata.log / journalctl -u suricata for the cause (crash, rule update, reboot).'])
+                'Check suricata.log / journalctl -u suricata for the cause (crash, rule update, reboot).'], key='engine-restart')
         if h['samples'] and h['samples'] < 2 and not restarted:
             self.add('INFO', 'engine', 'Only one stats sample in the window: counter changes cannot be computed (shown as 0)')
 
@@ -952,9 +962,15 @@ class Analysis:
         if end_is_now and info['newest'] is not None and now - info['newest'] > 60:
             self.add('HIGH', 'engine', f"eve.json has not been written for {int(now - info['newest'])}s",
                      ['Stats are logged every few seconds, so Suricata is probably stopped, hung or not logging. '
-                      'With --queue-bypass, traffic is then passing uninspected.'])
+                      'With --queue-bypass, traffic is then passing uninspected.'], key='eve-stale')
+        elif end_is_now and info['newest'] is None:
+            self.add('HIGH', 'engine', 'eve.json has no records at all',
+                     ['The log exists but is empty, and there is no rotated one with records: Suricata is '
+                      'probably stopped or not logging. With --queue-bypass, traffic is then passing '
+                      'uninspected.'], key='eve-stale')
         if not info['complete'] and info['oldest'] is not None and info['oldest'] > self.start:
-            self.add('INFO', 'engine', f"Logs only go back to {fmt_time(info['oldest'])} (rotated or recently started)")
+            self.add('INFO', 'engine', f"Logs only go back to {fmt_time(info['oldest'])} (rotated or recently started)",
+                     key='logs-start')
 
         if suri_log is not None:
             errors = [(ts, m) for ts, (lvl, m) in suri_log if lvl.lower() in ('error', 'critical', 'alert', 'emergency')]
@@ -962,17 +978,17 @@ class Analysis:
             notices = [(ts, m) for ts, (lvl, m) in suri_log if lvl.lower() == 'notice']
             if errors:
                 self.add('MEDIUM', 'engine', f'{len(errors)} error(s) in suricata.log',
-                         [f'{fmt_time(ts)} {m[:140]}' for ts, m in errors[-5:]])
+                         [f'{fmt_time(ts)} {m[:140]}' for ts, m in errors[-5:]], key='suricata-log-errors')
             if warns:
                 self.add('LOW', 'engine', f'{len(warns)} warning(s) in suricata.log',
-                         [f'{fmt_time(ts)} {m[:140]}' for ts, m in warns[-5:]])
+                         [f'{fmt_time(ts)} {m[:140]}' for ts, m in warns[-5:]], key='suricata-log-warnings')
             h['suricata_log'] = {'errors': len(errors), 'warnings': len(warns),
                                  'notices': [f'{fmt_time(ts)} {m[:120]}' for ts, m in notices[-3:]]}
         if fast is not None:
             h['fast_log'] = {'alerts': len(fast), 'drops': sum(1 for _, d in fast if d)}
             if abs(len(fast) - len(self.ev['alert'])) > max(5, len(fast) // 10):
                 self.add('INFO', 'engine', f"fast.log has {len(fast)} alerts but eve.json {len(self.ev['alert'])}",
-                         ['One of the outputs may be disabled or lagging.'])
+                         ['One of the outputs may be disabled or lagging.'], key='fast-eve-mismatch')
 
 
 # ---------------------------------------------------------------------------------------------

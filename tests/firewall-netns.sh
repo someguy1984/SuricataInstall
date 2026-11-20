@@ -78,9 +78,14 @@ for cmd in iptables ip6tables; do
     ns $cmd -t mangle -I OUTPUT 1 -o lo -j ACCEPT
     ns $cmd -t mangle -I OUTPUT 2 -j NFQUEUE --queue-num 0 --queue-bypass
     ns $cmd -t mangle -I FORWARD 1 -j NFQUEUE --queue-num 0 --queue-bypass
+    # Older still: queue rules in the filter table, where they bypassed UFW
+    ns $cmd -I OUTPUT 1 -j NFQUEUE --queue-num 0 --queue-bypass
+    ns $cmd -I FORWARD 1 -j NFQUEUE --queue-num 0 --queue-bypass
 done
 ns bash "$NFQ" start
 for cmd in iptables ip6tables; do
+    hasnt $cmd "" "-A OUTPUT -j NFQUEUE --queue-num 0 --queue-bypass" "$cmd: filter-table queue rule in OUTPUT is removed"
+    hasnt $cmd "" "-A FORWARD -j NFQUEUE --queue-num 0 --queue-bypass" "$cmd: filter-table queue rule in FORWARD is removed"
     hasnt $cmd mangle "-A INPUT -j NFQUEUE --queue-num 0 --queue-bypass" "$cmd: old-layout queue rule is replaced"
     hasnt $cmd mangle "-A INPUT -i lo -j ACCEPT" "$cmd: old-layout loopback rule is removed"
     has $cmd mangle "-A INPUT -j SURICATA-NFQ" "$cmd: new chain in place after the upgrade"
@@ -106,6 +111,13 @@ for chain in DNSLOCK DNSLOCK-FWD; do
 done
 ns bash "$LOCK" start
 [[ $(count iptables "" "-A OUTPUT -j DNSLOCK") -eq 1 ]] && ok "start twice leaves one jump" || bad "start twice duplicated the jump"
+# Upgrade from the layout in which FORWARD jumped straight into DNSLOCK
+for cmd in iptables ip6tables; do ns $cmd -I FORWARD 1 -j DNSLOCK; done
+ns bash "$LOCK" start
+for cmd in iptables ip6tables; do
+    hasnt $cmd "" "-A FORWARD -j DNSLOCK" "$cmd: the older FORWARD jump into DNSLOCK is removed"
+    has $cmd "" "-A FORWARD -j DNSLOCK-FWD" "$cmd: FORWARD jumps to DNSLOCK-FWD after the upgrade"
+done
 
 # With the resolver's cgroup present, as on a real machine. The cgroup match cannot be
 # reached from FORWARD (the kernel refuses the jump), which is why forwarded traffic has a
@@ -140,6 +152,9 @@ for cmd in iptables ip6tables; do
         && ok "$cmd pause: port 53 is accepted ahead of every other filter rule" || bad "$cmd: pause chain is not first in filter OUTPUT"
     has $cmd "" "-A DNSLOCK-PAUSE -p tcp -m tcp --dport 53 -j ACCEPT" "$cmd pause: the filter chain accepts TCP 53 only by port"
 done
+[[ $(rules ip6tables OUTPUT mangle | sed -n 2p) == "-A OUTPUT -j DNSLOCK-PAUSE" ]] \
+    && ok "ip6tables pause: port 53 is accepted ahead of Suricata's queue" || bad "ip6tables: pause chain is not first in mangle OUTPUT"
+has ip6tables mangle "-A DNSLOCK-PAUSE -p udp -m udp --dport 53 -j ACCEPT" "ip6tables pause accepts UDP 53 only by port"
 # In practice: a lookup sent while paused is counted by the pause chain, not by the other firewall's DROP
 ns bash -c 'echo -n x > /dev/udp/192.0.2.53/53' 2>/dev/null
 passed=$(ns iptables -L DNSLOCK-PAUSE -v -n -x | awk '$3 == "ACCEPT" && /udp dpt:53/ { print $1 }')
@@ -162,6 +177,7 @@ done
 check "resume succeeds" ns bash "$LOCK" resume
 [[ $(rules iptables OUTPUT | sed -n 2p) == "-A OUTPUT -j DNSLOCK" ]] && ok "resume re-locks" || bad "resume: DNSLOCK is not first in OUTPUT"
 hasnt iptables mangle "-N DNSLOCK-PAUSE" "resume removes the pause chain"
+hasnt ip6tables mangle "-N DNSLOCK-PAUSE" "ip6tables: resume removes the mangle pause chain"
 for cmd in iptables ip6tables; do
     hasnt $cmd "" "-N DNSLOCK-PAUSE" "$cmd: resume removes the filter pause chain"
     has $cmd "" "-A OUTPUT -p udp -m udp --dport 53 -j DROP" "$cmd: resume leaves the other firewall's rule alone"

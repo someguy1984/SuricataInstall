@@ -9,7 +9,8 @@
 #   /etc/dns-lockdown, /etc/default/dns-lockdown  resolver list and mode
 #   /etc/resolv.conf                              where the system resolver points
 #   /etc/ufw                                      the firewall Suricata sits in front of
-#   /etc/firefox/policies, /etc/chromium-browser/policies   the browser DoH locks
+#   /etc/firefox/policies, /etc/chromium-browser/policies, /etc/chromium/policies,
+#   /etc/opt/chrome/policies, /etc/brave/policies, /etc/opt/edge/policies   the browser DoH locks
 #   /usr/local/sbin, /usr/local/lib/suricata-ips, /usr/local/lib/ips-watch
 #                                                 helper scripts that run as root
 #   /etc/ips-watch, /etc/ips-watch.conf           what the alerting notifies about
@@ -65,6 +66,10 @@ spec:
         - "/etc/ufw"
         - "/etc/firefox/policies"
         - "/etc/chromium-browser/policies"
+        - "/etc/chromium/policies"
+        - "/etc/opt/chrome/policies"
+        - "/etc/brave/policies"
+        - "/etc/opt/edge/policies"
         - "/usr/local/sbin/"
         - "/usr/local/lib/suricata-ips"
         - "/usr/local/lib/ips-watch"
@@ -102,6 +107,10 @@ spec:
         - "/etc/ufw"
         - "/etc/firefox/policies"
         - "/etc/chromium-browser/policies"
+        - "/etc/chromium/policies"
+        - "/etc/opt/chrome/policies"
+        - "/etc/brave/policies"
+        - "/etc/opt/edge/policies"
         - "/usr/local/sbin/"
         - "/usr/local/lib/suricata-ips"
         - "/usr/local/lib/ips-watch"
@@ -145,6 +154,10 @@ spec:
         - "/etc/ufw"
         - "/etc/firefox/policies"
         - "/etc/chromium-browser/policies"
+        - "/etc/chromium/policies"
+        - "/etc/opt/chrome/policies"
+        - "/etc/brave/policies"
+        - "/etc/opt/edge/policies"
         - "/usr/local/sbin"
         - "/usr/local/lib/suricata-ips"
         - "/usr/local/lib/ips-watch"
@@ -211,6 +224,10 @@ spec:
         - "/etc/ufw"
         - "/etc/firefox/policies"
         - "/etc/chromium-browser/policies"
+        - "/etc/chromium/policies"
+        - "/etc/opt/chrome/policies"
+        - "/etc/brave/policies"
+        - "/etc/opt/edge/policies"
         - "/usr/local/sbin"
         - "/usr/local/lib/suricata-ips"
         - "/usr/local/lib/ips-watch"
@@ -230,6 +247,10 @@ spec:
         - "/etc/ufw"
         - "/etc/firefox/policies"
         - "/etc/chromium-browser/policies"
+        - "/etc/chromium/policies"
+        - "/etc/opt/chrome/policies"
+        - "/etc/brave/policies"
+        - "/etc/opt/edge/policies"
         - "/usr/local/sbin"
         - "/usr/local/lib/suricata-ips"
         - "/usr/local/lib/ips-watch"

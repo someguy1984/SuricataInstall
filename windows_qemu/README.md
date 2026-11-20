@@ -1,12 +1,15 @@
 # Windows under QEMU/KVM
 
-Boots the installed Windows straight off its physical NVMe disk (WD_BLACK SN8100, picked by serial
-under `/dev/disk/by-id/`, never by `nvmeXn1`, which swaps between boots) inside a VM. Useful when the
+Boots the installed Windows straight off its physical NVMe disk (named by its `/dev/disk/by-id/`
+entry, never by `nvmeXn1`, which swaps between boots) inside a VM. Useful when the
 board firmware can't boot Windows: it tells you whether Windows itself is healthy, and lets you get into it.
+
+Which disk is set per machine: put `WIN_DISK=/dev/disk/by-id/...` in `local.conf` in this folder (it is
+kept out of git), or pass `--disk`. Without either the scripts stop.
 
     sudo ./run_windows_qemu.sh               # normal boot, writes go to the real disk
     sudo ./run_windows_qemu.sh --snapshot    # test boot, every disk write thrown away at exit
-    sudo ./run_windows_qemu.sh --usb /dev/disk/by-id/usb-Fanxiang_F397_DD56419883BA4-0:0 --boot-usb
+    sudo ./run_windows_qemu.sh --usb /dev/disk/by-id/usb-... --boot-usb
                                              # boot the installer stick (read-only) with the disk attached
     sudo ./run_windows_qemu.sh --help
 

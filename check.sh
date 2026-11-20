@@ -23,7 +23,7 @@ done
 
 [[ $EUID -eq 0 ]] || { echo "Run as root (sudo $0)"; exit 1; }
 
-if [[ -t 1 ]]; then G=$'\e[32m' Y=$'\e[33m' R=$'\e[31m' B=$'\e[1m' N=$'\e[0m'; else G= Y= R= B= N=; fi
+if [[ -t 1 ]]; then G=$'\e[32m' Y=$'\e[33m' R=$'\e[31m' B=$'\e[1m' N=$'\e[0m'; else G='' Y='' R='' B='' N=''; fi
 PASS=0 WARN=0 FAIL=0
 pass() { echo "  ${G}PASS${N} $*"; PASS=$((PASS + 1)); }
 warn() { echo "  ${Y}WARN${N} $*"; WARN=$((WARN + 1)); }
@@ -94,7 +94,7 @@ if command -v ufw >/dev/null; then
 fi
 
 section "Kernel queue"
-if [[ -r /proc/net/netfilter/nfnetlink_queue ]] && read -r q peer waiting _ _ qdrop udrop seq _ < <(awk '$1 == 0' /proc/net/netfilter/nfnetlink_queue); then
+if [[ -r /proc/net/netfilter/nfnetlink_queue ]] && read -r _ peer waiting _ _ qdrop udrop seq _ < <(awk '$1 == 0' /proc/net/netfilter/nfnetlink_queue); then
     info "queue 0: waiting=$waiting queue_dropped=$qdrop user_dropped=$udrop packets_seen=$seq"
     [[ $peer -ne 0 ]] && pass "Suricata is attached to queue 0 (portid $peer)" || fail "Nothing is attached to queue 0"
     if [[ $qdrop -gt 0 || $udrop -gt 0 ]]; then
@@ -198,9 +198,10 @@ if systemctl is-failed --quiet suricata-filestore-prune.service; then
 fi
 if [[ $CONFIG_TEST -eq 1 ]]; then
     info "Running suricata -T (loads all rules)..."
-    # -l to a temp dir so the test run doesn't append its own start-up lines to suricata.log
+    # -l to a temp dir so the test run doesn't append its own start-up lines to suricata.log,
+    # and no command socket, so it cannot get in the way of the running engine's
     tdir=$(mktemp -d)
-    if out=$(suricata -T -c "$CONF" -l "$tdir" 2>&1); then pass "Configuration test passed"
+    if out=$(suricata -T -c "$CONF" -l "$tdir" --set unix-command.enabled=no 2>&1); then pass "Configuration test passed"
     else fail "Configuration test failed:"; tail -10 <<<"$out" | sed 's/^/       /'; fi
     rm -rf "$tdir"
 fi

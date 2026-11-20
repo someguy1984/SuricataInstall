@@ -7,8 +7,8 @@ a VM.
 > **WARNING: use rootless Docker only. The boxes run `privileged`, which on rootful Docker is real root on this
 > machine.** The installers unload modules, set sysctls and write `/etc/modprobe.d`; on rootful Docker that
 > changes the host, not the box, and a privileged container can remount the repository read-write. `cap_drop`
-> cannot limit it (Docker ignores drops when privileged). Do not run the mock on rootful Docker on a machine you
-> care about; until `mock.sh` refuses a rootful daemon, do not run it there at all. Use a throwaway VM instead.
+> cannot limit it (Docker ignores drops when privileged). `mock.sh` refuses a rootful daemon for that
+> reason. `MOCK_ALLOW_ROOTFUL=1` overrides it: only ever in a throwaway VM.
 
 | Box | Private address | What runs | Reachable from this machine |
 |-----|-----------------|-----------|-----------------------------|
@@ -69,8 +69,8 @@ The list below is the summary; `mock.sh` is the authority on the exact checks an
   by itself when `/var/run/docker.sock` doesn't exist.
   - Publishing ports 80 and 443 needs `net.ipv4.ip_unprivileged_port_start` to be 80 or lower. It is 80 here.
   - The boxes run `privileged` because systemd needs it. Under rootless Docker that privilege stays inside your
-    user namespace. Until `mock.sh` refuses a rootful daemon (see "Planned safety changes"), check the daemon
-    yourself: `docker info -f '{{.SecurityOptions}}'` must list `rootless`.
+    user namespace. `mock.sh` checks that before it starts or enters a box (`docker info -f
+    '{{.SecurityOptions}}'` must list `rootless`) and refuses otherwise; `down` always works.
 - Published ports are bound to `127.0.0.1` only, never to your LAN.
 - Installers must never flush nftables or iptables globally, only the kit's own table and chains. The box's
   iptables `nat` table holds Docker's `127.0.0.11` DNS rules, and a flush would break name resolution.
@@ -84,7 +84,8 @@ the box and install from there (client section 7). The read-only repository moun
 
 | Flag | Installer | Why the mock needs it |
 |------|-----------|-----------------------|
-| `--no-kernel` | client | Pre-flight refuses kernel steps inside a container unless this is given; with it the installer prints a WARN and skips `modprobe -r sctp`, non-network sysctls and other kernel-wide steps, which a container shares with this machine |
+| `--no-kernel` | client | Pre-flight refuses kernel steps inside a container unless this is given; with it the installer prints a WARN and skips **every** kernel-wide step: module load and unload (`modprobe -r sctp`), the live SCTP block, all sysctls (network ones too), conntrack sizing and accounting, and BPF, which a container shares with this machine. Nothing the mock runs writes to the host kernel. The `/etc/modprobe.d` file is still written and its parse checked |
+| `--droplet-id ID` | client | The mock is not a DigitalOcean droplet and has no metadata service, but `droplet_id` is required by the hub. The installer accepts this flag only when the metadata service does not answer (it refuses, exit 3, when it does); `edr-droplet-id.service` then writes that value (client section 4.6) |
 | `--no-tetragon` | client | Tetragon cannot load in a container (see the table below) |
 | `--no-suricata` | client | When Suricata's af-packet cannot run on the veth, or to save memory |
 | `--no-web` | client | On the hub box, which has no nginx |
@@ -107,10 +108,10 @@ Containers share this machine's kernel, so anything that changes the kernel itse
 |------------------|--------------|
 | nginx, php-fpm, systemd units, timers, the kit's journal namespace and the disk guard | yes |
 | Suricata in af-packet IDS mode on the box's own interfaces | yes for rules and alerts; set `checksum-checks: no` (veth offload); no performance numbers |
-| nftables ban sets, ban apply, the `inet edr_dns` lock logic, `bigconn` counting | yes, inside each box's own network namespace |
-| `nf_conntrack_acct` and other sysctls | yes, if `/proc/sys` is writable in the box (probe it; fail loudly if not) |
+| nftables ban sets, ban apply, the `inet edr_dns` lock logic, `bigconn` logic on recorded counters | yes, inside each box's own network namespace. Real `bigconn` byte counting needs `nf_conntrack_acct` (a sysctl): VM only |
+| `nf_conntrack_acct`, conntrack sizing and every other sysctl | **no**. `--no-kernel` skips them all and nothing in the mock may write to the host kernel; a VM test covers them. `bigconn` is tested on recorded counters |
 | nft and iptables `LOG` lines (`edr-bigconn:`, `edr-dnslock:`) and `journalctl -k` | **no**. A container's namespace emits none; test the kernel-log reader with recorded lines, and the real thing in a VM |
-| The `sctp` modprobe block file and `modprobe -n -v sctp` | the file and its parse, yes; real blocking **no** (the modules are the host's) |
+| The `sctp` modprobe block file and `modprobe -n -v sctp` | the file is written under `--no-kernel` and its parse checked, yes; the live block (`modprobe -r sctp`) and real blocking **no** (the modules are the host's) |
 | dnscrypt-proxy | yes |
 | systemd-resolved drop-in | only after installing systemd-resolved (the image has none), and `/etc/resolv.conf` is a Docker bind mount, so the installer must cope with it |
 | `IPAddressDeny` / `IPAddressAllow` | **no**. Under rootless Docker systemd has no BPF firewall and silently does not enforce them |
@@ -133,27 +134,27 @@ All box addresses are private, which the ban logic never bans (see "Planned addi
 
 ## Planned safety changes
 
-Not built yet; until they are, follow the warning at the top.
+Not built yet. (`mock.sh` refusing a rootful daemon, once on this list, is in place.)
 
 1. Replace `privileged` with `cap_add: [SYS_ADMIN, NET_ADMIN, NET_RAW, SYS_PTRACE, DAC_READ_SEARCH, SYSLOG]`, with
    no `SYS_MODULE` or `SYS_TIME`. Boot-test this variant first; it may need `systempaths=unconfined`, which is
-   acceptable on rootless Docker only.
-2. `mock.sh up` refuses a rootful daemon unless `MOCK_ALLOW_ROOTFUL=1` is set.
-3. The client installer refuses to run kernel steps (modprobe, non-network sysctls, BPF, `/etc/modprobe.d`) when
-   `systemd-detect-virt -cq` succeeds, unless `--no-kernel` is given; with the flag it skips them and prints a
-   WARN. This is the real guard. The hub installer makes no such change.
+   acceptable on rootless Docker only. The variant exists as `compose.caps.yaml` and is opt-in until it has been
+   booted: `MOCK_CAPS=1 ./mock.sh up && MOCK_CAPS=1 ./mock.sh test`. When that passes it becomes the default.
+2. The client installer refuses to run kernel steps (modprobe, every sysctl, conntrack sizing and accounting, BPF) when
+   `systemd-detect-virt -cq` succeeds, unless `--no-kernel` is given; with the flag it skips them all and prints a
+   WARN (the `/etc/modprobe.d` file is still written and parse-checked, being a file). This is the real guard. The hub installer makes no such change.
 
 ## Planned additions
 
 Not built yet. Each stays optional, in its own compose profile where it adds a box.
 
-- `mock.sh test` probes `/proc/sys` writability, `memory.max` and BPF firewall support, and fails loudly (not
-  skips) when a limit or sysctl row cannot be trusted.
+- `mock.sh test` probes `memory.max` and BPF firewall support, and fails loudly (not skips) when a limit row cannot be
+  trusted. Sysctls are not probed: the client installer runs with `--no-kernel`, so no sysctl row is tested here.
 - The hub placeholder asks for a client certificate (`-Verify 1 -CAfile`) once the real CA exists.
 - An `attacker` box (curl, nmap, ssh client, h2load) on a new `edr_wan` network, using `198.18.77.0/24` as the
   droplet's "public" side with the web box's default route on it, for ban, scan and h2c tests.
 - A 24.04 variant of both images (`UBUNTU_TAG` and a PHP version as Dockerfile build args: PHP 8.3 and
-  Ubuntu's nginx 1.24 package), each running the enrolment and mTLS round trip. Hub tests on Python 3.12 (24.04)
+  Ubuntu's nginx 1.24 package), each running the enrolment and mTLS round trip (the client installed with `--droplet-id`). Hub tests on Python 3.12 (24.04)
   need it; until it exists they run in a VM.
 - A second hub, `hub2` at `10.77.0.11`, for `rehome` and restore tests.
 - `openssh-server` and `libfaketime` in the web image, and `sudo` or `runuser` for the canaries.
@@ -169,6 +170,7 @@ Not built yet. Each stays optional, in its own compose profile where it adds a b
 | File | Purpose |
 |------|---------|
 | `compose.yaml` | The two boxes, both networks, published ports, certificate volumes |
+| `compose.caps.yaml` | Opt-in (`MOCK_CAPS=1`): the boxes with a capability list instead of `privileged`; not boot-tested yet |
 | `Dockerfile` | One shared `base` stage (Ubuntu 26.04 and systemd), then `hub` and `web` targets |
 | `mock.sh` | `up`, `test`, `status`, `shell`, `logs`, `down` |
 | `common/mock-tls.sh` | Creates a self-signed certificate on first boot, so no private key is baked into an image |

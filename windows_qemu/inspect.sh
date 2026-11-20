@@ -78,8 +78,7 @@ attach() {
 collect() {
   if attached; then
     mon 'device_del xferdev' >/dev/null
-    local i
-    for i in $(seq 50); do attached || break; sleep 0.2; done
+    for _ in $(seq 50); do attached || break; sleep 0.2; done
     attached && die "the VM did not release the INSPECT stick"
     echo "INSPECT stick unplugged from the VM."
   fi
@@ -96,6 +95,7 @@ collect() {
   release
   chown -R "$RUN_USER:$RUN_USER" "$REPORTS"
   [ "$n" -gt 0 ] || { echo "no reports on the INSPECT disk yet"; return; }
+  # shellcheck disable=SC2010   # sorted by time, and these are directories this script named
   newest=$(ls -td "$REPORTS"/*/ | grep -v '/screens/$' | head -1)
   echo "copied $n report(s) to $REPORTS; newest: $newest"
   echo

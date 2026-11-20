@@ -5,14 +5,17 @@
 #                                 turn off the browsers' own DoH, make ctrld's config and
 #                                 logs root-only, add the DNS rules to Suricata if it is installed
 #   MODE=redirect ./install.sh    redirect hard-coded IPv4 resolvers to ctrld instead of refusing
-#   HARDEN=0 ./install.sh         skip the ctrld sandbox drop-in
+#                                 (a later run without MODE= keeps it; MODE=block switches back)
 #   BROWSERS=0 ./install.sh       skip the Firefox/Chromium policies
 #
 # Safe to re-run. Undo everything with ./uninstall.sh.
 set -euo pipefail
 
+# A re-run without MODE= keeps the mode of the last install instead of going back to block
+if [ -z "${MODE:-}" ] && [ -r /etc/default/dns-lockdown ]; then
+    MODE=$(sed -n 's/^MODE=//p' /etc/default/dns-lockdown | tail -n 1)
+fi
 MODE=${MODE:-block}
-HARDEN=${HARDEN:-1}
 BROWSERS=${BROWSERS:-1}
 TEST_DOMAIN=${TEST_DOMAIN:-controld.com}   # example.com is blocked by the Control D profile
 
@@ -37,6 +40,18 @@ die()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 resolves() { [ -n "$(dig +time=3 +tries=2 +short @127.0.0.1 "$TEST_DOMAIN" 2>/dev/null | grep -v '^;')" ]; }
 # The same through /etc/resolv.conf, i.e. what every program on the machine actually uses
 system_resolves() { [ -n "$(dig +time=3 +tries=2 +short "$TEST_DOMAIN" 2>/dev/null | grep -v '^;')" ]; }
+
+# Take the lockdown off again: firewall chain (now and at boot) and Suricata's DNS rules.
+# For the one case where this script would otherwise end with DNS locked to a dead ctrld.
+unlock() {
+    echo "Lifting the DNS lockdown"
+    systemctl disable --now dns-lockdown.service 2>/dev/null || true
+    /usr/local/sbin/dns-lockdown.sh stop || true
+    if [ -f "$SURICATA_RULES" ] && grep -q '^drop ' "$SURICATA_RULES"; then
+        bash "$HERE/files/dns-lockdown-rules.sh" --stub > "$SURICATA_RULES"
+        if systemctl is-active --quiet suricata; then systemctl reload suricata || true; fi
+    fi
+}
 
 [ "$(id -u)" -eq 0 ] || die "run as root"
 [ "$MODE" = block ] || [ "$MODE" = redirect ] || die "MODE must be 'block' or 'redirect'"
@@ -106,52 +121,56 @@ else
     echo "../install.sh adds these rules when it is run after this script."
 fi
 
-if [ "$HARDEN" = 1 ]; then
-    say "Sandboxing ctrld"
-    SANDBOX="$CTRLD_DROPIN/60-hardening.conf"
-    # PrivateIPC is one of this drop-in's settings: "yes" means systemd has it loaded
-    if cmp -s "$HERE/files/ctrld-60-hardening.conf" "$SANDBOX" && systemctl is-active --quiet ctrld \
-        && [ "$(systemctl show -p PrivateIPC --value ctrld)" = yes ]; then
-        # Restarting ctrld means a few seconds without DNS; don't when nothing would change
-        echo "The sandbox is already in place and unchanged: ctrld is not restarted"
+# The sandbox is not optional (HARDEN=0 used to skip it): a sandbox ctrld does not start
+# under is taken off again below, so there is nothing to opt out of
+[ "${HARDEN:-1}" = 1 ] || echo "NOTE: HARDEN=0 is no longer an option; ctrld is sandboxed whenever it runs under the sandbox"
+say "Sandboxing ctrld"
+SANDBOX="$CTRLD_DROPIN/60-hardening.conf"
+# PrivateIPC is one of this drop-in's settings: "yes" means systemd has it loaded
+if cmp -s "$HERE/files/ctrld-60-hardening.conf" "$SANDBOX" && systemctl is-active --quiet ctrld \
+    && [ "$(systemctl show -p PrivateIPC --value ctrld)" = yes ]; then
+    # Restarting ctrld means a few seconds without DNS; don't when nothing would change
+    echo "The sandbox is already in place and unchanged: ctrld is not restarted"
+else
+    # Keep whatever sandbox was there, so a new one that doesn't work is replaced by the
+    # old one that did rather than by nothing
+    rm -f "$STATE/60-hardening.conf.prev"
+    if [ -f "$SANDBOX" ]; then cp -p "$SANDBOX" "$STATE/60-hardening.conf.prev"; fi
+    install -m 0644 -o root -g root "$HERE/files/ctrld-60-hardening.conf" "$SANDBOX"
+    systemctl daemon-reload
+    echo "Restarting ctrld (DNS lookups fail for a few seconds)"
+    systemctl restart ctrld || true
+    sleep 3
+    if systemctl is-active --quiet ctrld && resolves && system_resolves; then
+        echo "ctrld restarted under the sandbox and is resolving"
     else
-        # Keep whatever sandbox was there, so a new one that doesn't work is replaced by the
-        # old one that did rather than by nothing
-        rm -f "$STATE/60-hardening.conf.prev"
-        if [ -f "$SANDBOX" ]; then cp -p "$SANDBOX" "$STATE/60-hardening.conf.prev"; fi
-        install -m 0644 -o root -g root "$HERE/files/ctrld-60-hardening.conf" "$SANDBOX"
+        echo "ctrld failed under the new sandbox:"
+        journalctl -u ctrld -n 20 --no-pager || true
+        tail -n 20 /var/log/ctrld.err.log 2>/dev/null || true
+        if [ -f "$STATE/60-hardening.conf.prev" ]; then
+            echo "Putting the previous sandbox back and restarting ctrld"
+            install -m 0644 -o root -g root "$STATE/60-hardening.conf.prev" "$SANDBOX"
+        else
+            echo "Removing it and restarting ctrld without a sandbox"
+            rm -f "$SANDBOX"
+        fi
         systemctl daemon-reload
-        echo "Restarting ctrld (DNS lookups fail for a few seconds)"
         systemctl restart ctrld || true
         sleep 3
-        if systemctl is-active --quiet ctrld && resolves && system_resolves; then
-            echo "ctrld restarted under the sandbox and is resolving"
-        else
-            echo "ctrld failed under the new sandbox:"
-            journalctl -u ctrld -n 20 --no-pager || true
-            tail -n 20 /var/log/ctrld.err.log 2>/dev/null || true
-            if [ -f "$STATE/60-hardening.conf.prev" ]; then
-                echo "Putting the previous sandbox back and restarting ctrld"
-                install -m 0644 -o root -g root "$STATE/60-hardening.conf.prev" "$SANDBOX"
-            else
-                echo "Removing it and restarting ctrld without a sandbox"
-                rm -f "$SANDBOX"
-            fi
+        if ! { resolves && system_resolves; } && [ -f "$SANDBOX" ]; then
+            echo "Still not resolving; removing the sandbox altogether"
+            rm -f "$SANDBOX"
             systemctl daemon-reload
             systemctl restart ctrld || true
             sleep 3
-            if ! { resolves && system_resolves; } && [ -f "$SANDBOX" ]; then
-                echo "Still not resolving; removing the sandbox altogether"
-                rm -f "$SANDBOX"
-                systemctl daemon-reload
-                systemctl restart ctrld || true
-                sleep 3
-            fi
-            resolves || die "ctrld still not resolving without the sandbox; run ./uninstall.sh"
-            echo "New sandbox skipped; everything else is in place"
         fi
-        rm -f "$STATE/60-hardening.conf.prev"
+        if ! resolves; then
+            unlock
+            die "ctrld is still not resolving without the sandbox, so the DNS lockdown was lifted again. Fix ctrld (journalctl -u ctrld), then re-run this script; ./uninstall.sh removes the rest"
+        fi
+        echo "New sandbox skipped; everything else is in place"
     fi
+    rm -f "$STATE/60-hardening.conf.prev"
 fi
 
 if [ "$BROWSERS" = 1 ]; then
@@ -206,9 +225,28 @@ PY
 fi
 
 say "Verifying"
+rc=0
+# What verify.sh cannot see as a normal user: the chain itself, in both families, with ctrld
+# let through it. (A real install once ended with the chain down while every test passed.)
+for cmd in iptables ip6tables; do
+    out=$($cmd -S OUTPUT 2>/dev/null || true)
+    if ! grep -q -- '-j DNSLOCK$' <<<"$out"; then
+        echo "  FAIL  $cmd: the DNSLOCK chain is not in OUTPUT (journalctl -u dns-lockdown -n 30)"; rc=1
+        continue
+    fi
+    out=$($cmd -S DNSLOCK 2>/dev/null || true)
+    if ! grep -q -- '-m cgroup' <<<"$out"; then
+        echo "  FAIL  $cmd: ctrld is not exempt in DNSLOCK, so its own lookups are refused (sudo systemctl restart ctrld)"; rc=1
+    fi
+done
 # verify.sh doesn't need root; run it as the person who called sudo when there is one
 if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ]; then
-    sudo -u "$SUDO_USER" "$HERE/verify.sh" || true
+    sudo -u "$SUDO_USER" "$HERE/verify.sh" || rc=1
 else
-    "$HERE/verify.sh" || true
+    "$HERE/verify.sh" || rc=1
 fi
+if [ $rc -ne 0 ]; then
+    echo
+    echo "The lockdown is NOT fully in place: see the FAIL lines above."
+fi
+exit $rc

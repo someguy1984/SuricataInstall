@@ -1,7 +1,8 @@
 #!/bin/bash
 # Static checks for the scripts, Python, policies, generated rules, JSON and units in the repo. Changes nothing and needs nothing installed
 # beyond bash and python3; the optional tools are used when present and reported as skipped
-# when not (shellcheck, PyYAML, systemd-analyze).
+# when not (shellcheck, PyYAML, systemd-analyze, logrotate). Its only writes go to a temp
+# directory of its own, removed at the end.
 #
 # Usage: tests/lint.sh SHELL-FILES... -- PYTHON-FILES...     (normally via: make lint)
 set -uo pipefail
@@ -13,6 +14,9 @@ sh_files=() py_files=() in_py=0
 for arg in "$@"; do
     if [[ $arg == -- ]]; then in_py=1; elif [[ $in_py -eq 1 ]]; then py_files+=("$arg"); else sh_files+=("$arg"); fi
 done
+
+LINT_TMP=$(mktemp -d) || exit 1
+trap 'rm -rf "$LINT_TMP"' EXIT
 
 FAIL=0
 ok() { echo "  ok    $*"; }
@@ -47,6 +51,16 @@ for f in "${py_files[@]}"; do
         bad "$f: $out"
     fi
 done
+# The Python that ips-watch carries inside itself: a syntax error there would silently switch
+# off the reporting of Suricata's findings
+sed -n "/python3 -I -c '\$/,/^'\$/p" watch/files/ips-watch | sed '1d;$d' > "$LINT_TMP/ips-watch.py"
+if [[ ! -s $LINT_TMP/ips-watch.py ]]; then
+    bad "watch/files/ips-watch: its embedded Python was not found (lint.sh looks for python3 -I -c ' ... ')"
+elif out=$(python3 -I -c 'import sys; compile(open(sys.argv[1]).read(), "ips-watch (embedded Python)", "exec")' "$LINT_TMP/ips-watch.py" 2>&1); then
+    ok "watch/files/ips-watch (embedded Python)"
+else
+    bad "watch/files/ips-watch (embedded Python): $out"
+fi
 # Every Python file in the repo should be on the list, or a new one silently goes uncompiled
 while IFS= read -r f; do
     printf '%s\n' "${py_files[@]}" | grep -qxF -- "$f" || bad "$f is a Python script but is not in the Makefile's PY_FILES"
@@ -145,10 +159,14 @@ for n, line in enumerate(open(sys.argv[1]), 1):
             if not rx.startswith("^"):
                 print(f"  FAIL  line {n}: {key} {rx!r} is not anchored with ^"); failed = True
     # Arguments are whatever the process was started with: on their own they hide anything
-    if f.get("arguments_regex") and not (f.get("binary_regex") or f.get("parent_binary_regex")):
-        print(f"  FAIL  line {n}: arguments_regex without binary_regex or parent_binary_regex: {line[:80]}"); failed = True
+    # ... so they count only with the root-owned program that started the process, and whole
+    if f.get("arguments_regex") and not f.get("parent_binary_regex"):
+        print(f"  FAIL  line {n}: arguments_regex without parent_binary_regex: {line[:80]}"); failed = True
+    for rx in f.get("arguments_regex", []):
+        if not (rx.startswith("^") and rx.endswith("$")):
+            print(f"  FAIL  line {n}: arguments_regex {rx[:60]!r} is not anchored at both ends (^...$)"); failed = True
 if not failed:
-    print("  ok    every line is limited to an event type or policy, binary patterns are anchored, and none matches on arguments alone")
+    print("  ok    every line is limited to an event type or policy, binary patterns are anchored, and arguments match whole and only under a named parent")
 sys.exit(failed)
 PY
 then :; else FAIL=1; fi
@@ -185,6 +203,91 @@ if command -v systemd-analyze >/dev/null; then
     if [[ -z $out ]]; then ok "units parse"; else bad "systemd-analyze verify:"; sed 's/^/        /' <<<"$out"; fi
 else
     skip "systemd-analyze is not available"
+fi
+
+echo "== Drop-ins and the units the Tetragon installer writes"
+NOISE='is not executable|No such file or directory|not found|Unit .* not found'
+if command -v systemd-analyze >/dev/null; then
+    # A drop-in is only read as part of a unit: give ctrld's two a stand-in unit to belong to
+    mkdir -p "$LINT_TMP/ctrld/ctrld.service.d"
+    printf '[Service]\nExecStart=/bin/true\n' > "$LINT_TMP/ctrld/ctrld.service"
+    cp controld/files/ctrld-50-dns-lockdown.conf controld/files/ctrld-60-hardening.conf "$LINT_TMP/ctrld/ctrld.service.d/"
+    out=$(systemd-analyze verify "$LINT_TMP/ctrld/ctrld.service" 2>&1 | grep -vE "$NOISE" || true)
+    if [[ -z $out ]]; then ok "ctrld drop-ins parse"; else bad "ctrld drop-ins:"; sed 's/^/        /' <<<"$out"; fi
+
+    # tetragon/local_install.sh writes its units from here-documents. Replay just those (and
+    # the plain assignments they use) into the temp directory, then check what comes out.
+    if python3 -I - tetragon/local_install.sh > "$LINT_TMP/gen.sh" <<'PY'
+import re, sys
+lines = open(sys.argv[1]).read().split("\n")
+assign, docs, i = [], [], 0
+while i < len(lines):
+    line = lines[i]
+    m = re.match("\\s*cat >(\"[^\"]+\") <<('?)EOF'?$", line)
+    if m:
+        end = lines.index("EOF", i + 1)
+        body = lines[i + 1:end]
+        # Unquoted, the shell expands the text: nothing in it may run a command
+        if not m.group(2) and any("$(" in b or "`" in b for b in body):
+            sys.stderr.write(f"line {i + 1}: a here-document with a command substitution cannot be checked\n")
+            sys.exit(1)
+        docs.append((m.group(1), m.group(2), body))
+        i = end + 1
+        continue
+    if re.match("[A-Za-z_][A-Za-z0-9_]*\\+?=", line) and "$(" not in line and "`" not in line:
+        assign.append(line)
+    i += 1
+if len(docs) < 5:
+    sys.stderr.write(f"found {len(docs)} generated files in {sys.argv[1]}, expected at least 5: lint.sh needs updating\n")
+    sys.exit(1)
+print("DIR=/opt/kit/tetragon")
+print("\n".join(assign))
+print("set -u    # a misspelt variable in a unit must not expand to nothing")
+for target, quote, body in docs:
+    print(f'cat > "$OUT/$(basename {target})" <<{quote}EOF{quote}')
+    print("\n".join(body))
+    print("EOF")
+PY
+    then
+        mkdir -p "$LINT_TMP/tetragon/tetragon.service.d"
+        # shellcheck disable=SC2016   # expanded by the inner shell, on purpose
+        if out=$(OUT="$LINT_TMP/tetragon" bash -c '. tetragon/config.sh; . "$1"' _ "$LINT_TMP/gen.sh" 2>&1); then
+            printf '[Service]\nExecStart=/bin/true\n' > "$LINT_TMP/tetragon/tetragon.service"
+            mv "$LINT_TMP/tetragon/boot-gate.conf" "$LINT_TMP/tetragon/shutdown.conf" "$LINT_TMP/tetragon/tetragon.service.d/" 2>/dev/null \
+                || bad "tetragon/local_install.sh no longer writes boot-gate.conf and shutdown.conf (lint.sh needs updating)"
+            out=$(systemd-analyze verify "$LINT_TMP"/tetragon/*.service 2>&1 | grep -vE "$NOISE" || true)
+            if [[ -z $out ]]; then
+                ok "tetragon units and drop-ins parse (written by local_install.sh: $(cd "$LINT_TMP/tetragon" && find . -name '*.service' -o -name '*.conf' | grep -vc '^\./tetragon\.service$') files)"
+            else
+                bad "units written by tetragon/local_install.sh:"; sed 's/^/        /' <<<"$out"
+            fi
+            if out=$(sh -n "$LINT_TMP/tetragon/tetragon-wait-ready" 2>&1); then ok "tetragon-wait-ready parses"; else bad "tetragon-wait-ready: $out"; fi
+        else
+            bad "the units in tetragon/local_install.sh could not be generated: $out"
+        fi
+    else
+        bad "tetragon/local_install.sh: its here-documents could not be read (see the message above)"
+    fi
+else
+    skip "systemd-analyze is not available"
+fi
+
+echo "== tmpfiles and logrotate"
+if systemd-tmpfiles --help 2>/dev/null | grep -q -- '--dry-run'; then
+    out=$(systemd-tmpfiles --create --dry-run controld/files/ctrld-logs.tmpfiles 2>&1 | grep -E '^[^ ]*ctrld-logs\.tmpfiles:[0-9]+:' || true)
+    if [[ -z $out ]]; then ok "controld/files/ctrld-logs.tmpfiles"; else bad "controld/files/ctrld-logs.tmpfiles:"; sed 's/^/        /' <<<"$out"; fi
+else
+    skip "systemd-tmpfiles has no --dry-run here"
+fi
+if command -v logrotate >/dev/null; then
+    for f in files/suricata.logrotate controld/files/ctrld.logrotate; do
+        # A copy: logrotate refuses a file that belongs to someone else. -d changes nothing.
+        cp "$f" "$LINT_TMP/logrotate.conf"
+        out=$(logrotate -d -s "$LINT_TMP/logrotate.state" "$LINT_TMP/logrotate.conf" 2>&1 | grep -E 'unknown option|error: .*logrotate\.conf' || true)
+        if [[ -z $out ]]; then ok "$f"; else bad "$f:"; sed 's/^/        /' <<<"$out"; fi
+    done
+else
+    skip "logrotate is not installed"
 fi
 
 echo

@@ -53,7 +53,7 @@ behind nginx and php-fpm. It installs and tunes:
 | **Tetragon** | Records what processes do. After a gate and a canary it kills an nginx worker that starts a program, or a process that opens an SCTP socket. **Most web-attack detection happens here** (§4.3). |
 | **DNS over HTTPS** | `dnscrypt-proxy` (DoH only) plus a lock on plain DNS, with a watchdog that relaxes the lock if DoH fails (§4.4). |
 | **`edr-agent`** | A sandboxed, standard-library-only Python process. It reads all of the above and sends compact telemetry to the hub over mutual TLS and polls it for fleet peers and, from P3, bans and feeds (§4.5). |
-| **Root helpers** | Small oneshot units with fixed JSON in and out: `edr-bans`, `edr-inventory`, `edr-diskguard`, `edr-dns-watch`, `edr-home-net`, `edr-policy-check`; the optional `edr-notify` is the local alert sender (§4.7). |
+| **Root helpers** | Small oneshot units with fixed JSON in and out: `edr-bans`, `edr-inventory`, `edr-diskguard`, `edr-dns-watch`, `edr-home-net`, `edr-policy-check`, `edr-droplet-id`; the optional `edr-notify` is the local alert sender (§4.7). |
 
 Installing needs the hub's address and a one-time token. The token never goes on the command line, because any local
 user can read process arguments (§4.6). The hub prints these two lines:
@@ -119,7 +119,7 @@ nginx**. The operator's actions, the bug table and the signal table are in Appen
    | DNS lock | plain DNS (53, 853) from the box | `edr-dns-watch` removes the lock when DoH fails and restores it when healthy (§4.4) |
    | `edr-diskguard` | kit logs, the MPM cache, Suricata (SIGTERM below 3% free) | Frees the site's disk; fixed actions only, switch in §14 (§9) |
    | Tetragon fork watch `Sigkill` (P3) | a non-root nginx process forking | Local switch, monitor first (§4.3) |
-   | Kernel settings | conntrack limit and accounting, SCTP module block | Each recorded in the manifest, reverted by uninstall, skipped with `--no-kernel` or `--no-sctp-block` (§4.2, §7) |
+   | Kernel settings | conntrack limit and accounting, SCTP module block | Each recorded in the manifest, reverted by uninstall, skipped with `--no-kernel` (all of them but the `modprobe.d` file) or `--no-sctp-block` (§4.2, §7) |
    | Resolver switch | the box's own lookups go to the local DoH proxy | `edr-dns-watch` falls back to the link resolvers (§4.4) |
    | Daily rule update restarts Suricata (hosts under 4 GB) | Suricata | Memory-guarded timer; blind for one cold load (§4.1) |
    | php-fpm restart after a policy change | php-fpm | Operator only; the installer and `apply-config` print the command and never run it (§4.3, §7) |
@@ -326,7 +326,8 @@ agent's checkpoint (§4.5); schedule and caps are in §9.
 | flow, netflow, files, file-store, drop | not configured | Most of the logging cost; `drop` is silent in IDS mode |
 
 **Stats and the heartbeat.** The 60 s event gives `capture.kernel_packets`, `capture.kernel_drops` and memcap counters
-(confirm names on the pinned build) for the heartbeat; the agent alerts the hub when drops exceed 1% in a window.
+(confirm names on the pinned build) for the heartbeat key `suricata_drops` `{packets, drops, window_s}`; the hub computes the 1% share
+(hub §4), so the agent sends no separate event for it.
 
 ### 4.2 Blocking: nftables ban sets
 
@@ -506,6 +507,7 @@ The `ct` expressions need conntrack, and the kit must not be what fills it. Pre-
   with TIME_WAIT alone), and a full table drops new connections. If the limit is still the default the installer
   sets `nf_conntrack_max=262144` (about 67 MB worst case) after the module loads (`sysctl -p` after `modprobe nf_conntrack`;
   `sysctl.d` can run first). Established timeouts are not shortened. Uninstall removes the drop-in if the kit made it.
+  `--no-kernel` skips the sizing and the accounting switch (§7); they are tested at L3 (VM) only (§11).
 - **Monitoring.** The heartbeat reports count, maximum, and `drop` and `early_drop` from `/proc/net/stat/nf_conntrack`.
   The hub alerts at 70%; `check.sh` WARNs at 70% and FAILs at 90%.
 - **Connections that existed before install** are picked up mid-stream (tested: a flow that predates the rule is never counted)
@@ -569,14 +571,14 @@ Break-glass without the agent: the commands are in §4.7 (they stop the path and
 
 #### What the client expects of `/v1/policy` (hub Appendix A, P3)
 
-Before P3 only `peers` and the hub addresses are used (see Guards, above). The `/v1/policy` document and its field names are in hub Appendix A: `rev` (the ETag; 304 when unchanged),
+Before P3 only `peers` and the hub addresses are used (see Guards, above). The `/v1/policy` document and its field names are in hub Appendix A: `rev` (the ETag, a string of 16 hex characters: the hub hashes the document; 304 when unchanged),
 `hub_time`, bans as `{cidr, expires_at, source, reason_id}` (`expires_at` in epoch seconds on the hub clock), feeds
 and `peers`, plus `hub_addresses` and `port` (as in the enroll reply); nothing else in v1. The agent computes the remaining time as `expires_at - hub_time` and stores an
 absolute expiry on its own clock at receipt, so skew shifts nothing; it WARNs above 60 s. `source` and `reason_id`
 are validated against closed vocabularies (else shown as `unknown`): `source` is `fleet` or `operator`, `reason_id` is `fleet_quorum` or `operator`, and feed names are `spamhaus_drop_v4`, `spamhaus_drop_v6` and `dshield`. Values are cleaned before display in `edr-agent bans`
 and `check.sh`, because root runs them. An unban is absence from the next document. Unknown fields are ignored; no
-reason text names another host. The heartbeat carries `policy_rev_applied`, `ban_counts` and `last_apply_error`; the reply carries `hub_time`,
-`policy_rev` and `min_client_schema`.
+reason text names another host. The heartbeat carries `policy_rev_applied` (the `rev` string last applied), `ban_counts` and `last_apply_error`; the reply carries `hub_time`,
+`policy_rev` (the same string type) and `min_client_schema` (an integer: the previous event schema version, hub §4 Policy document).
 
 ### 4.3 Tetragon, server policy set
 
@@ -695,13 +697,14 @@ followed by any web-policy event within 10 minutes is a hub rule rated CRITICAL 
 | Policy | Change |
 |--------|--------|
 | `privilege-escalation`, `setuid-files`, `kernel-tampering`, `tetragon-tamper` | none |
+| `boot-config` | none; observe-only, as on the laptop. Boot tampering matters on a server (a changed kernel command line or bootloader decides what the next boot runs). Expected entries: unattended kernel upgrades and `update-grub` write under `/boot` (kernels, initrds, `grub.cfg`), so a burst there during an upgrade is normal; read it against the upgrade; a write outside one is the signal |
 | `sensitive-files` | keep `/etc/shadow`, `/etc/passwd`, `/etc/group`, sudoers, SSH and cloud keys; drop desktop entries (keeps `check.sh --canary`) |
 | `monitor-kernel-modules` | tag `sctp` and unused protocol loads HIGH (our inference, no published IOC: [Xint](https://xint.io/blog/nginx2root-remote-code-execution)) |
 | `persistence` | drop autostart; add `authorized_keys`, `/etc/ld.so.preload`, `/var/spool/cron`; writes to `/etc/passwd`, `/etc/group`, `/etc/sudoers.d`; exec of `useradd`, `usermod`, `adduser` (lint: at most 8 prefix/postfix lists). DigitalOcean's droplet-agent rewrites `authorized_keys` for each Console session, so a write by `/opt/digitalocean/bin/droplet-agent` is allowlisted by binary (first selector, `NoPost`; confirm the path with `dpkg -L droplet-agent`); any other writer stays HIGH |
 | `suspicious-exec`, `stack-tamper` | add `/tmp`, `/var/tmp` (the agent treats `/memfd:` and `(deleted)` exec paths as signals); point `stack-tamper` at this kit's Suricata, `/etc/edr-agent`, `/usr/local/lib/edr-agent`, `/var/lib/edr-agent/identity`, `edr-*`, nft and dnscrypt paths; add writes and unlinks on `/var/log/auth.log` and `/var/log/nginx` (directory prefix) and an exec of `journalctl --vacuum*` |
 | `tcp-listen` | ignore nginx, php-fpm, sshd, mysqld, postgres, redis, agent; allowlist Octane or Reverb per host |
 
-Dropped: `device-access`, the all-process `tcp-connect`. P3 additions: `log-tamper` (truncate, unlink, rename under
+Dropped: `device-access`, the all-process `tcp-connect`. With `boot-config` the reused set is 11 of the laptop's 13 policies. P3 additions: `log-tamper` (truncate, unlink, rename under
 `/var/log` except by logrotate, journald, rsyslog, dpkg), `link-sensitive` (links onto `/etc/passwd`, `/etc/shadow`,
 `.env` by the web tree) and decoy credential files outside every served tree read-watched by `sensitive-files` (§4.7).
 Rejected: `ptrace` (noisy), bulk delete (cache clears), DNS telemetry (§4.4).
@@ -735,7 +738,7 @@ with `Sigkill`. A pause does not switch it to monitor (§4.7): it cannot touch t
 enforcement works. `check.sh --live` and the post-upgrade self-test run it as the web user (root holds `CAP_SYS_ADMIN`);
 with no web user (`--no-web`) they run it, and the SCTP canaries, as `nobody` (uid and gid 65534):
 `setpriv --reuid <web user> --regid <web user> --clear-groups /usr/libexec/edr/canary -c "exec /bin/true"`, and require
-death by SIGKILL plus an event. An `unshare -U` then SCTP canary runs once `sctp-socket` enforces. VM tests expect zero kills for a
+death by SIGKILL plus an event. An `unshare -U` then SCTP canary runs once `sctp-socket` enforces; on an enrolled host these SCTP canaries page the hub (no test marker, §8). VM tests expect zero kills for a
 `kill -USR2` upgrade under a hardened unit, certbot's `nginx -t` and `apt install nginx` (§11).
 
 #### Discovery and drift
@@ -792,9 +795,9 @@ a pause, and runs the daily canary (P2). It writes `/run/edr-policy-check/status
 in the unit's `RuntimeDirectory=edr-policy-check`) for the agent, which cannot call `tetra`. The file holds per policy the
 name, mode, state and `NMONITOR`, plus the canary result and time, the kernel version and the BTF state. From that file
 the agent raises HIGH `health.enforcement_gone` locally, so the signal exists with no hub, and INFO `canary.policy_check` for each daily canary (§4.5). The heartbeat carries the `tetragon`
-key (policy name, mode, would-be kills) and `kernel` (hub Appendix A). The hub raises HIGH "enforcement gone"
-(hub §4) when a policy set to enforce is disabled or missing, or the kernel changed without a passed canary,
-5 minutes after boot.
+list (`{name, mode, would_be_kills}`) and `kernel` (hub Appendix A). The agent raises `health.enforcement_gone` (HIGH) when a policy
+set to enforce is not loaded, or the kernel changed without a passed canary, 5 minutes after boot, and the hub's HIGH
+"enforcement gone" rule (hub §4) keys on that event, not on a heartbeat field: the hub never sees `[tetragon] enforce`.
 
 `check.sh` checks `kernel.apparmor_restrict_unprivileged_userns=1` (the Ubuntu default; the kit does not set it). amd64 only.
 
@@ -887,7 +890,9 @@ the behaviour reference and its netns test is ported. Tested sketch (names gener
 - **Severity.** The agent reads `edr-dnslock:` from the kernel journal (the one prefix; `plain`, `self` and `doh` after it
   are the event's `what`); the exemption is the first rule and everything else from that uid is refused. A refusal
   by a web user (§4.3, Discovery and drift) is HIGH, other non-root uids MEDIUM, unless nginx has an outside `resolver`. `edr-inventory` records nginx `resolver`
-  addresses, the installer WARNs and suggests `resolver 127.0.0.53;`, the hub downgrades matching hits. Lookups
+  addresses and the installer WARNs and suggests `resolver 127.0.0.53;`. The client always sends its own `sev`; the hub owns
+  the downgrade rule (hub §4: MEDIUM when the refused destination is a `resolver` address in that host's inventory) and
+  records its rating beside the event, never rewriting `sev`. Lookups
   through `127.0.0.53` are allowed and not logged. Precursor names only "unusual lookups from nginx hosts" as a
   lead ([source](https://www.precursorsecurity.com/blog/nginx2root-critical-nginx-rce-vulnerabilities)).
 - **Boot.** `edr-dnslock.service` (oneshot, `RemainAfterExit`, `Before=network-pre.target`, `TimeoutStartSec=10`,
@@ -1182,10 +1187,10 @@ A bad certificate fails the TLS handshake or the first read with no status. One 
   by cgroup presence under `/sys/fs/cgroup/system.slice/` (`running` or `absent`); the root helpers that write a
   status file (`edr-bans`, `edr-inventory`, `edr-diskguard`, `edr-dns-watch`, `edr-policy-check`) by the age of that
   file (`fresh` or `stale`). Timers and path units are not reported; `check.sh` covers the `edr-bans` path and timer, the `edr-dns-watch` timer and the `edr-diskguard` timer (§8);
-- `tetragon` (policy names, modes and would-be-kill counts); `nft` (the `inet edr` table: `table_present`, set sizes,
+- `tetragon` (a list of `{name, mode, would_be_kills}`: policy name, `monitor` or `enforce`, would-be-kill count; never the local `[tetragon] enforce` intent, §14); `nft` (the `inet edr` table: `table_present`, set sizes,
   counters from `/run/edr-bans/counters.json`); `conntrack` (count, maximum, `drop` and `early_drop`, §4.2); `dns_lock` (`state`: `locked`, `open`,
   `paused` or `flapping`, with `since` and the re-lock count, from `/run/edr-dns-watch/status.json`, §4.4); `disk`,
-  `load`, `mem`; `suricata_drops` (kernel drops);
+  `load`, `mem`; `suricata_drops` (an object `{packets, drops, window_s}`: kernel packets and kernel drops over the last stats window, §4.1);
 - `spool` (depth, drop counters by lane and source); `seq` and `epoch` (the highest sequence number and its epoch);
   `boot_id` (`/proc/sys/kernel/random/boot_id`), `uptime_s`, `kernel`;
 - `agent_version`, `agent_sha256`, `droplet_id` (§4.6), `sent_at`, `schema`, `proto`, `local_conf_sha256`, `cert_not_after`,
@@ -1210,7 +1215,8 @@ within 10 minutes" as a planned reboot (hub §4). Confirm in the VM test that th
 259; every directive exists in systemd 255 on 24.04)
 
     [Unit]
-    After=network-online.target
+    After=network-online.target edr-droplet-id.service   # the droplet id is read by that root oneshot (§4.6)
+    Wants=edr-droplet-id.service
     StartLimitIntervalSec=0
     [Service]
     Type=notify
@@ -1218,7 +1224,6 @@ within 10 minutes" as a planned reboot (hub §4). Confirm in the VM test that th
     WatchdogSec=90
     Restart=always
     RestartSec=5
-    ExecStartPre=+<droplet-id step>           # root, 2 s timeout; writes the droplet id to /run/edr-agent/ (§4.6)
     ExecStop=/usr/bin/python3 -I /usr/local/lib/edr-agent/edr-agent.py shutdown-notice
     TimeoutStopSec=5
     ExecStart=/usr/bin/python3 -I /usr/local/lib/edr-agent/edr-agent.py
@@ -1282,7 +1287,8 @@ capability for the agent). On `EACCES` the agent raises HIGH `health.tetragon_un
 `nginx -v` is not a vulnerability check. Ubuntu backports fixes without changing it (noble stays `1.24.0`), so fixes
 are judged from full package versions ([Xint](https://xint.io/blog/nginx2root-remote-code-execution)). **Vulnerability
 status is computed on the client from apt**, so it works with no hub and covers every package, not only nginx. The hub's
-advisory file (`common/advisories.json`, hub §4) adds exposure context, origins apt cannot judge (nginx.org, PPAs) and
+advisory file (`common/advisories.json`; its JSON shape, `{updated, rows: [{id, origin, release, packages, compare, fixed_in, cves,
+needs_feature, ref}]}`, and the override rule are defined in hub §4, Advisory data) adds exposure context, origins apt cannot judge (nginx.org, PPAs) and
 "no fix yet" cases. Checks that need root run in this small unit, which writes a fixed-schema JSON file (the `edr-bans`
 split). The agent sends the file's contents as the `inventory` object in the heartbeat (hash-compared, so unchanged
 content is not resent more than hourly) and raises `inventory.<check>` events only for findings. A stale or missing
@@ -1386,7 +1392,11 @@ canary. `edr-check --live` confirms nothing fires on the helpers.
 
 **The token.** The hub creates it (`edr-hub token create --name web1`) in the form `id.secret.ca_sha256`. It is
 single-use, expires (15 minutes by default, 24 hours at most), is bound to a name, and is stored hashed on the
-hub (hub §2, Tokens). A host the hub already knows needs a token made with `--for HOST` (see Host identity).
+hub (hub §2, Tokens). A host the hub already knows needs a token made with `--for HOST` (see Host identity). The 15-minute
+default is kept short on purpose and a manual first install can outlast it (apt, rule download, then a human
+`--confirm` from a second SSH session, §7): make the token with `--ttl 1h` when the install will wait for a
+confirmation, and `token create` prints that hint. While the hub runs `--clients-only`, `token create` requires
+`--source` (hub §2).
 
 **Delivery: never on the command line.** `/proc` has no `hidepid`, so any local user, the web user included, can
 read another process's arguments, and `sudo` logs them. The installer takes the token from `--token-file PATH`,
@@ -1427,13 +1437,16 @@ stdin reaches the unit and that nothing else is reachable from it.
    does; the same flag on every version keeps 24.04 and 26.04 identical). Nothing is sent before this succeeds.
    Enrollment connections never load a client certificate, old or new.
 4. **Enroll:** `POST /v1/enroll {token (id.secret), csr, host_uuid (only if host-id exists and the droplet id is
-   unchanged), hostname, os, ips, droplet_id}`. A stale `host-id` after a clone is not sent (see Host identity).
+   unchanged), hostname, os, ips, droplet_id}`. `droplet_id` is always sent, a non-empty string: the hub requires it
+   and never skips its duplicate-identity comparison (hub Appendix A). A stale `host-id` after a clone is not sent (see Host identity).
    The reply carries the host UUID the hub minted, the signed client certificate (CN = UUID, 365 days), the CA, the
    hub's address list, the expiry and the host state `pending`. Hostname, `os` and `ips` are labels only. A 409
    (`host_exists`: the hint matches a host the hub already holds, in any state, and the token is a plain one)
    stops the installer with a message to ask for a token made with `--for HOST`. If the reply is lost, repeat the call with the same key and CSR: within
    10 minutes the hub returns the same certificate.
-5. **Test call.** `GET /v1/policy` on the fleet port (8443) with the new certificate and key.
+5. **Test call.** `GET /v1/policy` on the fleet port (8443) with the new certificate and key. With the hub's
+   `--clients-only` the address filter is filled by a root oneshot a moment after enrollment, so the call is retried
+   for up to 30 s (every 2 s) before the enrollment is aborted as below.
 6. **Commit (root).** Before writing, root validates the reply: `host_uuid` must round-trip through `uuid.UUID`
    to canonical lower-case form; `hub_addresses` is a list of bare IP literals (hub Appendix A) and the
    fleet port is the separate integer field `port`. Each address must be accepted by `ipaddress`, not loopback, link-local
@@ -1472,17 +1485,25 @@ and uninstall plus reinstall (uninstall keeps it unless `--purge`). When an enro
 different UUID, the agent rewrites `host-id` from the reply and sends the queued spool unchanged (event ids have no
 host part, Appendix B; the hub takes the host from the certificate). Because the hub refuses to give a
 known UUID to a plain token, a **reinstall or re-enrollment of a known host needs a token made with `--for HOST`**.
+- **Off DigitalOcean** (the mock, a VM) there is no metadata service, and `droplet_id` stays required and non-null. The
+  installer then takes `--droplet-id ID` (§7), accepted **only when the metadata service does not answer** at install
+  time; if it does answer, `--droplet-id` is refused (exit 3). The id is stored beside `host-id`, and
+  `edr-droplet-id.service` writes that stored value when the metadata service does not answer. There is no null case.
 - **Bound to the droplet.** The installer stores the DigitalOcean droplet id (`/metadata/v1/id` on
-  169.254.169.254) beside `host-id`. An `ExecStartPre=+` step of `edr-agent.service` (root, 2 s timeout) reads it
-  again at every start into `/run/edr-agent/`, so the sandboxed agent needs no metadata access. The agent sends
-  it with enrollment and every heartbeat.
+  169.254.169.254) beside `host-id`. A separate root oneshot, `edr-droplet-id.service` (`Before=edr-agent.service`,
+  `IPAddressDeny=any`, `IPAddressAllow=169.254.169.254`, 2 s timeout, `LogNamespace=edr`), reads it again at every boot
+  and at every start of the agent, and writes `/run/edr-droplet-id` (`root:edr-agent`, mode 0640). `edr-agent.service` is
+  ordered `After=` it, so the sandboxed agent never gets metadata access and keeps `IPAddressAllow=<hub IPs>` only. An
+  `ExecStartPre=+` metadata line in the agent unit is not used: `+` lifts the namespace and privilege sandbox but the
+  command still runs in the unit's cgroup, so its IP filter would drop the request (confirm in the VM, §11 L3). The
+  agent sends the id with enrollment and every heartbeat.
 - **A clone** (snapshot or copied image: same `host-id`, key and certificate, new droplet id) stops using the old
   certificate, keeps spooling, logs `host identity changed, re-enrol with a new token`, and raises
   `health.identity` locally. A plain token then mints a new UUID for the clone. The old row stays on the hub
   (HIGH "possible clone"); the operator retires it (`edr-hub host OLD retire`) only if the original droplet is
   gone. The client deletes its stale `host-id`, so the new enrollment sends no UUID hint, and writes the new one from the
   reply.
-- **Unreachable metadata fails open:** the old identity stays. A droplet rebuilt or restored in place keeps its
+- **Unreachable metadata fails open:** the oneshot leaves the old `/run/edr-droplet-id` (or none) and the old identity stays. A droplet rebuilt or restored in place keeps its
   id and so its identity. The hub alerts when one certificate reports two droplet ids (hub §2).
 
 ### 4.7 Local alerts and local response
@@ -1680,7 +1701,9 @@ treats any manifest as untrusted input and keeps three limits in the script itse
   named files in steps 3 to 9 (sysctl, modprobe, resolved, apt hook, needrestart, MOTD and journald files); any other
   entry is refused.
 - **Packages:** purged only if the name is in the script's built-in list (`suricata`, `suricata-update`,
-  `dnscrypt-proxy`, and Tetragon's deb if used) **and** the manifest marks it as the kit's.
+  `dnscrypt-proxy`, `nftables`, and Tetragon's deb if used) **and** the manifest marks it as the kit's ("installed by
+  the kit", the same mark rollback uses, §7). `nftables` stays when it was already there; when the kit installed it, it is
+  purged only after the kit's tables are gone (steps 2 and 3).
 - **Prior values:** restored only for a built-in key list (`nf_conntrack_max`, `nf_conntrack_acct`, the resolved
   drop-in state), each checked as an integer or enum.
 
@@ -1704,7 +1727,7 @@ manifest to a root-only directory under `/run` and runs from there; the director
    history; `host-id` stays so a reinstall with a `--for HOST` token continues it (§4.6).
 5. Stop and remove `edr-agent`, `edr-notify` (with `edr-notify.path`), `edr-bans`, `edr-inventory`, `edr-diskguard`
    (with the kit's `/etc/edr-agent/logrotate.conf` and its state file), `edr-policy-check`, `edr-dns-watch`,
-   `edr-home-net` and the auto-restart path unit, with their timers and the boot unit of the DNS lock; the `zz-edr-inventory` apt hook,
+   `edr-home-net`, `edr-droplet-id` and the auto-restart path unit, with their timers and the boot unit of the DNS lock; the `zz-edr-inventory` apt hook,
    `/etc/needrestart/conf.d/50-edr.conf`, `/etc/update-motd.d/90-edr`, `/etc/systemd/journald@edr.conf` and the `edr`
    journal namespace (its data too, unless `--keep-logs`). The main journald is not touched.
 6. **Kernel settings:** remove the conntrack sysctl drop-in and, **only if the kit changed them**, write the recorded
@@ -1714,11 +1737,11 @@ manifest to a root-only directory under `/run` and runs from there; the director
 7. **Tetragon:** `tetragon/local_uninstall.sh` (`--purge` unless `--keep-logs`), then the `edr-canary` policy and
    `/usr/libexec/edr/`. Enforcement ends here, after DNS and bans are restored.
 8. **Suricata:** stop, purge if the kit installed it, remove its rules, cache, `home-net.extra`, the update units and
-   `files/suricata.apt-pin`. Remove the OISF PPA **only if this kit added it**. A package the operator had stays.
+   `files/suricata.apt-pin`. Remove the OISF PPA **only if this kit added it**. A package the operator had stays. Then purge `nftables` if the manifest marks it as the kit's (Packages, above).
 9. Remove `/usr/local/lib/edr-agent` and `/usr/local/lib/edr-agent.prev`, the `/usr/local/sbin` links, `/etc/edr-agent`
    (`local.conf` kept with `--keep-config`), `/var/lib/edr-agent` **except `host-id`** (removed with `--purge`),
    `/var/lib/edr-bans`, `-inventory`, `-restart`, `-diskguard`, `-notify`, `/var/lib/edr-install`, every `/run/edr-*`
-   directory (`/etc/edr-agent` takes `pause.json` with it), and last the users `edr-agent` and `edr-notify`
+   directory and `/run/edr-droplet-id` (`/etc/edr-agent` takes `pause.json` with it), and last the users `edr-agent` and `edr-notify`
    (`/var/log/tetragon` is group `edr-agent` until step 7 has run).
 10. **Swap:** if the manifest says the kit made `/swapfile-edr`, `swapoff` it, remove its fstab line, delete the file.
 11. **Final check:** no `edr`, `edr_dns` or `edr_isolate` table; no `edr-*` unit or kit drop-in or swapfile left; DNS resolves; sshd
@@ -1760,13 +1783,14 @@ SHA-256 go in the manifest and the heartbeat; the hub holds the known hashes (hu
 
 The install command is always run from the unpacked, hash-checked tarball, for example
 `sudo ./install.sh --hub 203.0.113.5:8443 --token-file /root/edr.token` (the hub prints the same form).
+Make the token with `--ttl 1h` for a manual first install that waits for `--confirm` (the 15-minute default can run out before step 11, §4.6); `token create` prints that hint.
 
     sudo ./install.sh --plan  [flags]                   # read-only: pre-flight and everything that would change
     sudo ./install.sh [--hub IP:PORT --token-file PATH | --token - ]  [--yes]
         [--admin-ip CIDR ...] [--lite] [--no-dns-lockdown] [--no-sctp-block] [--bigconn-cap SIZE]
         [--webroot PATH ...] [--allow-egress-port N ...] [--enforce | --observe-only] [--enroll-port N]
         [--home-net CIDR ...] [--resolve-check NAME ...] [--vpc-dns auto] [--swapfile SIZE] [--no-web]
-        [--no-tetragon] [--no-suricata] [--no-kernel] [--force]
+        [--no-tetragon] [--no-suricata] [--no-kernel] [--droplet-id ID] [--force]
     sudo /usr/local/lib/edr-agent/install.sh --confirm | --rollback | --plan    # session control (below)
 
 - **`--plan` is the documented first command on production.** It runs pre-flight, then prints every file, unit,
@@ -1779,11 +1803,15 @@ The install command is always run from the unpacked, hash-checked tarball, for e
   the VPC range is `[sites] vpc_cidr`, which `edr-agent discover` fills from the VPC interface's connected route and
   the installer asks for when there is none (§4.1). `--bigconn-cap SIZE` seeds `[bans] bigconn_cap` (default off);
   the watch threshold `bigconn_bytes` is set only in `local.conf` (§4.2). `--no-web` is for a host with no nginx (the
-  hub's own droplet): nginx policies, web checks and web-sourced bans are off, and the canaries run as `nobody` (§4.3). `--no-kernel` skips sysctl, `modprobe` and conntrack,
-  and is for the mock; `--no-tetragon`, `--no-suricata` likewise. `--no-web`, `--no-kernel`, `--no-tetragon` and `--no-suricata` each write `off` to their `[kit]` key (§14; `--no-dns-lockdown` writes `[dns] lockdown = off` and `--no-sctp-block` writes `[kernel] sctp_block = off`),
+  hub's own droplet): nginx policies, web checks and web-sourced bans are off, and the canaries run as `nobody` (§4.3). `--no-kernel` skips **every kernel-wide step**: module load and
+  unload (`modprobe`, `modprobe -r sctp`), the live SCTP block, **all** sysctls (the network ones included), conntrack
+  sizing and accounting (`nf_conntrack_max`, `nf_conntrack_acct`) and BPF. Nothing the mock runs may write to the host kernel. The
+  `modprobe.d` file is still written and its parse checked, since it is a file and not a kernel change. It is for the mock; `--no-tetragon`, `--no-suricata` likewise. `--no-web`, `--no-kernel`, `--no-tetragon` and `--no-suricata` each write `off` to their `[kit]` key (§14; `--no-dns-lockdown` writes `[dns] lockdown = off` and `--no-sctp-block` writes `[kernel] sctp_block = off`),
   so a re-run and `check.sh` know the host was installed without that part. `--force` allows installing an older
   `VERSION` over a newer one (§15). `--swapfile SIZE` is opt-in; no swap is created
-  otherwise. The token never goes on the command line (§4.6); it is read before the hand-off below and deleted after use.
+  otherwise. `--droplet-id ID` is for hosts that are not DigitalOcean droplets (the mock, a VM): it supplies the
+  required `droplet_id` (§4.6) and is accepted only when the metadata service does not answer at install time; when
+  it does, the installer refuses (exit 3). The token never goes on the command line (§4.6); it is read before the hand-off below and deleted after use.
 - A flag given on a re-run for a key already set is ignored and said so ("kept enforce = ...; edit `local.conf`,
   then `edr-agent apply-config`").
 - **Phases.** The steps and the §8 blocks carry the phase that ships them (§10). An install built from an earlier phase
@@ -1815,6 +1843,8 @@ The install command is always run from the unpacked, hash-checked tarball, for e
 | Hub reachable but the CA SHA-256 it serves differs from the token's (P2) | refuse (wrong hub or token) |
 | Host clock more than 60 s from the hub's `Date` (P2) | WARN |
 | Rule sources and the PPA reachable (§4.1, P1b) | WARN only |
+| `--droplet-id ID` given while the metadata service answers (169.254.169.254) | refuse (exit 3) |
+| `--hub` given, the metadata service does not answer and no `--droplet-id` (P2) | refuse (exit 3): `droplet_id` is required |
 | Token: format only (P2). An open 8444 proves some token is pending, not that this one is valid; step 11 proves that | note |
 
 **Safe apply over SSH.** A dropped session must not leave the box half changed.
@@ -1854,11 +1884,11 @@ The install command is always run from the unpacked, hash-checked tarball, for e
 | 2 | P1a | **Stage.** Copy the tree, create the users `edr-agent` and `edr-notify`, start the manifest, seed `local.conf` (a commented reference of every key, plus flag and `edr-agent discover` values), previous version to `edr-agent.prev`; opt-in `--swapfile`: create `/swapfile-edr` (0600), `swapon`, one fstab line, both recorded in the manifest | remove from manifest; `swapoff`, delete the file and its fstab line |
 | 3 | P1a; P1b packages | **Packages.** `python3`, `openssl` (P1a); OISF PPA and pin, `suricata`, `nftables`, `dnscrypt-proxy` (P1b); `apt-get -o DPkg::Lock::Timeout=300`; `apt-get update` in a bounded loop (10 x 30 s), since that lock is not covered; a `policy-rc.d` written only if none exists, answering 101 for `suricata` and `dnscrypt-proxy` (it checks `$1`) and 0 for everything else, removed by a trap on every exit and by `--rollback`; `check.sh` WARNs if it is left behind (§8) | purge packages marked "by the kit" |
 | 4 | P1b | **Suricata** (§4.1): candidate yaml, `suricata-update`, `suricata -T` under `systemd-run -p MemoryMax=900M` and the memory guard, unit drop-in with the limits, `edr-home-net`; then start, already tuned | discard candidate; remove drop-in |
-| 5 | P1b | **nftables** (§4.2): conntrack sizing, `inet edr`, `edr-bans` units | delete table; restore sysctl |
-| 6 | P1a | **Kernel** (NGINX2Root): `edr-sctp-block.conf`; `modprobe -r sctp` only if loaded with no users; WARN if `CONFIG_IP_SCTP=y` | remove file |
+| 5 | P1b | **nftables** (§4.2): conntrack sizing (not under `--no-kernel`), `inet edr`, `edr-bans` units | delete table; restore sysctl |
+| 6 | P1a | **Kernel** (NGINX2Root): `edr-sctp-block.conf` (written, and its parse checked, even with `--no-kernel`); `modprobe -r sctp` only if loaded with no users and not under `--no-kernel`; WARN if `CONFIG_IP_SCTP=y` | remove file |
 | 7 | P1a | **Tetragon** (§4.3): `local_install.sh` with the change table there, `--no-viewer`, no boot gate; every policy installed in **monitor**; log group and mode; the canary binary `/usr/libexec/edr/canary` and the `edr-canary` policy; `edr-policy-check` (§4.3), which promotes `sctp-socket` after its canary and `nginx-exec` after its 24 h gate, within the `[tetragon] enforce` list (§4.3), and the install does not wait for either | `local_uninstall.sh` |
 | 8 | P1b | **DNS** (§4.4): config check, proxy, resolved drop-in, lookup test, then the lock and `edr-dns-watch` | delete lock, drop-ins, restart resolved |
-| 9 | P1a; P1b parts | **Agent, inventory, local alerts:** units, `zz-edr-inventory` hook, `/etc/needrestart/conf.d/50-edr.conf` (adds keys for `^tetragon`, `^edr-`, `^dnscrypt-proxy`; never reassigns the hash), `edr-diskguard` (service and timer, `OnBootSec=1min` and `OnUnitActiveSec=2min`; runs the kit's `/etc/edr-agent/logrotate.conf`, Suricata paths P1b, §9), `edr-notify` units (P1b, off until `notify.url` exists), journal namespace `edr`, MOTD line; start the agent (§4.5, §4.7) | remove units and files |
+| 9 | P1a; P1b parts | **Agent, inventory, local alerts:** units (P2: `edr-droplet-id.service`, §4.6), `zz-edr-inventory` hook, `/etc/needrestart/conf.d/50-edr.conf` (adds keys for `^tetragon`, `^edr-`, `^dnscrypt-proxy`; never reassigns the hash), `edr-diskguard` (service and timer, `OnBootSec=1min` and `OnUnitActiveSec=2min`; runs the kit's `/etc/edr-agent/logrotate.conf`, Suricata paths P1b, §9), `edr-notify` units (P1b, off until `notify.url` exists), journal namespace `edr`, MOTD line; start the agent (§4.5, §4.7) | remove units and files |
 | 10 | P1a | **Health and confirm:** `check.sh`, then wait for `--confirm` (or the `--yes` self-confirm); disarm the rollback timer | none |
 | 11 | P2 | **Enroll** (§4.6), last: after the host is proven good, so a bad token never costs the install | local mode, exit 5 |
 
@@ -1880,7 +1910,7 @@ or resume. Files the operator edited (hash differs from the manifest) are left a
     ├── PLAN.md  VERSION  MANIFEST.sha256     (VERSION and MANIFEST.sha256 come from make dist)
     ├── install.sh  uninstall.sh  check.sh    §7, §6, §8 (`rehome` is `edr-agent rehome`, §5)
     ├── agent/edr-agent.py                    stdlib only; the helpers (edr-bans, edr-inventory, edr-diskguard,
-    │                                         edr-dns-watch, edr-home-net, edr-policy-check, edr-notify) beside it
+    │                                         edr-dns-watch, edr-home-net, edr-policy-check, edr-droplet-id, edr-notify) beside it
     ├── files/                suricata-server.yaml and unit drop-in, update job, logrotate, nft file, units and timers,
     │                         sctp, conntrack, dnscrypt-proxy toml (per series) and drop-in, resolved drop-in,
     │                         `inet edr_dns` file, needrestart, apt hook, MOTD, defaults.conf, tripwires.json
@@ -1894,7 +1924,7 @@ or resume. Files the operator edited (hash differs from the manifest) are left a
       the resolved drop-in zz-edr-doh.conf and the conntrack sysctl drop-in
       /var/lib/edr-agent/{manifest.json,identity,spool,cursors,host-id,alerts.jsonl,seen.json}
       /var/lib/edr-{bans,inventory,restart,diskguard,install,notify}
-      /run/edr-{agent,bans,inventory,diskguard,policy-check,dns-watch}
+      /run/edr-{agent,bans,inventory,diskguard,policy-check,dns-watch}, /run/edr-droplet-id (a file)
 
 ---
 
@@ -1938,7 +1968,7 @@ are all expected. `edr-canary` is not paused and is still checked, and `--live` 
   `tetragon/check.sh`); the gate reason for any policy kept in monitor; `/run/edr-policy-check/status.json` under 5 minutes old (the helper
   runs every 2 minutes, §4.3) and free of `enforcement_gone`.
 - `/var/log/tetragon/tetragon.log` is `edr-agent:640`; **FAIL** on a Tetragon listener on a non-loopback address; no
-  `@HOME@` left in a rendered policy; WARN when the `KERNELMEMORY` sum is over 150 MB on `--lite`.
+  `@HOME@` left in a rendered policy; WARN when the `KERNELMEMORY` sum is over 160 MB on `--lite`.
 - Coverage drift (P1b): `uncovered_webroots`, `uncovered_fpm_binaries`, `uncovered_pool_users` (WARN; skipped in a P1a install).
 
 **DNS (§4.4)** (P1b)
@@ -1953,7 +1983,7 @@ are all expected. `edr-canary` is not paused and is still checked, and `--live` 
 
 **Agent and local alerts (§4.5, §4.7)** (P1a; hub checks P2)
 - Running; sandbox self-test passed; spool size; no `gap` or `spool_dropped` in 24 h (WARN); `inventory.json` under
-  2 h old; certificate expiry (P2; WARN at 30, 14 and 7 days, FAIL when expired); any CRITICAL in `alerts.jsonl` in 24 h (WARN).
+  2 h old; certificate expiry (P2; WARN at 30, 14 and 7 days, FAIL when expired); any CRITICAL in `alerts.jsonl` in 24 h (WARN); when enrolled, `/run/edr-droplet-id` present, non-empty and `root:edr-agent 0640` (P2; WARN otherwise: clone detection is blind without it, §4.6).
 - **Heartbeat:** last accepted one over 5 minutes old is a **FAIL**, over 2 minutes a WARN (the hub calls a host "late"
   at 4 minutes and HIGH at 5; heartbeat every 60 s; hub §4). In local mode "n/a": the last event processed is used.
   Hub unreachable is a separate WARN; 403 `host_orphan` is a WARN "adopt me on the hub"; any other 403 (revoked, moved, retired, unknown) FAILs with the `code`; 426, 422 `schema_too_old` and a
@@ -1984,8 +2014,13 @@ are all expected. `edr-canary` is not paused and is still checked, and `--live` 
 4. Nothing fires on the root helpers (§4.5.1).
 The `edr-canary` kill and the daily `canary.policy_check` are INFO, so they do not reach `alerts.jsonl` (§4.7). The
 SCTP canaries raise the normal `tetragon.sctp-socket` event, which is rated as in §17 and can reach `alerts.jsonl` and
-`edr-notify`; `--live` prints that before it runs them and skips them when `edr-notify` is configured unless `--yes` is
-given. Each event must appear in the agent's journal
+`edr-notify`. There is **no test marker**: an event field saying "this is only a test" could be set by an intruder, so the
+canary is an ordinary CRITICAL event. On an enrolled enforcing host `check.sh --live` and the post-upgrade self-test
+therefore **page the hub** (every channel, as the NGINX2Root root step; with a prior crash or bigconn signal it can also
+complete the hub's "Attempt contained" chain, hub §4). The operator opens a maintenance window for the host first
+(`edr-hub host HOST maintenance --for 30m`, hub §4 Maintenance windows), so the page is expected and the incident shows
+the window. `--live` prints this warning before it runs the canaries and skips them when `edr-notify` is configured or the
+host is enrolled unless `--yes` is given. Each event must appear in the agent's journal
 (`journalctl --namespace=edr`) within 10 s and, when enrolled, the hub within 2 minutes (batches leave every 5 s;
 the margin covers one failed attempt). The `edr-canary` events never page.
 
@@ -2057,7 +2092,7 @@ expected user, deletes by `unlinkat` on a directory descriptor and never follows
   old. Chaos test: fill the disk to 95% (§11).
 
 **Journal.** The kit sets no system-wide journal cap, so sshd, kernel and auth history keep Ubuntu's default. Its own units (`edr-agent`,
-`edr-bans`, `edr-inventory`, `edr-diskguard`, `edr-dns-watch`, `edr-home-net`, `edr-notify`, `edr-policy-check`) set
+`edr-bans`, `edr-inventory`, `edr-diskguard`, `edr-dns-watch`, `edr-home-net`, `edr-notify`, `edr-policy-check`, `edr-droplet-id`) set
 `LogNamespace=edr`, with `/etc/systemd/journald@edr.conf` (`SystemMaxUse=150M`, `RuntimeMaxUse=50M`). Read it with
 `journalctl --namespace=edr`. Kernel and audit lines (`edr-bigconn:`, `edr-dnslock:`, `edr-egress:`) stay in the default
 journal only, and so do Suricata, Tetragon and dnscrypt-proxy (packaged units, own files). Uninstall removes the file.
@@ -2068,14 +2103,14 @@ Confirm in the VM that the agent's `BindReadOnlyPaths` reach the namespace store
 | Suricata | ~400 MB at ~41k rules (estimate), `--lite` smaller; unit limits in §4.1 |
 | Suricata **reload peak** | ~800 MB total (estimate, never measured); update handling in §4.1 |
 | Tetragon | User space 100-150 MB (laptop: 140 MB RSS, 375 MB cgroup peak, 7 policies); `OOMScoreAdjust=700` |
-| Tetragon **kernel memory** | ~145-155 MB locked, not counted in the cgroup (estimate; `bpftool map show`): 8 `rateLimit` policies x 9.7 MB = 78, `execve_map` ~32, about 17 other policies at 2-2.5 MB each. Tune `--execve-map-entries` on `--lite`; `check.sh` WARNs above 150 MB on `--lite` (§4.3) |
+| Tetragon **kernel memory** | ~155-165 MB locked, not counted in the cgroup (estimate; `bpftool map show`): 9 `rateLimit` policies x 9.7 MB = 87, `execve_map` ~32, about 17 other policies at 2-2.5 MB each. Tune `--execve-map-entries` on `--lite`; `check.sh` WARNs above 160 MB on `--lite` (§4.3) |
 | `edr-agent` | `MemoryHigh=96M`, `MemoryMax=128M`, `CPUQuota=10%`; ~30 MB and under 1% CPU expected, plus the access ring (10-20 MB, estimate) |
 | `edr-bans` | Idle most of the time; `MemoryMax=1G` (starting value, set after the VM test measures an apply at 200k entries; ~3 s, 0.3-0.8 GB estimated), ~30 MB of kernel memory for the sets (§4.2) |
 | conntrack | Up to ~67 MB at `nf_conntrack_max=262144`, only if the kit loaded the module (§4.2) |
 | `edr-inventory`, `edr-notify`, dnscrypt-proxy | `MemoryMax` 128M, 64M and 96M; dnscrypt-proxy uses ~20 MB. Oneshots run at idle priority |
-| `edr-diskguard`, `edr-dns-watch`, `edr-home-net`, `edr-policy-check` | `MemoryMax=64M` each (starting value; measure), idle priority |
+| `edr-diskguard`, `edr-dns-watch`, `edr-home-net`, `edr-policy-check`, `edr-droplet-id` | `MemoryMax=64M` each (starting value; measure), idle priority |
 
-**Minimum droplet.** Steady state is about 0.8 GB for the kit (Suricata ~400 MB, Tetragon ~250-300 MB with kernel
+**Minimum droplet.** Steady state is about 0.8 GB for the kit (Suricata ~400 MB, Tetragon ~260-310 MB with kernel
 memory, the rest ~100 MB) and the reload peak adds ~400 MB. **2 GB** is a floor for a light site, not a comfortable
 size; **4 GB** is the recommendation with MySQL on the same droplet. **1 GB** runs only with `--lite` or
 `--no-suricata`, unsupported until measured. With swap 0 the installer offers a 1 GB swapfile (opt-in).
@@ -2105,6 +2140,8 @@ A phase starts only when the previous one has met its exit criteria (tiers and c
   `apt full-upgrade` with a new nginx exits 0.
 - Canaries fire (`check.sh --live`); a kernel upgrade without a loadable policy raises HIGH `health.enforcement_gone`
   in `alerts.jsonl` within 5 minutes (§4.3, §11).
+- An install nobody confirms rolls back by itself and exits 4: the timed rollback and `--confirm` ship in P1a
+  (§7, step 10), so their test gates P1a (§11).
 - Agent under 1% CPU and 128 MB over 24 h. Seven days on a real droplet with no legitimate process killed.
 
 **P1b, network side (no hub, useful alone). Ships**
@@ -2126,8 +2163,7 @@ A phase starts only when the previous one has met its exit criteria (tiers and c
   Suricata exits 0.
 - 24 h on a real droplet with nginx p99 latency within 5% of the no-kit baseline; NIC offload flags unchanged after
   `kill -9` of Suricata; ban ladder and never-ban refusal tested (§11); a `>4 GiB` transfer produces `edr-bigconn:`.
-- Install over SSH with a deliberately failing last step keeps the session alive and the state accurate; an install
-  nobody confirms rolls back and exits 4 (§7).
+- Install over SSH with a deliberately failing last step keeps the session alive and the state accurate (§7).
 - DoH lock: DoH blocked for 10 minutes, lookups recover within 90 s, the lock re-arms itself, the site's own names
   resolve with the lock on.
 
@@ -2141,19 +2177,21 @@ A phase starts only when the previous one has met its exit criteria (tiers and c
 
 **P2 exit**
 - A canary event reaches the hub within 2 minutes; a revoked certificate is refused; a 60-minute hub outage loses no
-  HIGH or CRITICAL event (spool at most 50 MB, delivered within 5 minutes after); the previous agent version works
-  against the new hub; `rehome` survives a kill at each step and works onto a restored hub; the restore drill works onto a second hub (hub §12).
+  HIGH or CRITICAL event (spool at most 50 MB, delivered within 5 minutes after); from the second release, the previous agent version works
+  against the new hub (at the first, unit tests cover a synthetic N-1 event schema and `X-EDR-Proto: 0` answered 426, hub §11); `rehome` survives a kill at each step and works onto a restored hub; the restore drill works onto a second hub (hub §12).
 - `web-exec` enforces only after `learn --accept` and no new tuple for 72 h.
 
 **P3, with fleet bans. Ships**
 - Fleet bans and feed sets applied from the hub (guards in §4.2), with the hub's ban commands and Bans page (hub §5,
-  §6); `isolate`, `maintenance`, opt-in nginx restart;
+  §6); `isolate`, `maintenance`, opt-in nginx restart; the DoH lock (§4.4), if it was moved out of P1b;
   webroot integrity (§4.5.1); `log-tamper` and `link-sensitive` policies, decoy credential files with their Tetragon read-watch (§4.3, §4.7), `Override` hardening after a canary proves
   `EPERM`; DNS telemetry; the context pack; JSONL export from the hub.
 
 **P3 exit**
 - A two-host fleet-ban round trip under 2 minutes; the restore drill is repeated on the operator's own schedule (hub §15); feed carving and the 5%
-  refusal tested; `fleet_ban_mode` has run in dry-run for a week.
+  refusal tested; `fleet_ban_mode` has run in dry-run for a week. If the DoH lock moved out of P1b, its P1b criterion
+  (DoH blocked for 10 minutes, lookups recover within 90 s, the lock re-arms itself, the site's own names resolve with
+  the lock on) is also a P3 exit criterion.
 
 **P4. Ships** Laravel log counters (`laravel_log`, counters only) and credential-stuffing counters (§4.5); ATT&CK
 technique ids on the hub's rules (hub §4); the hub's read-only view of each client's local settings (the
@@ -2212,7 +2250,7 @@ installers run only in the mock (with those flags) or a VM, never on a developer
 | **L0** `make lint`, `make unit` | No root, seconds | Syntax, units, policy limits, parsers on forged lines, validators, limits | Kernel, firewall, load |
 | **L1** `sudo make test` | Real root, `unshare -n` | Generated nft rules load and behave; uninstall leaves no table | Log lines (none from a netns, tested); Tetragon |
 | **L2** mock | Rootless Docker | Installs, enroll, spool, `rehome`, restore drill, bans from an attacker box; web and hub images, on 26.04 only today (a 24.04 variant through the `UBUNTU_TAG` and PHP version build args is planned), each running the enroll and mTLS round trip | Anything kernel-level: it shares the host kernel |
-| **L3** VM matrix | VMs, before a release | Tetragon kills, SCTP block, kernel log lines, conntrack, performance, chaos | Hardware differences |
+| **L3** VM matrix | VMs, before a release | Tetragon kills, SCTP block, every sysctl, conntrack sizing and accounting, kernel log lines, conntrack, performance, chaos | Hardware differences |
 
 - **L0 unit tests.** Forged lines per source: a user name holding ` from 198.51.100.8 port 1 ssh2`, a fake `, client: `
   trailer, a request cutting the real trailer at 2048 bytes, an access line not starting with `$remote_addr`, lines over
@@ -2227,15 +2265,17 @@ installers run only in the mock (with those flags) or a VM, never on a developer
   bans trip the 20-new-bans breaker; `ufw reload` as well as `systemctl reload nftables` brings `inet edr` back within
   60 s. `setpriv --reuid nobody --regid nogroup --clear-groups nft -c -f FILE` fails ("Operation not permitted"), and `unshare -rn` fails
   under `kernel.apparmor_restrict_unprivileged_userns=1`, so it runs as real root.
-- **L2 limits.** In the mock: nginx, php-fpm, units, nft sets and apply, `inet edr_dns` logic, `bigconn` **counting**,
-  agent and hub, uninstall, and mTLS and `rehome` once the mock's planned additions exist; sysctls and conntrack only if `/proc/sys` is writable (probe, fail loudly).
+- **L2 limits.** In the mock: nginx, php-fpm, units, nft sets and apply, `inet edr_dns` logic,
+  agent and hub, uninstall, and mTLS and `rehome` once the mock's planned additions exist; `bigconn` **counting** on recorded counters only. The mock always runs with `--no-kernel`, so
+  nothing in it writes to the host kernel: sysctls, conntrack sizing and `nf_conntrack_acct` (and with them real `bigconn` byte counting) are tested at L3 only.
   **Not** in the mock: the `edr-bigconn:` and `edr-dnslock:` **log lines**, Tetragon, the SCTP block, `IPAddressDeny` and
   `MemoryMax` unless the box shows them enforced, the kernel clock. So the kernel-journal reader takes
   `--kernel-log journal|FILE|FIFO` and the mock feeds it recorded lines; recorded Tetragon JSON is replayed likewise.
-  The mock is to refuse rootful Docker without `MOCK_ALLOW_ROOTFUL=1` and to gain an `attacker` box, a second hub and a lab app (planned; see mock/README.md).
+  The mock refuses rootful Docker without `MOCK_ALLOW_ROOTFUL=1`; it is to gain an `attacker` box, a second hub and a lab app (planned; see mock/README.md).
 - **L3.** 24.04 GA kernel (6.8), 24.04 HWE (7.0), 26.04, and the kernel flavour DigitalOcean ships (confirm). First run
   4 GB (the full ruleset needs over 1 GB), then 2 GB to measure. **Manual** until multipass or qemu scripts are proven
   (`tests/vm-smoke.sh` is unproven and the VM tooling is not yet chosen (multipass or qemu); L3 stays manual until it is). Also the "confirm in the VM" items of §4 to §9
+  (among them: the old `ExecStartPre=+` metadata form of the agent unit is blocked by the unit's `IPAddressDeny=any`, so `edr-droplet-id.service` is needed, §4.6)
   and a >4 GiB single-connection transfer (or a test-only lower threshold) that must show `edr-bigconn:` on the hub.
 - **The enforcement canary** (§4.3, §8): `/usr/libexec/edr/canary` run as the web user (`nobody` with `--no-web`) under policy `edr-canary` must die
   by SIGKILL and raise an event on each kernel in the matrix; `check.sh --live` and the post-upgrade self-test run the
@@ -2259,15 +2299,16 @@ The idle kit must reach 95% of it. **Each fault gates the phase named in its col
 | `apt full-upgrade` with a new Suricata | P1b | As above |
 | DoH blocked 10 min | P1b | Lookups recover within 90 s; the lock re-arms itself (6 good probes, open at least 5 min) |
 | Kernel upgrade without a loadable policy | P1a | HIGH `health.enforcement_gone` in `alerts.jsonl` within 5 min (§4.3) |
-| Over-SSH install with a failing last step; an install nobody confirms | P1b | Session alive, state accurate; the unconfirmed install rolls back and exits 4 (§7) |
+| An install nobody confirms | P1a | The timer fires, the install rolls back and exits 4 (§7) |
+| Over-SSH install with a failing last step | P1b | Session alive, state accurate (§7) |
 | Hub blocked 60 min under a ~50 events/s scan | P2 | Spool at most 50 MB, agent under 10% CPU, CRITICAL kept, delivered within 5 min |
 
 Manual or nightly, **not gates:** memory squeeze (`stress-ng` to 90% plus the update timer: the OOM victim must be a
 kit process, never `mysqld`, php-fpm, nginx or `sshd`), SYN flood at 5,000/s, nginx USR2 upgrade (master not killed).
 
 **Upgrade test (L2, L3).** Install the previous tag, run the new `install.sh`: `local.conf`, `host-id` and identity
-unchanged, new keys in `defaults.conf`, ban state kept, `install.sh --rollback` restores the old copy (an upgrade uses the same rollback timer and `--confirm` as an install, §7); then an agent built from the previous tag
-(`AGENT_REF`) against the new hub. **Performance gate (L3):** replayed traffic against stored baselines for nginx p99,
+unchanged, new keys in `defaults.conf`, ban state kept, `install.sh --rollback` restores the old copy (an upgrade uses the same rollback timer and `--confirm` as an install, §7); then, from the second release, an agent built from the previous tag
+(`AGENT_REF`) against the new hub (at the first release, the synthetic N-1 tests of hub §12). **Performance gate (L3):** replayed traffic against stored baselines for nginx p99,
 Suricata RSS and drops, eve bytes an hour, agent CPU. **Clock:** `libfaketime` tests renewal at 30 days, the certificate-expiry WARNs of `check.sh` at 30, 14 and 7 days and its FAIL once expired (§8), and skewed
 timestamps. "The site always wins" is proved only by the chaos suite.
 
@@ -2471,7 +2512,7 @@ agent hash the hub does not know is a HIGH alert, so a client upgraded before it
 |-----------|--------------------|--------------------|
 | Tetragon | A kit release changes the version and every checksum together (§4.3); `install.sh` swaps it. The restart emits a blind window and policies reload | `edr-policy-check` and the canary (§8); `install.sh --rollback` restores the previous tree and reinstalls its pin (needs the download; confirm in the VM test) |
 | Suricata | The OISF PPA is not in unattended-upgrades' origins, so it is upgraded by hand: `apt-get install --only-upgrade suricata` in a quiet period | `edr-check` runs `suricata -T` on the kit config through the memory guard; a kept conffile (`--force-confold`) keeps the kit yaml; if the new version rejects it the IDS is down, the site is not, and the unit state shows it. Pin `1:8.*` |
-| Kernel | Ordinary apt, then a **planned reboot**: the agent sends a heartbeat with `shutdown: true` and the hub reads a new `boot_id` as planned (hub §4). Do one host first, and an HWE jump on the canary host | After boot `edr-policy-check` compares loaded policies, runs the canary, and the hub raises "enforcement gone" if a policy is missing. `edr-home-net` and `edr-bans` rebuild from state before traffic |
+| Kernel | Ordinary apt, then a **planned reboot**: the agent sends a heartbeat with `shutdown: true` and the hub reads a new `boot_id` as planned (hub §4). Do one host first, and an HWE jump on the canary host. The post-upgrade self-test's SCTP canaries page the hub like `check.sh --live` (§8): open a hub maintenance window first | After boot `edr-policy-check` compares loaded policies, runs the canary, and the hub raises "enforcement gone" if a policy is missing. `edr-home-net` and `edr-bans` rebuild from state before traffic |
 | dnscrypt-proxy | Package upgrade restarts it (a short stall; the watchdog covers it, §4.4) | `dnscrypt-proxy -check` first; inventory reports an untested version |
 | Ubuntu release | Not supported in place. Uninstall, upgrade the OS, reinstall with a `--for HOST` token (§4.6) | |
 
@@ -2542,7 +2583,7 @@ expired certificate) are hub §15; offboarding has a part on each side.
 
 Expect noise; record what you measure (the figures in §9 are estimates). `nginx-exec` stays in monitor for 24 h and
 `sctp-socket` until its canary has run (§4.3).
-1. **Day 0.** `edr-check --live` passes; `edr-agent status` shows each policy's mode.
+1. **Day 0.** `edr-check --live` passes (on an enrolled host open a hub maintenance window first: the SCTP canaries page, §8); `edr-agent status` shows each policy's mode.
 2. **Suricata.** Count alerts by `alert.signature_id`; disable the irrelevant (`disable.conf`), re-check `drop.conf` (it
    decides which rules may ban, §4.1.1), add `rate_filter` for the noisiest SIDs. Watch `kernel_drops` (under 1%), memcap
    counters, conntrack use and the MPM cache size.
@@ -2611,8 +2652,8 @@ Events spool (50 MB, `hi` lane for HIGH and CRITICAL) and replay at one batch a 
 with `--for HOST` tokens (§5). The spool drop counters show blind spots.
 
 **Kernel upgrade.** Procedure and automatic checks: §15. Keep the old kernel until `edr-check --live` passes and
-`kernel_pending` clears. If a policy will not load, the agent raises HIGH `health.enforcement_gone` locally (the hub
-raises it too): boot the old kernel from GRUB (Recovery Console without SSH) or wait for a Tetragon release; the site is
+`kernel_pending` clears. If a policy will not load, the agent raises HIGH `health.enforcement_gone` locally (the hub's rule
+keys on that event): boot the old kernel from GRUB (Recovery Console without SSH) or wait for a Tetragon release; the site is
 unaffected meanwhile.
 
 ---
@@ -2797,7 +2838,7 @@ The one definition of an event, the severity scale and the kind names (agent: §
 | `context` | array | 4 KiB | Up to 20 redacted access-log entries for `src_ip`, on HIGH and CRITICAL only |
 | `redacted`, `truncated` | bool | | Set when the agent removed or cut something |
 
-**Severity scale** (defined here once; the client assigns it and the hub may re-rate it)
+**Severity scale** (defined here once; the client assigns `sev` and the hub never rewrites it; where a hub rule rates an event differently, the hub's rating is stored beside it, hub §3 and §4)
 
 | Severity | Meaning |
 |----------|---------|
@@ -2827,7 +2868,7 @@ The one definition of an event, the severity scale and the kind names (agent: §
 
 **Who sets what**
 - **Set by the hub** from the client certificate and its own clock, never from the body: the host identity (UUID and
-  name), `received_at`, the clock skew, the corrected `ts`, the `replayed` flag, any re-rating of `sev`, and the
+  name), `received_at`, the clock skew, the corrected `ts`, the `replayed` flag, the hub's own rating (`hub_severity` and the rule that set it) beside the client's unchanged `sev`, and the
   address the connection came from.
 - **Client claims** (everything else): `sev`, `kind`, `src_ip`, `src_trust`, `details`, `proc`, `context`, `count`.
   A compromised client can claim anything, so the hub validates types and limits, escapes every field on display, and

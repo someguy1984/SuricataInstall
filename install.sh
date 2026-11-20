@@ -183,7 +183,8 @@ echo "$(grep -c '^drop ' /var/lib/suricata/rules/suricata.rules) of $(grep -cE '
 
 step "Testing configuration (loads all rules, can take a minute)"
 tdir=$(mktemp -d)
-if ! out=$(suricata -T -c "$CAND" -l "$tdir" 2>&1); then
+# Its own log directory and no command socket: the test engine runs beside the live one
+if ! out=$(suricata -T -c "$CAND" -l "$tdir" --set unix-command.enabled=no 2>&1); then
     echo "Configuration test FAILED:"
     tail -20 <<<"$out"
     exit 1

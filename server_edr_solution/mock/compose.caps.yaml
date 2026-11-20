@@ -1,0 +1,26 @@
+# The boxes without `privileged`: only the capabilities systemd and the installers need, and
+# none that reach the host's kernel modules or clock (no SYS_MODULE, no SYS_TIME).
+#
+#   MOCK_CAPS=1 ./mock.sh up      (mock.sh adds this file to compose.yaml)
+#
+# NOT BOOT-TESTED YET. Whether systemd reaches "running" on Ubuntu 26.04 with this set can only
+# be found out by starting it: run `MOCK_CAPS=1 ./mock.sh up && MOCK_CAPS=1 ./mock.sh test`. If
+# systemd cannot mount what it needs, add under security_opt:  - systempaths=unconfined
+# (acceptable on rootless Docker only). Once it passes, this becomes the default (README,
+# "Planned safety changes").
+
+x-caps: &caps
+  privileged: false
+  cap_add:
+    - SYS_ADMIN
+    - NET_ADMIN
+    - NET_RAW
+    - SYS_PTRACE
+    - DAC_READ_SEARCH
+    - SYSLOG
+
+services:
+  hub:
+    <<: *caps
+  web:
+    <<: *caps
