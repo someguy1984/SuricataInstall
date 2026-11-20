@@ -493,7 +493,7 @@ The hub owns every rating rule and never rewrites what the client sent: the stor
 **Admin actions** are notifications, not detections. They always send as HIGH, bypassing the minimum severity and
 dedup: token created or used, re-enrolment, host revoked or retired, `host adopt`, `agent-hash add`, `reissue-cert`,
 never-ban or settings changed, new dashboard session (with its source), over 5 failed dashboard logins, a ban of /16 or
-wider, and every **root-only file operation**: `ca-export`, `backup` (run by hand), `restore` and any write to `secrets.json`
+wider, and every **root-only file operation**: `ca-export`, `backup` (run by hand, or a second scheduled run within 20 hours), `restore` and any write to `secrets.json`
 (audited through `pending-audit.jsonl`, §5 Audit, so they alert even with the hub stopped, once it starts). A webhook change goes to the
 old channel too. A message never holds a token secret.
 
@@ -635,7 +635,9 @@ origins and "no fix yet". `nginx -v` cannot show a distro fix, because Ubuntu ba
 - **Body.** Severity, host and public IP, kind, one line of meaning, the "next step", the incident id and the exact
   commands (`edr-hub incident 41`, `edr-hub ack 41`, the host command), so a 03:00 alert is actionable from a phone
   over SSH (Termius, Blink) or the DigitalOcean web console; the dashboard is not published for phones. One table
-  in the hub code feeds alerts, runbook and dashboard. No secrets.
+  in the hub code feeds alerts, runbook and dashboard. No secrets. If an operator set a maintenance window for the host
+  on the hub, one more line names the operator and the end time (Maintenance windows); a window the host declared
+  itself is never mentioned.
 - **Escaping.** Every attacker field goes through the hub's sanitiser (same rules as client §4.5), is cut to 200
   characters and put in a code span (backticks replaced), so nothing auto-links or mentions anyone. Then per channel:
 
@@ -685,8 +687,11 @@ alert. A planned reboot needs no window (a shutdown notice plus a new boot id is
 an intruder, so `tetragon.sctp-socket` from the canary is an ordinary CRITICAL event (it can also complete the "Attempt
 contained" chain after a crash or bigconn signal). `check.sh --live` and the post-upgrade self-test on an enforcing,
 enrolled host (client §4.3, §8) therefore page every channel. Open a window first (`host HOST maintenance --for 30m`): it does not
-suppress the page, but the incident and the alert carry "in a maintenance window set by X", so the operator reads it as
-expected. The client prints this warning before it runs the canaries. It raises no fleet ban, because fleet votes count
+suppress the page. The alert body and the incident then carry one line, "maintenance window set on the hub by X until T"
+(Alert delivery, Body), and **only** for a window an operator set on the hub (`set_by` is a CLI or dashboard user).
+Maintenance that a host declares for itself in its heartbeat is never shown on an alert: a compromised host could
+otherwise label its own attack as expected. The client prints this warning before it runs the canaries, and on an
+enrolled host runs them only with `--yes` (client §8). It raises no fleet ban, because fleet votes count
 only `ban.local` events (Fleet bans; §12 L0).
 
 ---
@@ -818,7 +823,10 @@ A local website, installed and running by default, separate from the client inge
   restore that brings back an older `meta` ingests nothing twice. It works with the hub stopped, which `restore`
   requires. Each such row also raises a HIGH notification (the always-send list, §4) when it is ingested; the one
   exception is the daily `edr-hub-backup.timer` job (§8 step 8), which leaves its row but would page every day: a
-  failed or missed one is the backup-age rule (§4). The file is
+  failed or missed one is the backup-age rule (§4). The scheduled run is recognised by where it runs, not by anything
+  on the command line: the CLI finds itself in the cgroup of `edr-hub-backup.service` (`/proc/self/cgroup`) and marks
+  the line `scheduled`; no option sets that. A second scheduled run within 20 hours of the last notifies like a hand-run
+  one, so starting the unit by hand is not a quiet way to take a backup. The file is
   not in a backup (§7); a root attacker can still edit it, as with the chain itself (the off-box copy is the defence).
 - Denied socket commands, bad UI logins and bad enrollment tokens are recorded. Unauthenticated-failure rows
   (`actor_kind = client` with outcome denied or invalid) are one row per source per minute with a count (1000
@@ -1077,7 +1085,7 @@ firewall is the only step that can lock you out, so it comes last (step 10). Exi
    --namespace edr-hub`); the system journal is left alone.
 7. **Dead-man ping** (P2, optional). `edr-hub settings set deadman_url -`; `edr-hub-out` then pings each minute
    (§4). The output says it tells a third party that a hub exists.
-8. **Scheduled backups.** `edr-hub-backup.timer`, daily 02:15 UTC (`Persistent=yes`), runs `edr-hub backup` as root;
+8. **Scheduled backups.** `edr-hub-backup.timer`, daily 02:15 UTC (`Persistent=yes`), runs `edr-hub backup` as root in `edr-hub-backup.service` (which is how the run is known to be the scheduled one, §5 Audit);
    format, passphrase handling and `ca-export` are §7. It keeps `backup_keep` copies (default 14, §14), free space
    checked first. The installer prints the passphrase once (store it off the box) when it generates it; if `/etc/edr-hub/backup.pass` already exists it is kept and not printed again, so old backups still decrypt. It tells you to run
    `edr-hub ca-export`. Pull `/var/backups/edr-hub` to your own machine: no credentials go on the hub. Add a weekly
@@ -1237,7 +1245,7 @@ side:
 | Validators | CIDR and never-ban (minimum prefix, UI ban cap); settings keys and the secrets split: a secret is written by the root CLI straight to `secrets.json`, never over `ctl.sock`, and the settings history records only that it changed |
 | Storage | A duplicate (host, `id`) is `INSERT OR IGNORE` and counted, the host coming from the certificate; skew correction and the 5-minute clamp; replayed events never feed fleet bans; pruning order and HIGH and CRITICAL never pruned; roll-ups sum `count` |
 | Rules and alerts | Every row of the §4 rule tables names a kind or heartbeat key that Appendix A or client Appendix B defines; a rule counts `sum(count)` and distinct certificate CNs; escaping per channel; the sanitiser on hostile fields; a canary never raises a fleet ban; the outbox retries and a failing channel is flagged |
-| Dashboard and CLI | Host and Origin checks, single-use login codes, session expiry, CSP header, terminal-safe output, audit chain `verify`; `pending-audit.jsonl` ingest (hub stopped, a repeated line id, a HIGH notification per root-only file operation) |
+| Dashboard and CLI | Host and Origin checks, single-use login codes, session expiry, CSP header, terminal-safe output, audit chain `verify`; `pending-audit.jsonl` ingest (hub stopped, a repeated line id, a HIGH notification per root-only file operation, none for the first scheduled backup of the day and one for a second within 20 hours) |
 
 ### L1: network namespace (root)
 
@@ -1304,7 +1312,7 @@ Memory and timing figures in §2 were taken on Python 3.14: re-measure on 3.12 (
 | P2 exit, previous protocol | Applies from the second release; at the first, unit tests cover a synthetic N-1 schema and `X-EDR-Proto: 0` answered 426 (§11) |
 | `droplet_id` | Required and non-null in the API; off DigitalOcean the client passes `--droplet-id` (App. A, client §4.6) |
 | Client re-rating | The hub owns the rules and never rewrites `sev`; its rating is stored beside it (§3, §4) |
-| SCTP canary | No test marker: it pages as a CRITICAL event; the operator opens a maintenance window first (§4) |
+| SCTP canary | No test marker: it pages as a CRITICAL event; the operator opens a maintenance window first, and only a window set on the hub is named on the alert (§4) |
 | `--clients-only` and enrollment | `--source` is required while it is on; the range joins the set in the enrollment transaction (§2) |
 | Token lifetime | Default 15 minutes kept; `--ttl 1h` hint for a manual install (§2 Tokens) |
 

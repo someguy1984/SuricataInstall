@@ -1968,7 +1968,7 @@ are all expected. `edr-canary` is not paused and is still checked, and `--live` 
   `tetragon/check.sh`); the gate reason for any policy kept in monitor; `/run/edr-policy-check/status.json` under 5 minutes old (the helper
   runs every 2 minutes, §4.3) and free of `enforcement_gone`.
 - `/var/log/tetragon/tetragon.log` is `edr-agent:640`; **FAIL** on a Tetragon listener on a non-loopback address; no
-  `@HOME@` left in a rendered policy; WARN when the `KERNELMEMORY` sum is over 160 MB on `--lite`.
+  `@HOME@` left in a rendered policy; WARN when the `KERNELMEMORY` sum is over 150 MB on `--lite`.
 - Coverage drift (P1b): `uncovered_webroots`, `uncovered_fpm_binaries`, `uncovered_pool_users` (WARN; skipped in a P1a install).
 
 **DNS (§4.4)** (P1b)
@@ -2017,10 +2017,11 @@ SCTP canaries raise the normal `tetragon.sctp-socket` event, which is rated as i
 `edr-notify`. There is **no test marker**: an event field saying "this is only a test" could be set by an intruder, so the
 canary is an ordinary CRITICAL event. On an enrolled enforcing host `check.sh --live` and the post-upgrade self-test
 therefore **page the hub** (every channel, as the NGINX2Root root step; with a prior crash or bigconn signal it can also
-complete the hub's "Attempt contained" chain, hub §4). The operator opens a maintenance window for the host first
-(`edr-hub host HOST maintenance --for 30m`, hub §4 Maintenance windows), so the page is expected and the incident shows
-the window. `--live` prints this warning before it runs the canaries and skips them when `edr-notify` is configured or the
-host is enrolled unless `--yes` is given. Each event must appear in the agent's journal
+complete the hub's "Attempt contained" chain, hub §4). The operator opens a maintenance window for the host on the hub first
+(`edr-hub host HOST maintenance --for 30m`, hub §4 Maintenance windows): the page still goes out, and the alert names
+the window and who set it. `--live` prints this warning before it runs the canaries. When `edr-notify` is configured or
+the host is enrolled it runs them only with `--yes`; without it they are reported as **WARN "SCTP canaries not run"**,
+never as a pass, so that run ends with exit 1 (§15). The post-upgrade self-test always runs them. Each event must appear in the agent's journal
 (`journalctl --namespace=edr`) within 10 s and, when enrolled, the hub within 2 minutes (batches leave every 5 s;
 the margin covers one failed attempt). The `edr-canary` events never page.
 
@@ -2103,7 +2104,7 @@ Confirm in the VM that the agent's `BindReadOnlyPaths` reach the namespace store
 | Suricata | ~400 MB at ~41k rules (estimate), `--lite` smaller; unit limits in §4.1 |
 | Suricata **reload peak** | ~800 MB total (estimate, never measured); update handling in §4.1 |
 | Tetragon | User space 100-150 MB (laptop: 140 MB RSS, 375 MB cgroup peak, 7 policies); `OOMScoreAdjust=700` |
-| Tetragon **kernel memory** | ~155-165 MB locked, not counted in the cgroup (estimate; `bpftool map show`): 9 `rateLimit` policies x 9.7 MB = 87, `execve_map` ~32, about 17 other policies at 2-2.5 MB each. Tune `--execve-map-entries` on `--lite`; `check.sh` WARNs above 160 MB on `--lite` (§4.3) |
+| Tetragon **kernel memory** | ~153-162 MB locked, not counted in the cgroup (estimate; `bpftool map show`): 9 `rateLimit` policies x 9.7 MB = 87, `execve_map` ~32, about 17 other policies at 2-2.5 MB each. `check.sh` WARNs above 150 MB on `--lite` (§4.3): the budget of a 1 GB host, which the full set is over until `--execve-map-entries` is tuned down |
 | `edr-agent` | `MemoryHigh=96M`, `MemoryMax=128M`, `CPUQuota=10%`; ~30 MB and under 1% CPU expected, plus the access ring (10-20 MB, estimate) |
 | `edr-bans` | Idle most of the time; `MemoryMax=1G` (starting value, set after the VM test measures an apply at 200k entries; ~3 s, 0.3-0.8 GB estimated), ~30 MB of kernel memory for the sets (§4.2) |
 | conntrack | Up to ~67 MB at `nf_conntrack_max=262144`, only if the kit loaded the module (§4.2) |
@@ -2138,7 +2139,7 @@ A phase starts only when the previous one has met its exit criteria (tiers and c
 - Core chaos set (§11) passes: `nginx` answers 200 while Tetragon, the agent and the inventory are killed in turn;
   disk at 95%; three reboots, after each of which the Tetragon policies and the agent are back within 60 s;
   `apt full-upgrade` with a new nginx exits 0.
-- Canaries fire (`check.sh --live`); a kernel upgrade without a loadable policy raises HIGH `health.enforcement_gone`
+- Canaries fire (`check.sh --live`, with `--yes` where the SCTP canaries would notify, §8); a kernel upgrade without a loadable policy raises HIGH `health.enforcement_gone`
   in `alerts.jsonl` within 5 minutes (§4.3, §11).
 - An install nobody confirms rolls back by itself and exits 4: the timed rollback and `--confirm` ship in P1a
   (§7, step 10), so their test gates P1a (§11).
@@ -2583,7 +2584,7 @@ expired certificate) are hub §15; offboarding has a part on each side.
 
 Expect noise; record what you measure (the figures in §9 are estimates). `nginx-exec` stays in monitor for 24 h and
 `sctp-socket` until its canary has run (§4.3).
-1. **Day 0.** `edr-check --live` passes (on an enrolled host open a hub maintenance window first: the SCTP canaries page, §8); `edr-agent status` shows each policy's mode.
+1. **Day 0.** `edr-check --live` passes. On an enrolled host that is `edr-check --live --yes` after opening a maintenance window on the hub: the SCTP canaries page, and without `--yes` they are not run and the check ends with a WARN (§8). `edr-agent status` shows each policy's mode.
 2. **Suricata.** Count alerts by `alert.signature_id`; disable the irrelevant (`disable.conf`), re-check `drop.conf` (it
    decides which rules may ban, §4.1.1), add `rate_filter` for the noisiest SIDs. Watch `kernel_drops` (under 1%), memcap
    counters, conntrack use and the MPM cache size.
@@ -2651,7 +2652,7 @@ Events spool (50 MB, `hi` lane for HIGH and CRITICAL) and replay at one batch a 
 --alerts --since 7d`). Restore the hub (hub §7): with the Reserved IP moved clients reconnect alone, otherwise `rehome`
 with `--for HOST` tokens (§5). The spool drop counters show blind spots.
 
-**Kernel upgrade.** Procedure and automatic checks: §15. Keep the old kernel until `edr-check --live` passes and
+**Kernel upgrade.** Procedure and automatic checks: §15. Keep the old kernel until `edr-check --live` (`--yes` on an enrolled host, §8) passes and
 `kernel_pending` clears. If a policy will not load, the agent raises HIGH `health.enforcement_gone` locally (the hub's rule
 keys on that event): boot the old kernel from GRUB (Recovery Console without SSH) or wait for a Tetragon release; the site is
 unaffected meanwhile.
