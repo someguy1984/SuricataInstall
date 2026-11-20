@@ -99,4 +99,4 @@ done
 rm -rf "$STATE"
 
 say "Done"
-echo "ctrld is untouched apart from the drop-ins above. Restart the browsers to drop their policies."
+echo "ctrld is left in place and its drop-ins are removed; its config and binary stay root-only and its logs root:adm (0640), as install.sh set them. Restart the browsers to drop their policies."

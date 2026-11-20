@@ -339,7 +339,8 @@ agent decides, a small root oneshot (`edr-bans`) applies, and the kit never edit
           set edr_never4 { type ipv4_addr; flags interval; }                      # + edr_never6
           set edr_ban4   { type ipv4_addr; flags interval,timeout; size 16384; }  # + edr_ban6
           set edr_feed4  { type ipv4_addr; flags interval,timeout; size 400000; } # + edr_feed6
-          counter hit_ban4 { }                          # one named counter per drop rule
+          counter hit_ban4 { }                          # one named counter per drop rule (+ hit_ban6, hit_feed6, ...)
+          counter hit_feed4 { }
           chain ban {
             type filter hook prerouting priority -150; policy accept;
             ip saddr @edr_never4 return                 # + ip6; the never-ban check comes first
@@ -398,7 +399,7 @@ Added from the machine (`edr-home-net` recomputes at boot and every 15 minutes, 
 Rules: map `::ffff:a.b.c.d` to IPv4 first; one `norm_ip()` rejects whitespace, leading zeros, zone IDs and host bits;
 a CIDR that contains or overlaps any entry is refused (sorted intervals and `bisect`); a refused ban is reported as an
 event and in `last_apply_error`, and the rest of the state applies. A property test (random
-CIDR sets never overlap the list) runs in `make lint`; the mock attacker uses 198.18.77.0/24 (198.18.0.0/15 is deliberately not in the list, so the mock attacker can be banned).
+CIDR sets never overlap the list) runs in `make unit`; the mock attacker uses 198.18.77.0/24 (198.18.0.0/15 is deliberately not in the list, so the mock attacker can be banned).
 
 #### How a ban is applied
 
@@ -494,8 +495,7 @@ The line comes from the [nginx source](https://raw.githubusercontent.com/nginx/n
   `proxy_mode` in `local.conf`: `auto` (detect, above), `on` (force proxy handling), `off` (no heuristic
   detection). `off` never overrides inventory's `real_ip`: web-sourced bans stay off whenever `real_ip` or an
   X-Forwarded-For log format is present.
-- **Never-ban ranges still alert.** An internal source on scanner or web signals raises MEDIUM "internal source"
-  (CRITICAL only for `web-exec`, §4.3).
+- **Never-ban ranges still alert.** An internal source on scanner or web signals raises MEDIUM "internal source".
 
 #### Conntrack is a declared dependency
 
@@ -504,7 +504,7 @@ The `ct` expressions need conntrack, and the kit must not be what fills it. Pre-
 
 - **Sizing when the kit is first.** A 2 GB droplet gets 65,536 entries (about 550 new connections a second fill it
   with TIME_WAIT alone), and a full table drops new connections. If the limit is still the default the installer
-  sets `nf_conntrack_max=262144` (about 67 MB worst case) after the module loads (`sysctl -p` or `modules-load.d`;
+  sets `nf_conntrack_max=262144` (about 67 MB worst case) after the module loads (`sysctl -p` after `modprobe nf_conntrack`;
   `sysctl.d` can run first). Established timeouts are not shortened. Uninstall removes the drop-in if the kit made it.
 - **Monitoring.** The heartbeat reports count, maximum, and `drop` and `early_drop` from `/proc/net/stat/nf_conntrack`.
   The hub alerts at 70%; `check.sh` WARNs at 70% and FAILs at 90%.
@@ -575,7 +575,8 @@ and `peers`, plus `hub_addresses` and `port` (as in the enroll reply); nothing e
 absolute expiry on its own clock at receipt, so skew shifts nothing; it WARNs above 60 s. `source` and `reason_id`
 are validated against closed vocabularies (else shown as `unknown`): `source` is `fleet` or `operator`, `reason_id` is `fleet_quorum` or `operator`, and feed names are `spamhaus_drop_v4`, `spamhaus_drop_v6` and `dshield`. Values are cleaned before display in `edr-agent bans`
 and `check.sh`, because root runs them. An unban is absence from the next document. Unknown fields are ignored; no
-reason text names another host. The heartbeat returns `policy_rev_applied`, `ban_counts` and `last_apply_error`.
+reason text names another host. The heartbeat carries `policy_rev_applied`, `ban_counts` and `last_apply_error`; the reply carries `hub_time`,
+`policy_rev` and `min_client_schema`.
 
 ### 4.3 Tetragon, server policy set
 
@@ -605,8 +606,8 @@ Changes needed in `tetragon/local_install.sh` and `check.sh` (a server wrapper m
 
 | Change | Why |
 |--------|-----|
-| `POLICY_DIRS` (reused laptop plus server policies) staged into one directory, used by `check.sh` and the tools copy; `DENYLIST` override (local_install.sh:165, :446; check.sh:113) | Reused policies live in the laptop directory; the denylist is rendered from the repo file |
-| `config.sh` as `: "${TETRAGON_LOG_MAX_SIZE_MB:=50}"`; one `LOG_PERM` shared with check.sh:148 (asserts 600) | Assigned unconditionally today. Server: 20 MB, 5 backups, 640 (§9) |
+| `POLICY_DIRS` (reused laptop plus server policies) staged into one directory, used by `check.sh` and the tools copy; `DENYLIST` override (the denylist read and copy in `local_install.sh`; the diff in `check.sh`) | Reused policies live in the laptop directory; the denylist is rendered from the repo file |
+| `config.sh` with `TETRAGON_LOG_MAX_SIZE_MB` and `TETRAGON_LOG_MAX_BACKUPS` as `: "${VAR:=default}"`; one `LOG_PERM` shared with `check.sh` (its 600 asserts) and the `echo 600` in `local_install.sh` | Assigned unconditionally today. Server: 20 MB, 5 backups, 640 (§9) |
 | `--no-watch-user`: no `@HOME@` substitution; lint fails on `@HOME@` in a server policy | Unreplaced it never matches (39 uses in `persistence`, 22 in `sensitive-files`). Server variants use Postfix such as `/.ssh/authorized_keys` |
 | `health-server-address` `127.0.0.1:6789`; `check.sh` FAILs on a non-loopback Tetragon listener | The default `:6789` is on every interface |
 | `--no-viewer` always passed (it exists); boot gate off (`--no-boot-gate`) | The gate holds `basic.target` up to 90 s if Tetragon hangs |
@@ -960,7 +961,7 @@ One Python file using only the standard library (`agent/edr-agent.py`), like `an
 enrolled it runs in **local mode**: everything below except the transport (§4.7). Choices that change what the agent
 forwards (redaction, budgets, optional inputs) are local only, in `local.conf` (§14).
 
-**Subcommands** (root, except `status`): `status [--alerts --since D]`, `pause [--for]`, `resume`,
+**Subcommands** (root, except `status` and `shutdown-notice`, which runs as `edr-agent`): `status [--alerts --since D]`, `pause [--for]`, `resume`,
 `maintenance --for`, `collect [--out]`, `isolate --for [--all]` (§4.7); `enroll` (§4.6); `rehome [--rollback]
 [--drop-spool]` (§5); `discover` and `apply-config [--check]` (§14); `learn [--accept]` (§4.3); `bans`,
 `unban ADDR|--all` (§4.2); `webroot rebaseline` (P3, §4.5.1); `shutdown-notice` (the unit's `ExecStop`, below).
@@ -1180,7 +1181,7 @@ A bad certificate fails the TLS handshake or the first read with no status. One 
   (confirm in the VM test): the long-running units (`edr-agent`, `tetragon`, `suricata`, `dnscrypt-proxy`, `nginx`)
   by cgroup presence under `/sys/fs/cgroup/system.slice/` (`running` or `absent`); the root helpers that write a
   status file (`edr-bans`, `edr-inventory`, `edr-diskguard`, `edr-dns-watch`, `edr-policy-check`) by the age of that
-  file (`fresh` or `stale`). Timers and path units are not reported; `check.sh` covers them (§8);
+  file (`fresh` or `stale`). Timers and path units are not reported; `check.sh` covers the `edr-bans` path and timer, the `edr-dns-watch` timer and the `edr-diskguard` timer (§8);
 - `tetragon` (policy names, modes and would-be-kill counts); `nft` (the `inet edr` table: `table_present`, set sizes,
   counters from `/run/edr-bans/counters.json`); `conntrack` (count, maximum, `drop` and `early_drop`, §4.2); `dns_lock` (`state`: `locked`, `open`,
   `paused` or `flapping`, with `since` and the re-lock count, from `/run/edr-dns-watch/status.json`, §4.4); `disk`,
@@ -1673,7 +1674,9 @@ already there; no `autoremove`). The directory holding the first copy of the man
 treats any manifest as untrusted input and keeps three limits in the script itself:
 - **Paths:** only the kit's own prefixes and file names, built into the script: `/usr/local/lib/edr-agent` and `.prev`,
   `/usr/local/sbin/edr-*`, `/etc/edr-*`, `/var/lib/edr-*`, `/run/edr-*`, `/usr/libexec/edr/`, the kit's files in
-  `/etc/suricata/`, unit and drop-in names starting `edr-`, the Suricata update units and its unit drop-in, and the
+  `/etc/suricata/`, `/var/lib/suricata/rules/` and `/var/lib/suricata/cache/` (kit-created entries, including
+  `edr-ban-sids.txt`), the apt pin file the installer wrote under `/etc/apt/preferences.d/`, `/swapfile-edr` and its
+  manifest-recorded fstab line (exact text, no other fstab edits), unit and drop-in names starting `edr-`, the Suricata update units and its unit drop-in, and the
   named files in steps 3 to 9 (sysctl, modprobe, resolved, apt hook, needrestart, MOTD and journald files); any other
   entry is refused.
 - **Packages:** purged only if the name is in the script's built-in list (`suricata`, `suricata-update`,
@@ -1717,7 +1720,8 @@ manifest to a root-only directory under `/run` and runs from there; the director
    `/var/lib/edr-bans`, `-inventory`, `-restart`, `-diskguard`, `-notify`, `/var/lib/edr-install`, every `/run/edr-*`
    directory (`/etc/edr-agent` takes `pause.json` with it), and last the users `edr-agent` and `edr-notify`
    (`/var/log/tetragon` is group `edr-agent` until step 7 has run).
-10. **Final check:** no `edr`, `edr_dns` or `edr_isolate` table; no `edr-*` unit or kit drop-in left; DNS resolves; sshd
+10. **Swap:** if the manifest says the kit made `/swapfile-edr`, `swapoff` it, remove its fstab line, delete the file.
+11. **Final check:** no `edr`, `edr_dns` or `edr_isolate` table; no `edr-*` unit or kit drop-in or swapfile left; DNS resolves; sshd
     still listens; nginx answers on `127.0.0.1` when present; prior sysctl values restored. Partial flags relax
     it (below). Report PASS or FAIL (exit codes: §15).
 
@@ -1847,7 +1851,7 @@ The install command is always run from the unpacked, hash-checked tarball, for e
 | # | Phase | Step | Rollback |
 |---|-------|------|----------|
 | 1 | P1a | **Pre-flight** (above); `--plan` stops here | none needed |
-| 2 | P1a | **Stage.** Copy the tree, create the users `edr-agent` and `edr-notify`, start the manifest, seed `local.conf` (a commented reference of every key, plus flag and `edr-agent discover` values), previous version to `edr-agent.prev` | remove from manifest |
+| 2 | P1a | **Stage.** Copy the tree, create the users `edr-agent` and `edr-notify`, start the manifest, seed `local.conf` (a commented reference of every key, plus flag and `edr-agent discover` values), previous version to `edr-agent.prev`; opt-in `--swapfile`: create `/swapfile-edr` (0600), `swapon`, one fstab line, both recorded in the manifest | remove from manifest; `swapoff`, delete the file and its fstab line |
 | 3 | P1a; P1b packages | **Packages.** `python3`, `openssl` (P1a); OISF PPA and pin, `suricata`, `nftables`, `dnscrypt-proxy` (P1b); `apt-get -o DPkg::Lock::Timeout=300`; `apt-get update` in a bounded loop (10 x 30 s), since that lock is not covered; a `policy-rc.d` written only if none exists, answering 101 for `suricata` and `dnscrypt-proxy` (it checks `$1`) and 0 for everything else, removed by a trap on every exit and by `--rollback`; `check.sh` WARNs if it is left behind (§8) | purge packages marked "by the kit" |
 | 4 | P1b | **Suricata** (§4.1): candidate yaml, `suricata-update`, `suricata -T` under `systemd-run -p MemoryMax=900M` and the memory guard, unit drop-in with the limits, `edr-home-net`; then start, already tuned | discard candidate; remove drop-in |
 | 5 | P1b | **nftables** (§4.2): conntrack sizing, `inet edr`, `edr-bans` units | delete table; restore sysctl |
@@ -1941,7 +1945,8 @@ are all expected. `edr-canary` is not paused and is still checked, and `--live` 
 - `dnscrypt-proxy -check` passes; lookups work via `/etc/resolv.conf` and for the site's names; WARN when the Global scope of
   `resolvectl status` lists a server other than `127.0.2.1` or a link has `Domains=~.` pointing away from the proxy (link
   servers without a routing domain are expected); the lock matches `[dns] lockdown`: with `on`, `inet edr_dns` is present and `/run/edr-dns-watch/status.json` shows
-  `locked` (state `open` is a **FAIL**; `paused` is a WARN, see above; `flapping` a WARN); skipped when lockdown is `off`;
+  `locked` (state `open` is a **FAIL**; `paused` is a WARN, see above; `flapping` a WARN; with `on` also **FAIL** if `edr-dns-watch.timer` is not active, and WARN if
+  `/run/edr-dns-watch/status.json` is over 2 minutes old, not while paused); skipped when lockdown is `off`;
   the exempt uid exists; stamp and
   block-list sets disjoint (**FAIL**); a plain query to `9.9.9.9:53` as a non-proxy uid (`setpriv`) **fails**;
   detected containers and tunnels listed.
@@ -2140,7 +2145,7 @@ A phase starts only when the previous one has met its exit criteria (tiers and c
   against the new hub; `rehome` survives a kill at each step and works onto a restored hub; the restore drill works onto a second hub (hub §12).
 - `web-exec` enforces only after `learn --accept` and no new tuple for 72 h.
 
-**P3, with hub correlation. Ships**
+**P3, with fleet bans. Ships**
 - Fleet bans and feed sets applied from the hub (guards in §4.2), with the hub's ban commands and Bans page (hub §5,
   §6); `isolate`, `maintenance`, opt-in nginx restart;
   webroot integrity (§4.5.1); `log-tamper` and `link-sensitive` policies, decoy credential files with their Tetragon read-watch (§4.3, §4.7), `Override` hardening after a canary proves
@@ -2176,7 +2181,9 @@ hub-triggered isolation, raw access-log shipping; a vulnerability database beyon
    global duplicate check rejects today (tested).
 3. **Denylist check** takes a list of files; a line with `arguments_regex` also needs `parent_binary_regex` and `^...$`
    anchors on every regex (today only `binary_regex` and `parent_binary_regex` are checked). The 5-selector and
-   8-list limits stay, and `matchBinaries` Prefix and Postfix count towards the 8.
+   8-list limits stay, and `matchBinaries` Prefix and Postfix count towards the 8. Lint also fails on more than 5
+   args or 3 actions per hook, two kprobes on one symbol in a policy, `followChildren` paths over the 64-id budget
+   summed across policies, and `@HOME@` in `server_client/tetragon/policies`.
 4. **Units.** Globs gain `*.path`, `*.socket` and the server directories; each unit gets `systemd-analyze verify` and
    `security --offline=true --threshold=N` (N from the first measured scores).
 5. **Data and imports.** The advisory file (hub §4) joins the JSON list with a schema check; `dns-lockdown-rules.sh`
@@ -2185,6 +2192,8 @@ hub-triggered isolation, raw access-log shipping; a vulnerability database beyon
 6. **`make unit`** runs `python3 -m unittest`, no root (the hub plan names it). **CI fails, never skips,** when
    `shellcheck`, PyYAML or `systemd-analyze` is missing. **`dry-run-server`** fails if `nft list ruleset` on the host
    differs before and after.
+7. **`make dist`** builds the tarball, `MANIFEST.sha256`, `VERSION` and the tarball `.sha256` (§7); a lint check that
+   every file the installers reference is in it.
 
 **Why `tests/dry-run.sh` is not used for the server installers yet.** It isolates files with `unshare -m` only, so the
 network namespace, `/proc/sys` and kernel modules are the host's (tested: same namespace id, `nf_conntrack_acct`

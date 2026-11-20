@@ -10,6 +10,11 @@ board firmware can't boot Windows: it tells you whether Windows itself is health
                                              # boot the installer stick (read-only) with the disk attached
     sudo ./run_windows_qemu.sh --help
 
+Other options (see `--help`): `--disk`, `--mem`, `--cpus`, `--no-tpm`, `--reset-vars` (fresh OVMF vars),
+`--dry-run`, `-- ARGS` (extra QEMU arguments); env `WIN_DISK`, `STATE_DIR`. `inspect.sh` also has `status`
+and `prepare`, and `WIPE=1` recreates the INSPECT disk (drops uncollected reports). A second run is refused
+while a VM's monitor socket still answers.
+
 ## What the VM is
 
 - q35 + KVM, `-cpu host` with Hyper-V enlightenments, 8 vCPUs / 16 GiB by default.
@@ -66,4 +71,24 @@ CAs; and Defender status, exclusions and detections.
 on the host, so they leave through the host stack: UFW, then Suricata inline (the mangle OUTPUT
 NFQUEUE). Nothing can connect in. Known gaps: the guest's 10.0.2.2 is the host's 127.0.0.1, and `-o lo`
 is accepted before NFQUEUE, so that path is not inspected. The guest can also reach the LAN
-(192.168.0.0/24). `--no-net` turns networking off.
+(192.168.0.0/24). The host's DNS lockdown also applies to the QEMU process, so the guest should use
+QEMU's 10.0.2.3 forwarder. `--no-net` turns networking off.
+
+## Sentinel MM replica (research tool, not part of the laptop kit)
+
+`run_windows_sentinel_replica.sh` boots the same Windows disk on the Sentinel MM firmware instead of stock
+OVMF, to catch what makes Windows reset early in the kernel: which SW SMIs were raised, how long each vCPU
+sat in SMM, who wrote the reset, and the Windows stop code if it is a bugcheck. The disk is never written:
+QEMU runs on a qcow2 overlay over the read-only disk, deleted afterwards unless `--keep-overlay`.
+
+    sudo ./run_windows_sentinel_replica.sh --help
+
+Results go to `$OUT/run-*/SUMMARY.md`. `replica/qmp_watch.py` freezes the VM when it resets, panics or shuts
+down, and `replica/analyze_run.py` writes the summary.
+
+- It needs an external sentinel-uefi checkout at `$SENTINEL` (default `/home/j/sentinel-uefi`), which holds
+  the firmware build, the key store and the default output directory; the script stops if it is missing.
+- Other requirements: `swtpm` (unless `--no-tpm`), `efitools` and `openssl` (Secure Boot enrolment from the
+  private PK/KEK keys under `$SENTINEL`), and KVM ftrace via `/sys/kernel/tracing` (it creates its own trace
+  instance). The kvm_exit filter uses AMD SVM exit codes, so it assumes an AMD host.
+- Options: `--accel`, `--hold`, `--timeout`, `--re-enrol`, `--build`, `--keep-overlay`, `--no-disk`.

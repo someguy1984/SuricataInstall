@@ -54,6 +54,12 @@ build_rules() {
     for hook in $HOOKS; do
         $cmd -t mangle -I "$hook" 1 -j $CHAIN || return 1
     done
+    # A DNS pause in progress has to stay ahead of the Suricata jump, or port 53 is dropped
+    # again; the name must match PAUSE_CHAIN in controld/files/dns-lockdown.sh
+    if $cmd -t mangle -n -L DNSLOCK-PAUSE >/dev/null 2>&1; then
+        while $cmd -t mangle -D OUTPUT -j DNSLOCK-PAUSE 2>/dev/null; do :; done
+        $cmd -t mangle -I OUTPUT 1 -j DNSLOCK-PAUSE || return 1
+    fi
 }
 
 case ${1:-start} in

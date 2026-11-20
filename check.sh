@@ -123,6 +123,9 @@ else
 fi
 systemctl is-active --quiet suricata-home-net.timer && pass "HOME_NET refresh timer is active" \
     || warn "suricata-home-net.timer is not active (re-run ./install.sh)"
+if systemctl is-failed --quiet suricata-home-net.service; then
+    fail "The last HOME_NET refresh failed: HOME_NET is not following network changes (journalctl -u suricata-home-net -n 30)"
+fi
 [[ -x /etc/NetworkManager/dispatcher.d/90-suricata-home-net ]] && pass "NetworkManager hook refreshes HOME_NET on network changes" \
     || warn "NetworkManager hook not installed: HOME_NET only refreshes every 15 minutes"
 if cmp -s "$SRC/local.rules" /etc/suricata/local.rules; then
@@ -190,6 +193,9 @@ else
 fi
 systemctl is-active --quiet suricata-filestore-prune.timer && pass "Weekly filestore clean-up timer is active" \
     || warn "suricata-filestore-prune.timer is not active: extracted files are never deleted (re-run ./install.sh)"
+if systemctl is-failed --quiet suricata-filestore-prune.service; then
+    fail "The last filestore clean-up failed: extracted files are not being deleted (journalctl -u suricata-filestore-prune -n 30)"
+fi
 if [[ $CONFIG_TEST -eq 1 ]]; then
     info "Running suricata -T (loads all rules)..."
     # -l to a temp dir so the test run doesn't append its own start-up lines to suricata.log

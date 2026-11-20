@@ -223,6 +223,9 @@ pause_rules() {
     log "PAUSED until $until: plain DNS (port 53) may leave this machine. Re-lock now with: $0 resume"
 }
 
+# iptables -L fails for a normal user, which would make pause and status say "not active"
+[ "$(id -u)" -eq 0 ] || { echo "Run as root: sudo $0 ${1:-}" >&2; exit 1; }
+
 case ${1:-start} in
     start | resume)
         remove_pause

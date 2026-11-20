@@ -61,6 +61,10 @@ else
 fi
 if [[ -f /etc/systemd/system/tetragon.service.d/boot-gate.conf ]]; then
 	pass "Boot gate installed (services wait until Tetragon is recording)"
+	[[ -x /usr/local/libexec/tetragon-wait-ready ]] ||
+		fail "boot gate is installed but /usr/local/libexec/tetragon-wait-ready is missing: tetragon.service will fail to start"
+	[[ -f /etc/systemd/system/tetragon.service.d/shutdown.conf ]] ||
+		warn "tetragon.service.d/shutdown.conf is missing (local_install.sh restores it)"
 else
 	warn "No boot gate: whatever starts before Tetragon at boot goes unrecorded (local_install.sh without --no-boot-gate)"
 fi
@@ -69,6 +73,8 @@ if systemctl is-active --quiet tetragon-alerts; then
 else
 	fail "tetragon-alerts.service is not active: policy hits exist only in $TETRAGON_LOG_DIR"
 fi
+systemctl is-enabled --quiet tetragon-alerts 2>/dev/null ||
+	warn "tetragon-alerts.service is not enabled at boot: policy hits stop reaching the journal after the next reboot"
 
 section "Policies"
 mapfile -t want < <(sed -n 's/^  name: *"\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' "$ETC"/tetragon.tp.d/*.yaml 2>/dev/null | sort -u)
@@ -165,6 +171,7 @@ fi
 if [[ -f /etc/systemd/system/tetragon-viewer.service ]]; then
 	section "Web viewer"
 	if systemctl is-active --quiet tetragon-viewer; then pass "tetragon-viewer.service is active"; else warn "tetragon-viewer.service is not active"; fi
+	systemctl is-enabled --quiet tetragon-viewer 2>/dev/null || warn "tetragon-viewer.service is not enabled at boot"
 	if command -v curl >/dev/null && systemctl is-active --quiet tetragon-viewer; then
 		code=$(curl -s -o /dev/null -m 3 -w '%{http_code}' "http://127.0.0.1:$VIEWER_PORT/auth")
 		case $code in

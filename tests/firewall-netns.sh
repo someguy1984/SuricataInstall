@@ -153,6 +153,12 @@ for cmd in iptables ip6tables; do
     [[ $(rules $cmd OUTPUT | sed -n 2p) == "-A OUTPUT -j DNSLOCK-PAUSE" && $(rules $cmd OUTPUT | sed -n 3p) == "-A OUTPUT -j DNSLOCK" ]] \
         && ok "$cmd: a ctrld restart during a pause rebuilds the chain behind the pause" || bad "$cmd: a ctrld restart during a pause re-locked early"
 done
+# Restarting Suricata's rules during a pause must keep the pause chain first in mangle OUTPUT
+check "nfqueue start succeeds during a pause" ns bash "$NFQ" start
+for cmd in iptables ip6tables; do
+    [[ $(rules $cmd OUTPUT mangle | sed -n 2p) == "-A OUTPUT -j DNSLOCK-PAUSE" && $(rules $cmd OUTPUT mangle | sed -n 3p) == "-A OUTPUT -j SURICATA-NFQ" ]] \
+        && ok "$cmd: restarting the nfqueue rules during a pause keeps the pause chain ahead of Suricata" || bad "$cmd: an nfqueue restart during a pause put Suricata ahead of the pause chain"
+done
 check "resume succeeds" ns bash "$LOCK" resume
 [[ $(rules iptables OUTPUT | sed -n 2p) == "-A OUTPUT -j DNSLOCK" ]] && ok "resume re-locks" || bad "resume: DNSLOCK is not first in OUTPUT"
 hasnt iptables mangle "-N DNSLOCK-PAUSE" "resume removes the pause chain"
@@ -164,6 +170,9 @@ done
 check "resume clears the marker" test ! -e "$WORK/root/run/dns-lockdown.paused"
 if ns bash "$LOCK" pause 600 >/dev/null 2>&1; then bad "pause accepts more than 60 minutes"; else ok "pause refuses more than 60 minutes"; fi
 has iptables "" "-A OUTPUT -j DNSLOCK" "a refused pause leaves the lockdown in place"
+if ns bash "$LOCK" pause 0 >/dev/null 2>&1; then bad "pause accepts 0 minutes"; else ok "pause refuses 0 minutes"; fi
+has iptables "" "-A DNSLOCK -p udp -m udp --dport 5353 -j DROP" "mDNS is dropped"
+has iptables "" "-A DNSLOCK -p udp -m udp --dport 5355 -j DROP" "LLMNR is dropped"
 
 echo "MODE=redirect" > "$WORK/root/etc/default/dns-lockdown"
 ns bash "$LOCK" start

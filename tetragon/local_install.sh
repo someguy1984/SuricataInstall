@@ -25,6 +25,8 @@
 #                                           by this script: stray *.yaml are removed)
 #   /etc/tetragon/viewer-token, viewer-url  the token the viewer's event stream
 #                                           needs, and the link that carries it
+#   /etc/tetragon/watch-user                whose home the policies were rendered
+#                                           for (check.sh renders them the same way)
 #   /usr/local/lib/tetragon-viewer/         copy of ./viewer
 #   /usr/local/lib/tetragon-tools/          root-owned copy of check.sh and what it
 #                                           compares against (used by ../watch)
@@ -131,6 +133,12 @@ actual="$(sha256sum "$WORK/$NAME.tar.gz" | cut -d' ' -f1)"
 tar -xzf "$WORK/$NAME.tar.gz" -C "$WORK"
 SRC="$WORK/$NAME"
 [[ -x "$SRC/usr/local/bin/tetragon" ]] || die "unexpected tarball layout in $NAME.tar.gz"
+# Checked here, before anything is stopped or replaced: dying later would leave
+# Tetragon stopped with the new unit and the old boot gate (an ordering cycle).
+if ((WITH_BOOT_GATE)); then
+	grep -qx 'After=network.target local-fs.target' "$SRC/usr/local/lib/tetragon/systemd/tetragon.service" ||
+		die "upstream tetragon.service no longer has the expected After= line; review the boot gate before installing (or pass --no-boot-gate)"
+fi
 
 # Stop a previous native install before swapping binaries underneath it.
 if systemctl is-active --quiet tetragon; then
@@ -439,6 +447,11 @@ EOF
 	sleep 1
 	systemctl is-active --quiet tetragon-viewer ||
 		echo "warning: viewer failed to start; check: journalctl -u tetragon-viewer" >&2
+else
+	# --no-viewer on a re-install: do not leave the old viewer enabled but stopped
+	systemctl disable --now --quiet tetragon-viewer 2>/dev/null || true
+	rm -rf "$VIEWER_DIR" "$UNIT_DIR/tetragon-viewer.service" "$TOKEN_FILE" "$ETC/viewer-url"
+	systemctl daemon-reload
 fi
 
 # --- Root-owned copy of the health check --------------------------------------
@@ -469,3 +482,7 @@ cat <<EOF
   Change policies or the denylist: edit them in $DIR, then re-run this script.
   Remove:        $DIR/local_uninstall.sh   (--purge also deletes event logs)
 EOF
+if [[ -f $UNIT_DIR/ips-watch.timer && ! -f $UNIT_DIR/tetragon-notify.service ]]; then
+	echo
+	echo "  Alerting is installed: run (cd watch && sudo ./install.sh) again to get desktop notifications for policy hits."
+fi

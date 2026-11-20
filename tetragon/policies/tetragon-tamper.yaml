@@ -40,6 +40,7 @@ spec:
         - "/usr/local/bin/tetragon"
         - "/usr/local/bin/tetra"
         - "/usr/local/lib/tetragon"
+        - "/usr/local/libexec/tetragon"
       - index: 1
         operator: "Mask"
         values:
@@ -68,6 +69,7 @@ spec:
         - "/usr/local/bin/tetragon"
         - "/usr/local/bin/tetra"
         - "/usr/local/lib/tetragon"
+        - "/usr/local/libexec/tetragon"
       matchBinaries:
       - operator: "NotIn"
         values:
@@ -92,6 +94,7 @@ spec:
         - "/etc/tetragon"
         - "/usr/local/bin"
         - "/usr/local/lib/tetragon"
+        - "/usr/local/libexec"
       matchBinaries:
       - operator: "NotIn"
         values:
@@ -109,6 +112,10 @@ spec:
       label: "old_file"
     - index: 2 # const struct path *new_dir
       type: "path"
+    - index: 3 # struct dentry *new_dentry
+      type: "string"
+      resolve: "d_name.name"
+      label: "new_file"
     selectors:
     - matchArgs:
       - index: 0
@@ -129,6 +136,40 @@ spec:
         - "/var/log/tetragon"
         - "/etc/tetragon"
         - "/usr/local/lib/tetragon"
+      matchBinaries:
+      - operator: "NotIn"
+        values:
+        - "/usr/bin/tetragon"
+        - "/usr/local/bin/tetragon"
+    - matchArgs: # a Tetragon binary or the wait script moved away
+      - index: 0
+        operator: "Equal"
+        values:
+        - "/usr/local/bin"
+        - "/usr/local/libexec"
+      - index: 1
+        operator: "Equal"
+        values:
+        - "tetragon"
+        - "tetra"
+        - "tetragon-wait-ready"
+      matchBinaries:
+      - operator: "NotIn"
+        values:
+        - "/usr/bin/tetragon"
+        - "/usr/local/bin/tetragon"
+    - matchArgs: # a Tetragon binary or the wait script replaced by rename
+      - index: 2
+        operator: "Equal"
+        values:
+        - "/usr/local/bin"
+        - "/usr/local/libexec"
+      - index: 3
+        operator: "Equal"
+        values:
+        - "tetragon"
+        - "tetra"
+        - "tetragon-wait-ready"
       matchBinaries:
       - operator: "NotIn"
         values:

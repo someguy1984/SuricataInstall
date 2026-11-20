@@ -57,7 +57,7 @@ The list below is the summary; `mock.sh` is the authority on the exact checks an
 
 - The page is served on `:80` and on `:443` over HTTP/2, by PHP 8.5, with a certificate naming `web.dev.local`.
 - `/.env` is refused (403).
-- Each box is Ubuntu 26.04 with systemd as PID 1 and every unit running.
+- The web box is Ubuntu 26.04 with systemd as PID 1 and every unit running; the hub box is checked through its placeholder (TLS 1.3 on :8443) only.
 - php8.5-fpm and nginx are active, and the nginx package is at least the USN-9159-1 fixed build (NGINX2Root).
 - The web box reaches the hub placeholder at `10.77.0.10:8443` over TLS 1.3, and resolves `hub.dev.local`.
 - The hub reaches `https://web.dev.local` over the private network.
@@ -142,7 +142,6 @@ Not built yet; until they are, follow the warning at the top.
 3. The client installer refuses to run kernel steps (modprobe, non-network sysctls, BPF, `/etc/modprobe.d`) when
    `systemd-detect-virt -cq` succeeds, unless `--no-kernel` is given; with the flag it skips them and prints a
    WARN. This is the real guard. The hub installer makes no such change.
-4. The repository is mounted `:ro`.
 
 ## Planned additions
 

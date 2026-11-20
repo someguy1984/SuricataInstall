@@ -145,6 +145,7 @@ build_firmware() {
   rm -f "$FW/vars-enrolled.fd"                      # a new firmware gets a fresh enrolment
   chown -R "$RUN_USER:$RUN_USER" "$FW"
 }
+[ -d "$SENTINEL" ] || die "SENTINEL=$SENTINEL not found (set SENTINEL=/path/to/sentinel-uefi)"
 [ "$BUILD" = 1 ] && [ "$DRY_RUN" = 0 ] && build_firmware
 for f in OVMF_CODE.fd OVMF_VARS.fd Shell.efi; do [ -s "$FW/$f" ] || die "$FW/$f missing: run with --build"; done
 FW_SHA=$(sha256sum "$FW/OVMF_CODE.fd" | cut -c1-64)

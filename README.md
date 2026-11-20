@@ -26,6 +26,8 @@ uninstaller and health check, and each can be re-run safely.
 ├── tetragon/                  Tetragon                ./local_install.sh, sudo ./check.sh, ./local_uninstall.sh
 ├── watch/                     alerting                sudo ./install.sh, sudo ./uninstall.sh
 ├── status.sh                  all health checks at once    sudo ./status.sh [--quiet]
+├── windows_qemu/              boot a physical Windows disk under QEMU (own README)
+├── server_edr_solution/       plans and Docker mock for a server EDR built from these kits (own README; client and hub not written yet)
 ├── Makefile, tests/           make lint, sudo make test, sudo tests/dry-run.sh <installer>, make vm-test
 └── README.md
 ```
@@ -33,7 +35,8 @@ uninstaller and health check, and each can be re-run safely.
 ## Quick start
 
 `ctrld` itself (Control D's client) is installed separately, from Control D; everything else is here.
-Any order works, but this one needs no second pass:
+Any order works, but if you install Tetragon after the alerting kit, re-run `watch/install.sh` so it
+picks up the Tetragon notifier; this order needs no second pass:
 
     sudo ./install.sh                  # Suricata IPS
     (cd controld && sudo ./install.sh) # DNS lockdown: needs ctrld running and answering first
@@ -48,7 +51,10 @@ keep a copy when they replace one that had local edits).
 To see what an installer would do before letting it, rehearse it. It runs for real, but against
 copy-on-write copies of the system directories, with service restarts only recorded:
 
-    sudo tests/dry-run.sh ./install.sh          # likewise controld/install.sh, tetragon/local_install.sh
+    sudo tests/dry-run.sh ./install.sh          # likewise controld/install.sh, tetragon/local_install.sh, watch/install.sh
+
+`apt` is stubbed, so the kit's prerequisites (Suricata, ctrld, Tetragon) must already be installed;
+for a fresh machine use `make vm-test`.
 
 ### What an install or re-install does to your connection
 
@@ -57,7 +63,7 @@ not without a network.
 
 | Installer | What you may notice | If it goes wrong |
 |-----------|---------------------|------------------|
-| `install.sh` | Nothing. Suricata keeps inspecting while the new config is prepared and tested, then restarts once: about a minute in which traffic passes uninspected. Open connections survive. | Before the test has passed: the previous files are put back and Suricata is never touched. After: traffic passes uninspected until Suricata is back (`--queue-bypass`). If the firewall rules can't be built they are removed, which also means uninspected, not blocked. |
+| `install.sh` | Nothing. Suricata keeps inspecting while the new config is prepared and tested, then restarts once: about a minute in which traffic passes uninspected. Open connections survive. | Before the test has passed: the previous config files are put back and the running Suricata is not restarted (`home-net.extra`, the rule sources and the rebuilt ruleset are not rolled back). After: traffic passes uninspected until Suricata is back (`--queue-bypass`). If the firewall rules can't be built they are removed, which also means uninspected, not blocked. |
 | `controld/install.sh` | DNS lookups fail for a few seconds while ctrld restarts, and only if its sandbox file changed. Browsers pick up their policy the next time they start. | A sandbox that ctrld doesn't come back under is replaced by the previous one automatically. If the firewall chain can't be built it is removed: DNS works, but is not locked. |
 | `tetragon/local_install.sh` | Nothing; Tetragon only observes. Nothing is recorded for the seconds it takes to restart. | The network is not involved. |
 | `watch/install.sh` | One test notification. | The network is not involved. |
@@ -72,7 +78,7 @@ If DNS or the network does break, these undo progressively more:
     sudo dns-lockdown.sh pause 30          # lift the DNS lockdown for 30 minutes
     sudo systemctl restart ctrld           # ctrld itself is stuck
     sudo systemctl stop suricata-nfqueue   # take Suricata out of the traffic path (start it to put it back)
-    (cd controld && sudo ./uninstall.sh)   # remove the DNS lockdown, leave ctrld
+    (cd controld && sudo ./uninstall.sh)   # remove the DNS lockdown, leave ctrld (its config and binary stay root-only)
     sudo ./uninstall.sh --keep-logs        # remove Suricata
 
 ### How the kits fit together
@@ -116,8 +122,10 @@ What it does:
 4. Enables the rule sources in `files/rule-sources.conf` (disabling any no longer listed), then runs
    `suricata-update` to download them, convert the high-confidence rules to drop and leave out the
    categories listed in `disable.conf`.
-5. Runs `suricata -T` on the candidate. **If anything fails up to here, the previous files are put
-   back and Suricata is left running as it was**; the firewall is not touched.
+5. Runs `suricata -T` on the candidate. **If anything fails up to here, the previous files in
+   `/etc/suricata` are put back and Suricata is left running as it was**; the firewall is not touched.
+   Not rolled back: CIDRs passed as arguments (`home-net.extra`), the enabled rule sources, the rebuilt
+   ruleset (run `suricata-update`), the PPA and apt pin from step 1 and any package upgrade from step 2.
 6. Makes the candidate live, installs the NFQUEUE firewall script and unit, the systemd override
    that runs Suricata inline (`-q 0`) and sandboxed, logrotate, the daily rule-update timer, the
    weekly filestore clean-up and the HOME_NET updater, and copies `check.sh`, `analyse.py` and
@@ -170,8 +178,8 @@ Packages pulled in as dependencies can then be removed with `sudo apt autoremove
     sudo ./check.sh --config-test   # also runs suricata -T (about a minute)
     sudo ./check.sh --live          # also sends a test request to confirm a known rule fires
 
-`check.sh` is read-only. It prints PASS/WARN/FAIL for the services, the rule-update timer and
-whether its last run failed, the firewall rules (the `SURICATA-NFQ` chain hooked first in mangle
+`check.sh` is read-only. It prints PASS/WARN/FAIL for the services, the rule-update, HOME_NET and
+filestore clean-up timers and whether their last runs failed, the firewall rules (the `SURICATA-NFQ` chain hooked first in mangle
 INPUT/OUTPUT/FORWARD for IPv4 and IPv6, nothing left in the filter table where it would bypass UFW),
 UFW, kernel queue overflows, config settings, the DNS lockdown's rules, rule age, logrotate, errors
 in `suricata.log`, flows seen in both directions, IPv6, and why packets were blocked (rules vs engine
@@ -193,7 +201,7 @@ SID 2013504 (an alert-only rule, never dropped) and confirms it appears in `eve.
 | `--minutes N`             | Length of the window (default 5)                                         |
 | `--end now\|latest\|TIME` | End of the window: now (default), the newest eve.json record, or a local time (`13:55`, `2026-10-05T13:55`) |
 | `--top N`                 | Rows per table (default 10)                                              |
-| `-v`, `--verbose`         | Also show INFO findings and alerts that are informational only            |
+| `-v`, `--verbose`         | Also show INFO findings and flows                                          |
 | `--json`                  | Machine-readable output instead of the report                            |
 | `--no-color`              | Plain output (automatic when not writing to a terminal)                  |
 | `--log-dir`, `--config`   | Other log directory (default `/var/log/suricata`) / suricata.yaml to read HOME_NET from |
@@ -238,8 +246,8 @@ only the first and last.
 |----------|--------------------------------------------------------------------------------------------|
 | CRITICAL | A severity-1 alert rated Critical by ET that was **allowed**, or a host with several serious signals whose worst was HIGH |
 | HIGH     | Severity-1 alert allowed; risky service (SMB, RDP, telnet, databases...) reachable from the internet; attack request that got a 2xx answer; eve.json not written for over 60 s |
-| MEDIUM   | Severity-2 alert allowed, or severity-1 alert blocked; scans from inside; brute force; DGA/tunnelling DNS; executable downloads; expired certificates; engine restarts, memcap drops or suricata.log errors |
-| LOW      | Severity-2 alert blocked; ET INFO/POLICY rules rated severity 1-2; inbound scans; beaconing; large uploads; obsolete or self-signed TLS; abuse-heavy TLDs; plain HTTP to bare IPs |
+| MEDIUM   | Severity-2 alert allowed, or severity-1 alert blocked; scans from inside; brute force; SSH fan-out; answered connections to risky outbound ports; SSH reachable from the internet; web attacks (attack URLs, scanner user-agents, 20+ 4xx responses); DGA/tunnelling DNS; executable downloads; expired certificates; engine restarts, memcap drops or suricata.log errors |
+| LOW      | Severity-2 alert blocked; severity-3 alerts; ET INFO/POLICY/HUNTING/GAMES/CHAT and GPL INFO rules rated severity 1-2; inbound scans; inbound SSH sessions; other exposed services; beaconing; large uploads; obsolete or self-signed TLS; abuse-heavy TLDs; 50+ TXT lookups; a few random-looking domains (fewer than 3); unusual HTTP methods; plain HTTP to bare IPs; suricata.log warnings |
 | INFO     | Suricata's own stream/decoder events, "Not Suspicious Traffic", engine-reason drops (e.g. stream errors), TLS without SNI. Hidden unless `-v` |
 
 The overall risk is the worst finding. A blocked alert is rated one level lower than an allowed one, since
@@ -256,19 +264,20 @@ All counts are within the window.
 | Exposed service             | External host completed a TCP connection to a local host (port below 49152; flows that look reversed by midstream pickup are ignored) |
 | SSH brute force             | 10+ connections from one external host to port 22 on one local host             |
 | SSH fan-out                 | One local host opening SSH to 10+ different external hosts                       |
-| Risky outbound port         | Answered connection out to telnet, SMB, RDP, IRC, Tor, SOCKS, 4444, 5555, 31337  |
+| Risky outbound port         | Answered connection out to telnet, NetBIOS, SMB, RDP, IRC, Tor, SOCKS, 4444, 5555, 31337 |
 | Large upload                | 100 MB+ from one local host to one remote host                                   |
 | Beaconing                   | 6+ flows from one local host to the same remote host/port, 5 s+ apart, jitter 15% or less (DNS/NTP excluded) |
 | NXDOMAIN-heavy DNS          | 15+ NXDOMAIN answers, 30%+ of the host's lookups, 10+ different names            |
 | Random-looking domains      | Registered-domain label of 12+ characters, entropy 3.5+, 2+ digits               |
-| DNS tunnelling              | 30+ different subdomains of one domain, averaging 40+ characters; or 50+ TXT lookups |
+| DNS tunnelling              | 30+ different subdomains of one domain, averaging 40+ characters                 |
+| TXT lookups                 | 50+ TXT lookups from one host (LOW)                                              |
 | Abuse-heavy TLDs            | Lookups in `.zip`, `.top`, `.xyz`, `.tk`, `.icu` and similar                     |
-| TLS                         | Expired certificate, self-signed certificate, SSLv3/TLS 1.0/1.1, no SNI (external servers only) |
+| TLS                         | Expired certificate, self-signed certificate, SSLv2/SSLv3/TLS 1.0/1.1, no SNI (external servers only) |
 | Web attacks (inbound)       | Attack patterns in URLs (traversal, `/etc/passwd`, `${jndi:`, SQL injection, `.env`, `.git`...), scanner/tool user-agents, 20+ 4xx responses, unusual methods (PUT, DELETE, PROPFIND...) |
 | HTTP (outbound)             | Requests straight to IP addresses; scripted clients (curl, python, Go...) as INFO |
 | Executable download         | File name, magic or content type of an executable/script (exe, dll, ps1, sh, jar, apk...) |
 | Anomalies                   | 50+ protocol anomalies (LOW), otherwise INFO                                     |
-| Engine pressure             | Any memcap-drop, emergency-mode, queue-overflow, reassembly-gap, exception-policy or NFQ-error counter increased |
+| Engine pressure             | Any memcap-drop, emergency-mode, queue-overflow, filesystem-error, kernel-drop, reassembly-gap, exception-policy, NFQ-error or invalid-decoder-packet counter increased |
 | Restart                     | Uptime went down between two stats records                                      |
 
 ### Correlation
@@ -291,8 +300,8 @@ of root or of a user in the `suricata` group):
 
 ### Limitations
 
-- The thresholds are heuristics for a small network and may need tuning for busy ones (constants near the top
-  of `analyse.py`).
+- The thresholds are heuristics for a small network and may need tuning for busy ones (they are literals in the
+  detection methods of `analyse.py`; the table above lists them).
 - Beaconing also matches normal keep-alives and polling (it is LOW unless the same host has other findings).
 - SSH brute force is judged by connection count only; the logs can't show whether a login succeeded.
 - With DNS over HTTPS/TLS (e.g. Control D), Suricata sees few DNS lookups, so the DNS checks and naming
@@ -370,8 +379,10 @@ none of the normal traffic seen would have been blocked.
   start can't cut the network (or an SSH session). To keep that window short, systemd restarts
   Suricata 1 s after it exits for any reason, and apt is pinned to 8.x so an upgrade can't leave it
   unable to start.
-- **A failed install changes nothing.** The new config is tested as a candidate while Suricata keeps
-  running on the old one; on any failure the previous files are restored.
+- **A failed install leaves the running engine alone.** The new config is tested as a candidate while
+  Suricata keeps running on the old one; on any failure the previous config files in `/etc/suricata`
+  are put back. `home-net.extra`, the enabled rule sources, the rebuilt ruleset and any package
+  upgrade are not undone.
 - **Sandboxed.** Suricata runs with systemd hardening (read-only system, no kernel or namespace
   access) and Landlock (once started it can only touch its logs, `/var/lib/suricata` and `/run`).
   The daily `suricata-update` runs read-only except `/var/lib/suricata`, with no network admin or
@@ -399,10 +410,16 @@ reloads the rules without restarting Suricata.
 Needs `ctrld` installed, running and answering on `127.0.0.1:53` first (the installer checks and
 refuses otherwise, so DNS is never locked to a dead resolver).
 
+The kit assumes the layout Control D's own installer produces: a systemd service named `ctrld`, the
+binary at `/usr/local/bin/ctrld`, its config in `/etc/controld`, optional logs at `/var/log/ctrld.log`
+and `/var/log/ctrld.err.log`, and a listener on `127.0.0.1:53`. A different layout needs the paths
+edited throughout `controld/` (the installer, uninstaller, `verify.sh` and the files under `files/`)
+and in `tetragon/policies/stack-tamper.yaml`.
+
     cd controld
     sudo ./install.sh                  # block direct DNS and public DoH, sandbox ctrld, lock browsers
     sudo MODE=redirect ./install.sh    # redirect hard-coded IPv4 resolvers to ctrld instead of refusing
-    ./verify.sh                        # prove it: every bypass route is tried and must fail
+    ./verify.sh                        # prove it: the main bypass routes (plain DNS, DoT, DoH) are tried and must fail
     sudo ./uninstall.sh
 
 What it puts in place:
@@ -475,7 +492,7 @@ Everything Tetragon sees goes to `/var/log/tetragon/tetragon.log` (root-only), m
 | `suspicious-exec` | Programs run from `/dev/shm`. Programs with no file at all (memfd, deleted) are picked up from exec events by the journal copy |
 | `device-access` | Unexpected programs opening keyboards, cameras, microphones, HID devices |
 | `tcp-connect`, `tcp-listen` | Outbound TCP connections; programs starting to listen on a network-reachable address |
-| `tetragon-tamper`, `stack-tamper` | Changes to Tetragon's own logs, config and binaries; changes to Suricata's and the DNS lockdown's config, rules, scripts and logs |
+| `tetragon-tamper`, `stack-tamper` | Changes to Tetragon's own logs, config and binaries; changes to Suricata's and the DNS lockdown's config, rules and scripts, and to Suricata's logs |
 
 All policies observe only; nothing is blocked or killed.
 
@@ -511,16 +528,18 @@ A Tetragon limit worth knowing when editing policies: one policy can hold at mos
 
 | Piece | What it does |
 |-------|--------------|
-| `ips-watch.timer` | Every 15 minutes runs Suricata's and Tetragon's health checks, checks ctrld and the `DNSLOCK` chain, and runs `analyse.py` over the last 15 minutes. Health problems notify when they appear, change or clear (and every 6 hours while they last). Suricata findings from MEDIUM up go to the journal; from HIGH up (`NOTIFY_MIN`) also to the desktop. |
-| `tetragon-notify.service` | A desktop notification for each Tetragon policy hit and fileless exec that isn't on the ignore list. The same policy and program notify at most once per 10 minutes, and at most 5 notifications per 5 minutes are shown. |
+| `ips-watch.timer` | Every 15 minutes runs Suricata's and Tetragon's health checks, checks ctrld and the `DNSLOCK` chain, and runs `analyse.py` over the last 15 minutes. Health problems notify when they appear, change or clear (and every 6 hours while they last). Suricata findings from MEDIUM up go to the journal; from HIGH up (`NOTIFY_MIN`) also to the desktop. Only FAIL lines of the health checks notify; warnings appear only when you run `check.sh` by hand. |
+| `tetragon-notify.service` | A desktop notification for each Tetragon policy hit and fileless exec that isn't on the ignore list. The same policy and program notify at most once per 10 minutes, and at most 5 notifications per 5 minutes are shown. Tampering with the watchers themselves (`tetragon-tamper`, `stack-tamper`) is counted separately: each different file notifies on its own, a burst of other alerts does not hold it back, and its own limit is 20 per 5 minutes. When others are held back, one notice says so. |
 | `ips-notify` | What both use: always writes to the journal (`journalctl -t ips-alert`), and notifies every logged-in desktop user. `sudo ips-notify normal "Test" "It works"` |
 
 Tuning lives in `watch/files/`: `ips-watch.conf` (thresholds) and `tetragon-ignore.conf` (which
 policy hits stay off the screen). The ignore list never removes anything from the journal or from
 Tetragon's log. To see what your machine produces and what the list drops:
 
-    journalctl -t tetragon-alerts --since -1d -o cat \
-      | /usr/local/lib/ips-watch/tetragon-notify.py --print | sort | uniq -c | sort -rn
+    sudo journalctl -t tetragon-alerts --since -1d -o cat \
+      | sudo /usr/local/lib/ips-watch/tetragon-notify.py --print | sort | uniq -c | sort -rn
+
+It needs sudo: the ignore list is root-only.
 
 Expect to tune it during the first days: the shipped list covers a stock Ubuntu desktop with
 rootless Docker, and anything else that routinely trips a policy on your machine will notify until
@@ -532,13 +551,15 @@ you add it. `sudo tetragon/check.sh --canary` is an end-to-end test: it reads on
 # Checks and tests
 
     sudo ./status.sh         # every kit's health check, with a summary
-    make lint                # syntax of every script, unit, policy and config; changes nothing
-    sudo make test           # the two firewall scripts, in a throwaway network namespace
+    make lint                # syntax of the scripts, Python, Tetragon policies, export denylist, generated DNS rules, JSON and the kits' systemd units; changes nothing
+    sudo make test           # the two firewall scripts, in a throwaway network namespace, and analyse.py on synthetic logs
     sudo tests/dry-run.sh X  # rehearse installer X against copies of the system directories
-    make vm-test             # install -> check -> uninstall in a fresh Ubuntu VM (needs multipass)
+    make vm-test             # Suricata kit: install -> check -> uninstall in a fresh Ubuntu VM (needs multipass)
 
 `make lint` uses `shellcheck` and PyYAML when they are installed and says what it skipped when they
-are not. `sudo make test` builds and tears down the real `SURICATA-NFQ`, `DNSLOCK` and pause rules
+are not. It also parses `files/suricata.yaml` and the regexes in `files/drop.conf`, and notices Python
+files missing from the Makefile list. Not checked: Dockerfile, nginx, PowerShell/cmd, HTML and the
+plain `.conf` lists other than the notifier ignore list. `sudo make test` builds and tears down the real `SURICATA-NFQ`, `DNSLOCK` and pause rules
 (including the upgrade from the older rule layout) in a network namespace with its own empty
 firewall, so this machine's rules are never touched.
 
@@ -554,8 +575,9 @@ treat its first run as a test of the script too.
 
 ## Rolling out to a new machine
 
-1. Install `ctrld` from Control D if you want the DNS lockdown.
+1. Install `ctrld` from Control D (see [Control D DNS lockdown](#control-d-dns-lockdown) for the layout it must have) if you want the DNS lockdown.
 2. Copy this folder to the machine and follow [Quick start](#quick-start).
 3. Go through the per-machine settings under [Tetragon](#tetragon) and the notification ignore list.
-4. Before relying on it widely, run `make vm-test` (or do one full install → check → uninstall
-   cycle on a fresh Ubuntu VM by hand).
+4. Before relying on it widely, run `make vm-test` (or do one install → check → uninstall cycle of
+   the Suricata kit on a fresh Ubuntu VM by hand). `make vm-test` covers the Suricata kit only; run
+   `controld/install.sh`, `verify.sh` and `uninstall.sh` by hand once as well.

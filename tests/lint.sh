@@ -1,5 +1,5 @@
 #!/bin/bash
-# Static checks for everything in the repo. Changes nothing and needs nothing installed
+# Static checks for the scripts, Python, policies, generated rules, JSON and units in the repo. Changes nothing and needs nothing installed
 # beyond bash and python3; the optional tools are used when present and reported as skipped
 # when not (shellcheck, PyYAML, systemd-analyze).
 #
@@ -47,6 +47,11 @@ for f in "${py_files[@]}"; do
         bad "$f: $out"
     fi
 done
+# Every Python file in the repo should be on the list, or a new one silently goes uncompiled
+while IFS= read -r f; do
+    printf '%s\n' "${py_files[@]}" | grep -qxF -- "$f" || bad "$f is a Python script but is not in the Makefile's PY_FILES"
+done < <({ git ls-files -co --exclude-standard -- '*.py' 2>/dev/null \
+    || find . -name .git -prune -o -name '*.py' -type f -print | sed 's|^\./||'; } | sort -u)
 
 echo "== Tetragon policies"
 if python3 -I -c 'import yaml' 2>/dev/null; then
@@ -95,6 +100,29 @@ if grep -rnE '"/home/[a-z]' tetragon/policies/ >/dev/null; then
     grep -rnE '"/home/[a-z]' tetragon/policies/ | sed 's/^/        /'
 else
     ok "no hard-coded home directories (policies use @HOME@)"
+fi
+
+echo "== Suricata config"
+if python3 -I -c 'import yaml' 2>/dev/null; then
+    # The template only parses once the interface placeholder is filled in
+    if out=$(sed 's/@DEFAULT_IFACE@/eth0/' files/suricata.yaml | python3 -I -c '
+import sys, yaml
+d = yaml.safe_load(sys.stdin)
+assert d["nfq"]["fail-open"] is False, "nfq.fail-open must be no"
+assert d["stream"]["midstream"] is True, "stream.midstream must be yes"
+assert d["security"]["landlock"]["enabled"] is True, "security.landlock.enabled must be yes"
+' 2>&1); then ok "files/suricata.yaml parses; fail-closed queue, midstream and landlock are set"; else bad "files/suricata.yaml: $out"; fi
+    if out=$(python3 -I -c '
+import re, sys
+for n, line in enumerate(open(sys.argv[1]), 1):
+    if line.startswith("re:"):
+        try:
+            re.compile(line[3:].strip())
+        except re.error as e:
+            print(f"line {n}: {e}"); sys.exit(1)
+' files/drop.conf 2>&1); then ok "files/drop.conf: every re: line compiles"; else bad "files/drop.conf: $out"; fi
+else
+    skip "PyYAML is not installed (apt install python3-yaml)"
 fi
 
 echo "== Tetragon export denylist"
@@ -151,7 +179,8 @@ for n, line in enumerate(open(sys.argv[1]), 1):
 echo "== systemd units"
 if command -v systemd-analyze >/dev/null; then
     # Missing binaries and units are expected on a machine where the kits aren't installed
-    out=$(systemd-analyze verify files/*.service files/*.timer controld/files/*.service watch/files/*.service watch/files/*.timer 2>&1 \
+    out=$(systemd-analyze verify files/*.service files/*.timer controld/files/*.service watch/files/*.service watch/files/*.timer \
+        server_edr_solution/mock/hub/*.service server_edr_solution/mock/web/*.service 2>&1 \
         | grep -vE 'is not executable|No such file or directory|not found|Unit .* not found' || true)
     if [[ -z $out ]]; then ok "units parse"; else bad "systemd-analyze verify:"; sed 's/^/        /' <<<"$out"; fi
 else

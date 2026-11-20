@@ -47,7 +47,8 @@ vm sudo /home/ubuntu/ips/install.sh
 
 step "DNS still works with Suricata inline (no ctrld here, so no DNS rules may be loaded)"
 vm getent hosts archive.ubuntu.com >/dev/null
-vm sudo grep -c '^drop ' /etc/suricata/dns-lockdown.rules | grep -qx 0
+# (grep -c exits 1 on a count of 0, which pipefail would turn into a failure)
+vm sudo sh -c 'test -f /etc/suricata/dns-lockdown.rules && ! grep -q "^drop " /etc/suricata/dns-lockdown.rules'
 
 step "check.sh --live"
 vm sudo /home/ubuntu/ips/check.sh --live

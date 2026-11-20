@@ -1,4 +1,5 @@
-# Shared settings for run.sh / stop.sh. Sourced, not executed.
+# Shared settings for the native install (local_install.sh, local_uninstall.sh,
+# check.sh) and the Docker variant (run.sh, stop.sh). Sourced, not executed.
 
 # Pinned versions. Tags can be moved to point at different content, so the
 # image digests and tarball checksums below are what is actually trusted.

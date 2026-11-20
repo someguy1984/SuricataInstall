@@ -17,14 +17,15 @@ for example
 (a script is named by its own path, not its interpreter's) and dropped if any pattern
 in the ignore file matches that line (Python regular
 expressions, one per line, searched anywhere in it). Run with --print to see the lines
-for the events on stdin without notifying, which is how to write a new pattern:
+for the events on stdin without notifying, which is how to write a new pattern (needs
+sudo: the ignore list is root-only, and without it nothing is marked as dropped):
 
-    journalctl -t tetragon-alerts --since -1d -o cat | tetragon-notify.py --print | sort | uniq -c | sort -rn
+    sudo journalctl -t tetragon-alerts --since -1d -o cat | sudo tetragon-notify.py --print | sort | uniq -c | sort -rn
 
 Two limits keep a noisy program from flooding the screen: the same policy and binary
 notify once per --repeat seconds, and at most --burst notifications are shown per
---window seconds (one more then says that the rest were held back, and another says
-which policies they were once the burst is over).
+--window seconds (one more then says that the rest were held back, and the next
+notification after the burst says which policies they were).
 
 Tampering with the watchers themselves (ALWAYS below) is not subject to either: a
 different file is a different alert, and a burst of other alerts does not hold it back.

@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """Security breakdown of the last few minutes of Suricata logs. Read-only: changes nothing.
 
-Run with: ./analyse.py [--minutes 5] [--end now|latest|TIME] [--top 10] [--json] [--no-color]
+Run with: ./analyse.py [--minutes 5] [--end now|latest|TIME] [--top 10] [--json] [--no-color] [-v]
+          [--log-dir DIR] [--config suricata.yaml]
   --minutes N  length of the window to analyse (default 5)
   --end        end of the window: 'now' (default), 'latest' (newest record in eve.json) or a local
                time such as '2026-10-05T13:55' or '13:55'
   --top N      rows per table (default 10)
   --json       machine-readable output instead of the report
+  -v, --verbose  also show INFO findings and flows
+  --log-dir DIR  where eve.json and the other logs are (default /var/log/suricata)
+  --config FILE  suricata.yaml, read for HOME_NET (default /etc/suricata/suricata.yaml)
 
 eve.json (and eve.json.1, if the window crosses a rotation) is read backwards from the end, so only
 the window is read however big the file is. fast.log and suricata.log are read the same way,
@@ -933,7 +937,7 @@ class Analysis:
                 f"Uptime now {b.get('uptime', 0)}s; counters below are since the last restart. "
                 'Check suricata.log / journalctl -u suricata for the cause (crash, rule update, reboot).'])
         if h['samples'] and h['samples'] < 2 and not restarted:
-            self.add('INFO', 'engine', 'Only one stats sample in the window: counters are since the previous sample or start')
+            self.add('INFO', 'engine', 'Only one stats sample in the window: counter changes cannot be computed (shown as 0)')
 
         bad = {k: v for k, v in delta.items() if v > 0 and any(c in k for c in HEALTH_COUNTERS)
                and not any(g in k for g in GAUGES) and not k.startswith(NOT_COUNTERS)}
@@ -1154,8 +1158,11 @@ def parse_end(value, log_dir):
     if value == 'latest':
         for line in ReverseFile(os.path.join(log_dir, 'eve.json'), chunk=1 << 16):
             if line.startswith(b'{"timestamp":"'):
-                return parse_iso(line[14:line.index(b'"', 14)].decode()), False
-        raise SystemExit('eve.json is empty')
+                try:
+                    return parse_iso(line[14:line.index(b'"', 14)].decode()), False
+                except ValueError:      # the newest line is half-written: use the one before it
+                    continue
+        raise ValueError('no records in eve.json')
     if re.fullmatch(r'\d\d:\d\d(:\d\d)?', value):
         value = time.strftime('%Y-%m-%dT') + value
     return parse_iso(value), False

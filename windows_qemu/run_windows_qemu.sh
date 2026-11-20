@@ -225,6 +225,11 @@ if [ "$DRY_RUN" = 1 ]; then
   exit 0
 fi
 
+# A second run must not get as far as cleanup(), which removes the live VM's monitor socket.
+if [ -S "$STATE_DIR/monitor.sock" ] && MONITOR_SOCK="$STATE_DIR/monitor.sock" python3 "$SCRIPT_DIR/monitor.py" 'info status' >/dev/null 2>&1; then
+  die "a VM is already running (monitor.sock answers)"
+fi
+
 # ---- TPM ---------------------------------------------------------------------------------------
 TPM_PID=""
 cleanup() {

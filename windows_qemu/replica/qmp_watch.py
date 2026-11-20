@@ -60,13 +60,14 @@ class Qmp:
             msg["host_mono"] = time.monotonic()
             self.log.write(json.dumps(msg) + "\n")
             self.log.flush()
-            self.events.append(msg)
         return msg
 
     def cmd(self, name, **args):
         self.f.write((json.dumps({"execute": name, "arguments": args} if args else {"execute": name}) + "\n").encode())
         while True:
             msg = self._read()
+            if "event" in msg:
+                self.events.append(msg)         # keep it for wait_event(); the caller only wants the reply
             if "return" in msg or "error" in msg:
                 return msg
 
@@ -78,6 +79,8 @@ class Qmp:
         return r.get("return", json.dumps(r.get("error")))
 
     def wait_event(self, timeout):
+        if self.events:
+            return self.events.pop(0)
         # select(), not socket.settimeout(): a timeout inside makefile().readline() poisons the SocketIO object
         # ("cannot read from timed out object") and every later QMP command fails. The file is unbuffered
         # (buffering=0), so no line can sit in a Python-side buffer that select() would not see.

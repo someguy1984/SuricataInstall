@@ -8,7 +8,7 @@
 #   ./mock.sh logs hub|web  follow that box's journal
 #   ./mock.sh down [--volumes]   stop and remove (--volumes also forgets the mock certificates)
 #
-# Works with rootful or rootless Docker. If DOCKER_HOST is unset and the system socket is missing,
+# Use rootless Docker only (see README.md; the boxes run privileged). If DOCKER_HOST is unset and the system socket is missing,
 # the current user's rootless socket ($XDG_RUNTIME_DIR/docker.sock) is used.
 set -euo pipefail
 

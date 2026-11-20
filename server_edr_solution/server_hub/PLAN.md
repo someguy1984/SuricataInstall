@@ -349,7 +349,7 @@ SQLite in WAL mode, `/var/lib/edr-hub/hub.db`, mode `0640`, group shared with th
 | `login_codes` | hashes of single-use dashboard login codes, expiry, `used_at`. Dashboard sessions are never stored: they are held hashed in the dashboard's memory (§5) |
 | `never_ban`, `settings_history`, `agent_hashes` | never-ban list (cidr, reason, added_by, ts); every settings change with who and when (secret keys recorded as "changed", never the value); local agent-hash overrides. Settings live in `/var/lib/edr-hub/settings.json` and secrets in `/etc/edr-hub/secrets.json` (§14), never in the database |
 | `alert_state`, `ban_votes`, `maintenance` | alert dedup and storm state; fleet-ban votes (host, ip, evidence, ts); maintenance windows (host, until, set_by) |
-| `audit`, `meta` | `audit`: the columns and the hash chain are defined in §5 (Audit); `meta`: `schema_version`, engine cursor, last prune and check times |
+| `audit`, `meta` | `audit`: the columns and the hash chain are defined in §5 (Audit); `meta`: `schema_version`, engine cursor, writer tick (stamped on every group commit or 10 s idle tick), last prune and check times |
 
 ### Retention
 Retention and the size cap use `received_at`, never the client `ts` (a clock set to 2030 would pin rows). Daily jobs
@@ -364,8 +364,9 @@ run at `daily_job_utc` (setting, default `03:00`).
 | `audit`, `settings_history` | 3 years |
 | `tokens`, `login_codes`, `outbox` | 30 days after expiry, 1 day after expiry, 30 days after sent |
 
-Collapsed events carry `count`, `first` and `last`; every rule sums `count`, not rows. HIGH and CRITICAL are never
-collapsed or budgeted. `--max-db-size` defaults to 2 GB.
+Collapsed events carry `count`, `first` and `last`; every rule sums `count`, not rows. CRITICAL is never collapsed or
+budgeted. HIGH arrives collapsed by the client (same kind, source and sid or path within 5 minutes, at most 200 an
+hour per source, then one `health.high_flood`; client §4.5 step 4), so rules sum `count` for HIGH too. `--max-db-size` defaults to 2 GB.
 
 ### Sizing (estimates; measure on the real fleet in week one)
 Measured 875 B per row with three indexes; events per day (after client collapsing) are estimates, not fleet data.
@@ -445,9 +446,9 @@ attributed to the certificate CN, never to a name in the body. The "next step" o
 | New uid-0 account, `sudoers` or `authorized_keys` change (P1b) | `inventory.auth_state` | HIGH | Defined in client §4.5.1 |
 | A tailed log file shrank (P1b) | `tamper.log_truncated` | HIGH | Defined in client §4.5 (Log shrink) |
 | A new key or first root login, or a password login with password auth off (P2) | `ssh.login` | MEDIUM / HIGH | A new source address is a digest line. 14-day learning at LOW |
-| Scanner or web signal from an address in the never-ban ranges | field `src_ip` in a never-ban range, on `suricata.alert`, `ssh.fail`, `canary.tripwire` or `tetragon.web-exec` | MEDIUM; CRITICAL for `web-exec` | Never banned. Load balancers are internal, so a hint only |
+| Scanner or web signal from an address in the never-ban ranges | field `src_ip` in a never-ban range, on `suricata.alert`, `ssh.fail` or `canary.tripwire` | MEDIUM | Never banned. Load balancers are internal, so a hint only |
 
-**Containment and loss of visibility.** Two outcomes are possible after the first signals.
+**Containment and loss of visibility.** Three outcomes are possible after the first signals (contained, worker survived, possible success); the rows after them are host-health rules from heartbeats.
 
 | Rule | Kind or field | Severity | Action and next step |
 |------|---------------|----------|----------------------|
@@ -476,7 +477,7 @@ attributed to the certificate CN, never to a name in the body. The "next step" o
 | Old nginx processes run the pre-upgrade binary (`/proc/<pid>/exe` is `(deleted)`) | `inventory.deleted_exe` | HIGH | Restart nginx or let workers drain; a reload never loads a new binary ([site](https://nginx2root.com/)) |
 | `sctp` loadable, running kernel below its fix, other updates pending or reboot required over 7 days | `inventory.sctp`, `inventory.kernel_pending`, `inventory.security_pending` | MEDIUM | Daily digest. The **running** kernel decides, not the package |
 | A file under `public/` holds an `APP_KEY=` line (P1b) | `inventory.posture` (field `app_key_in_public`) | HIGH | Rotate `APP_KEY`, remove the file (client §4.5.1) |
-| Coverage drift | `inventory.uncovered_webroots`, `inventory.uncovered_fpm_binaries`, `inventory.uncovered_pool_users` | MEDIUM | Daily digest. Re-run discovery (client §7) |
+| Coverage drift | `inventory.uncovered_webroots`, `inventory.uncovered_fpm_binaries`, `inventory.uncovered_pool_users` | MEDIUM | Daily digest. Re-run discovery (client §4.3, Discovery and drift: `edr-agent discover`, then `apply-config`) |
 | Inventory file missing or over 2 hours old | `inventory.stale` | MEDIUM | The agent reports "unknown", never "clean" (client §4.5) |
 | Same IP with qualifying evidence from 2 distinct host certificates in 1 h (P3) | hub-side: `ban.local` votes | MEDIUM | Fleet ban ("Fleet bans") |
 
@@ -568,7 +569,7 @@ commands and the Bans page are P3; in P2 the policy document carries peers only.
 ### Advisory data for inventory rules
 
 **Status is computed on the client from apt** (`security_pending`, list age, held and phased counts; client
-client §4.5.1), so it works with no hub and covers every package. The hub's table adds the exploitable feature, other
+§4.5.1), so it works with no hub and covers every package. The hub's table adds the exploitable feature, other
 origins and "no fix yet". `nginx -v` cannot show a distro fix, because Ubuntu backports keep the version
 ([Xint](https://xint.io/blog/nginx2root-remote-code-execution)). The table is `common/advisories.json`; files in
 `/var/lib/edr-hub/advisories.d/` override it and survive uninstall.
@@ -633,7 +634,7 @@ A dead hub looks like a quiet fleet. Four layers, none relying on the one before
    stop, so a hub that is down, or restarted and not back within the service's grace period, is noticed even when the
    hub's own alerting is dead.
 2. **Health.** `edr-hub health` (local CLI only) is 0 only if the writer committed or idled within 30 s and
-   the engine cursor is current. `check.sh` uses it; there is no health route on any port.
+   the engine cursor is current, both read from `meta` with a read-only connection. `check.sh` uses it; there is no health route on any port.
 3. **Watchdog.** `edr-hub.service` runs under the systemd watchdog, fed from the writer loop (idle tick
    included); `OnFailure=` has `edr-hub-out` send one direct message (§8 step 4).
 4. **Clients.** After 15 minutes without hub contact an agent writes a recurring WARN to its journal and `edr-check` warns
@@ -819,7 +820,7 @@ A local website, installed and running by default, separate from the client inge
   lines (P3), with `ensure_ascii=True` as in the output rules below.
 
 ### Which socket takes which command
-`ctl.sock` (root CLI) accepts every command. `ui.sock` (the dashboard) accepts only the rows marked UI. `out.sock`
+`ctl.sock` (root CLI) accepts every socket command (`backup`, `restore`, `ca-export` and `health` are file operations and use no socket). `ui.sock` (the dashboard) accepts only the rows marked UI. `out.sock`
 (`edr-hub-out` only) accepts `outbox.take`, `outbox.result`, `feed.job` and `feed.result`; no admin verb is reachable
 on it. Reads do not use a socket: the CLI and the UI open the database read-only.
 
@@ -915,7 +916,8 @@ firewall is the only step that can lock you out, so it comes last (step 10). Exi
 1. **Pre-flight** (refuses before changing anything, except WARN):
    - Ubuntu 24.04 or 26.04, systemd, `python3` 3.12+, `openssl`, `nftables`, SQLite with `VACUUM INTO`.
    - Clock synchronised (`timedatectl`; tokens and certificate dates depend on it). SSH port from `sshd -T`.
-   - Addresses: public, VPC and each `--public-ip`; WARN if no Reserved IP is passed (not on the NIC, §2).
+   - Addresses: public, VPC and each `--public-ip`; WARN if no Reserved IP is passed (not on the NIC, §2). Refuse (exit 3)
+     if that combined list holds more than 4 addresses (`hub_addresses` is capped at 4).
    - Free disk at least the database cap plus `backup_keep` backups of that size (§14); WARN under 2x.
    - WARN: `ufw` active (the installer prints the `ufw allow` lines, never edits UFW); the admin account has no
      local password (the DigitalOcean Recovery Console needs one; confirm what the Droplet Console needs in the
@@ -929,6 +931,8 @@ firewall is the only step that can lock you out, so it comes last (step 10). Exi
    | `/var/lib/edr-hub` | `edr-hub:edr-hub-ui`, `2750` | `hub.db`, `-wal`, `-shm` (`0640`, group inherited), `settings.json`, `advisories.d/`, `webhook-ca.pem` (the `--webhook-ca` file, copied here by the installer; a public certificate), `last-backup` (`0644`, written by the backup job, §7) |
    | `/var/lib/edr-hub/ca` | `edr-hub`, `0700` | CA key and certificate, `revoked.txt` (P3: the key moves to `/var/lib/edr-hub-ca`, the signer's own `StateDirectory`, owner `edr-hub-ca`, `0400`; the certificate and `revoked.txt` stay here) |
    | `/var/lib/edr-hub/tls` | `edr-hub`, `0700` | Hub server certificate `server.pem` and key `server.key` (`0600`); reissued at runtime (§2), not backed up (§7), kept on uninstall (§9) |
+   | `/var/lib/edr-hub-out` | `edr-hub-out`, `0700` | `channels.json` (the outbound worker's `StateDirectory`), kept on uninstall (§9) |
+   | `/var/lib/edr-hub-ca` (P3) | `edr-hub-ca`, `0700` | CA key (`0400`), the signer's `StateDirectory`, kept on uninstall (§9) |
    | `/var/backups/edr-hub` | `root`, `0700` | Encrypted backups (step 8) |
    | `/run/edr-hub` | `edr-hub:edr-hub`, `0711` | `ctl.sock` `0600` `edr-hub`; `ui.sock` `0660` group `edr-hub-ui`; `out.sock` `0660` group `edr-hub-out` (outbox and feed verbs only) |
    | `/etc/edr-hub` | `root:root`, `0750` | Firewall file, `ui-url` (`0600`), `manifest.jsonl`, `secrets.json` (webhook, SMTP, ntfy and dead-man secrets; written by the root CLI, §6) and `backup.pass` (the backup passphrase file; encrypts scheduled backups; shown once at install; not the `ca-export` passphrase), both `0600` |
@@ -1020,7 +1024,7 @@ firewall is the only step that can lock you out, so it comes last (step 10). Exi
    (§4). The output says it tells a third party that a hub exists.
 8. **Scheduled backups.** `edr-hub-backup.timer`, daily 02:15 UTC (`Persistent=yes`), runs `edr-hub backup` as root;
    format, passphrase handling and `ca-export` are §7. It keeps `backup_keep` copies (default 14, §14), free space
-   checked first. The installer prints the passphrase once (store it off the box) and tells you to run
+   checked first. The installer prints the passphrase once (store it off the box) when it generates it; if `/etc/edr-hub/backup.pass` already exists it is kept and not printed again, so old backups still decrypt. It tells you to run
    `edr-hub ca-export`. Pull `/var/backups/edr-hub` to your own machine: no credentials go on the hub. Add a weekly
    DigitalOcean snapshot. The hub alerts at 7 days without a good backup (§4).
 9. **Start.** Start `edr-hub`, `edr-hub-out`, `edr-hub-ui` and wait for `edr-hub health` (§4). On a first install the
@@ -1057,7 +1061,7 @@ pointed at itself.
 1. **Final backup** to `/var/backups/edr-hub/` (encrypted, as in §7), if the database opens. If it does not, say so
    and carry on.
 2. Stop and disable `edr-hub-backup.timer`, cancel any `edr-hub-fw-rollback` or `edr-hub-install` transient unit, then
-   stop and disable `edr-hub-ui`, `edr-hub-out`, `edr-hub` (and `edr-hub-ca`, P3). Clients spool and retry meanwhile.
+   stop and disable `edr-hub-ui`, `edr-hub-out`, `edr-hub` (and `edr-hub-ca`, P3, and in P3 `edr-hub-clients.path` and `edr-hub-clients.timer`). Clients spool and retry meanwhile.
 3. Disable `edr-hub-nft.service` and delete the `inet edr_hub` table. Do this after the services, so the ports are
    never open without the table.
 4. Replay `/etc/edr-hub/manifest.jsonl`: remove the units, `/usr/local/lib/edr-hub` and `/usr/local/lib/edr-hub.prev`,
@@ -1065,7 +1069,7 @@ pointed at itself.
    `systemctl stop systemd-journald@edr-hub`) and `/etc/apt/apt.conf.d/52edr-hub`, and restore any prior value the
    manifest holds. A file the manifest does not list is left alone and printed. Then remove `/etc/edr-hub`
    except `secrets.json` and `backup.pass`.
-5. **Keep `/var/lib/edr-hub`** (database, CA, server certificate and key in `tls/`, settings, `last-backup`), `/etc/edr-hub/secrets.json`, `/etc/edr-hub/backup.pass` and
+5. **Keep `/var/lib/edr-hub`** (database, CA, server certificate and key in `tls/`, settings, `last-backup`), `/var/lib/edr-hub-out` (`channels.json`) and, in P3, `/var/lib/edr-hub-ca` (the CA key), `/etc/edr-hub/secrets.json`, `/etc/edr-hub/backup.pass` and
    `/var/backups/edr-hub`, so running
    `install.sh` again brings back the same hub and clients keep working without re-enrolling.
 
@@ -1076,14 +1080,14 @@ pointed at itself.
 - **No package is removed.** `unattended-upgrades` stays on; the manifest lists any package the installer added.
 - A DigitalOcean Cloud Firewall and the DNS or Reserved IP records are yours: remove them by hand.
 
-**`--purge`** also deletes `/var/lib/edr-hub`, `/etc/edr-hub`, `/var/backups/edr-hub` and then the four users and groups. Before it
+**`--purge`** also deletes `/var/lib/edr-hub`, `/var/lib/edr-hub-out`, `/var/lib/edr-hub-ca` (P3), `/etc/edr-hub`, `/var/backups/edr-hub` and then the four users and groups. Before it
 does anything it warns, in this order, that:
 - the CA key is deleted, and a backup holds none (§7), so offer `edr-hub ca-export` first;
 - every enrolled client then needs a new token from a new hub (`rehome`, client §5) and old pins will not match;
 - the backups are deleted too, so copy off anything you want.
 
 It asks twice. It finishes by checking that no `edr_hub` table is left, that nothing listens on the fleet,
-enrollment and dashboard ports, and that no `edr-hub*` unit or process remains. A host still enrolled keeps alerting
+enrollment and dashboard ports, and that no `edr-hub*` unit (`edr-hub-clients` included) or process remains. A host still enrolled keeps alerting
 locally (§4, Watching the hub); a client uninstall does not need the hub (client §6). Exit codes: the
 `uninstall.sh` column of §17.
 
@@ -1095,8 +1099,10 @@ locally (§4, Watching the hub); a client uninstall does not need the hub (clien
     ├── PLAN.md               this document
     ├── install.sh            §8; re-runnable, doubles as the upgrade (§17)
     ├── uninstall.sh          §9
-    ├── check.sh              read-only health: services, ports, certificate expiry, DB size, `auto_vacuum`, WAL
-    │                         size, feed age, backup age, hosts down; exit codes in §17
+    ├── check.sh              read-only health: services, ports, `inet edr_hub` table loaded (FAIL if
+    │                         missing), `edr-hub-nft.service` and `edr-hub-backup.timer` enabled, no pending
+    │                         `edr-hub-fw-rollback` timer, `edr-hub health`, certificate expiry, DB size,
+    │                         `auto_vacuum`, WAL size, feed age, backup age, hosts down; exit codes in §17
     ├── docs/RUNBOOK.md       §15; the same "next step" table that feeds alerts and the dashboard (§4)
     ├── pki/strict/           explicit X.509 extension files `ca.ext`, `srv.ext`, `cli.ext` (§2)
     ├── hub/
@@ -1108,6 +1114,7 @@ locally (§4, Watching the hub); a client uninstall does not need the hub (clien
     │   ├── ui/index.html     the single-page dashboard
     │   ├── agent-hashes.json accepted agent hashes of this release, written by the release build (§17)
     │   └── edr-hub           CLI (Python)
+    ├── tests/test_*.py       L0 unit tests for `make unit` (§12)
     └── files/                units for the three services (four with the P3 signer), backup service and timer,
                               the failure-notice unit, nft table; the P3 root helper `edr-hub-clients` (service, path
                               and timer) that fills the `--clients-only` sets; the unit names are fixed in §8
@@ -1178,7 +1185,7 @@ side:
 ### L1: network namespace (root)
 
 The `inet edr_hub` table in a throwaway namespace: the per-source SYN meter on 8443 and 8444, the IPv6 /64 form, `--clients-only` (P3), and the `meta skuid` rule that stops `edr-hub` starting outbound
-connections.
+connections. The L1 cases are added to `tests/firewall-netns.sh` (client §11).
 
 ### Slow-client and flood tests (L2, run against the real server)
 
@@ -1189,7 +1196,10 @@ Each row of the §2 Limits table and each flood rule in §2 and §3 gets a test 
   let the WAL pass its alert bound.
 - **Sockets.** After a start, the socket directory and each socket have the modes in §8, and the CLI still sends the
   caller's login uid although every unit has `ProtectProc=invisible`.
-- **Queue.** With the writer queue full, CRITICAL is still alerted from memory and appended to `critical-overflow.jsonl`.
+- **Queue.** With the writer queue full, every ingest route answers 503 with `Retry-After` and stores nothing (HIGH and
+  CRITICAL included, §2); the client keeps the batch. **Storage.** With `max_page_count` reached or the disk full and
+  the emergency prune not enough, LOW and INFO get 503; HIGH and CRITICAL are alerted from memory, appended to
+  `critical-overflow.jsonl` and answered 200 only after the append (§3).
 
 ### Restore drill and compatibility (L2)
 
@@ -1451,7 +1461,7 @@ exists so the operator can decide the notices and legal basis that apply; it is 
 **Order: hub first, then clients.** Clients cannot be pushed to, so the hub must understand the version they have and
 the one they will have. Protocol and schema rules: Appendix A (Versioning). An old protocol gets 426, an old event
 `v` (client Appendix B) gets 422 `schema_too_old`; the client keeps spooling in both cases. A client newer than the
-hub is refused the same way (confirm the status code in the VM test). Hub and clients may run different Ubuntu releases.
+hub is refused the same way (426, Appendix A). Hub and clients may run different Ubuntu releases.
 
 **Upgrading the hub.** Re-run `install.sh` from the new release tarball (checksum verified).
 1. Pre-flight, then stage the new code beside the old; keep one previous copy (`/usr/local/lib/edr-hub.prev`).
@@ -1532,7 +1542,7 @@ The contract between `edr-agent` and `edr-hub`. Limits and the reasons for them 
   client keeps the `ca_sha256` part). `host_uuid`, `hostname`, `os` and `ips` are hints for display; the hub mints the
   UUID and the token's name wins. `droplet_id` is stored with the host and compared with every heartbeat's.
 - **Response:** `200 {"host_uuid", "certificate", "ca", "hub_addresses": ["203.0.113.5"], "port": 8443, "not_after",
-  "state": "pending"}`. `hub_addresses` is a list of bare IP literals (IPv6 without brackets, at most 4); `port` is the
+  "state": "pending"}`. `hub_addresses` is a list of bare IP literals (IPv6 without brackets, at most 4; it is the stored `public_ip` list in stored order); `port` is the
   fleet port, a separate integer. The same token and CSR within 10 minutes gets the
   same answer.
 - **Statuses:** 400 bad body or CSR; 401 `invalid_token` (the same answer for unknown, wrong, expired and used);

@@ -5,6 +5,8 @@ After=suricata.service tetragon.service
 [Service]
 Type=oneshot
 ExecStart=/usr/local/sbin/ips-watch
+# A hung check would otherwise leave the unit activating for ever and stop all alerting
+TimeoutStartSec=10min
 StateDirectory=ips-watch
 # Reads a lot of log on each run; never at the expense of whatever you are doing
 Nice=10

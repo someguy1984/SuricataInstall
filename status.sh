@@ -60,4 +60,13 @@ if systemctl is-active --quiet ips-watch.timer; then
 else
     echo "  ${Y}not installed${N}  Alerting: nothing notifies you of problems (sudo $ROOT/watch/install.sh)"
 fi
+# watch/install.sh adds the Tetragon notifier only if Tetragon was already installed
+if [[ -f /etc/systemd/system/ips-watch.timer && -f /etc/systemd/system/tetragon-alerts.service ]]; then
+    if systemctl is-active --quiet tetragon-notify.service; then
+        echo "  ${G}ok${N}             Tetragon desktop alerts (tetragon-notify.service)"
+    else
+        echo "  ${R}FAIL${N}           Tetragon desktop alerts: tetragon-notify.service is not running (sudo $ROOT/watch/install.sh)"
+        bad=1
+    fi
+fi
 exit $bad
