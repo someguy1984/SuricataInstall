@@ -40,8 +40,11 @@ import time
 
 # Tampering with Tetragon or with the IPS: see the module comment
 ALWAYS = {"tetragon-tamper", "stack-tamper"}
-# Worth knowing, not worth a notification that stays on screen until dismissed
-QUIET = {"tcp-listen", "device-access"}
+# Worth knowing, not worth a notification that stays on screen until dismissed. Not
+# device-access: a camera or microphone opened by something that is not PipeWire is exactly
+# what a short-lived banner lets you miss (a browser listing the cameras for a page's
+# fingerprinting does this too, about twice in five hours, and is rate-limited by --repeat)
+QUIET = {"tcp-listen"}
 
 
 def detail(args):
