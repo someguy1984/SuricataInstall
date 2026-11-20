@@ -1,0 +1,88 @@
+# Observe-only: log edits to the user's desktop settings database that do not come from
+# the settings service.
+#
+# ~/.config/dconf/user holds the GNOME settings: notifications and Do Not Disturb, the screen
+# lock and idle time, the enabled shell extensions, custom keyboard shortcuts (which run
+# commands), the camera and microphone privacy switches. dconf-service is the only program
+# that writes it: every application that changes a setting (Settings, gsettings, dconf,
+# an extension) asks the service over D-Bus, and the service rewrites the file. So a write
+# from any other program is an edit that went round the service.
+#
+# Two hooks, because a rename is not a write:
+#   1. a write (MAY_WRITE, 0x02) to anything in ~/.config/dconf/, including the temporary
+#      copy an editor such as `sed -i` makes next to the file
+#   2. a file moved into ~/.config/dconf (`mv evil ~/.config/dconf/user`)
+#
+# dconf-service itself rewrites the file on every login, unlock and settings change, and
+# renames its new copy over the old one each time; it is excluded and not logged.
+#
+# Limit: this does not say WHO changed a setting. A program that runs `gsettings set` or
+# talks to dconf-service is the service doing the write. `gsettings` and `dconf` runs are
+# in Tetragon's exec log (/var/log/tetragon); a setting changed from inside a GUI program is not.
+# @HOME@ is replaced by the watched user's home directory at install time.
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "desktop-settings"
+spec:
+  kprobes:
+  - call: "security_file_permission"
+    syscall: false
+    return: true
+    message: "Write to the desktop settings (dconf) database"
+    args:
+    - index: 0
+      type: "file" # (struct file *) used for getting the path
+    - index: 1
+      type: "int" # 0x02 is MAY_WRITE
+    returnArg:
+      index: 0
+      type: "int"
+    selectors:
+    - matchArgs:
+      - index: 0
+        operator: "Prefix"
+        values:
+        - "@HOME@/.config/dconf/"
+      - index: 1
+        operator: "Mask"
+        values:
+        - "2" # MAY_WRITE
+      matchBinaries:
+      - operator: "NotIn"
+        values:
+        - "/usr/libexec/dconf-service"
+      matchActions:
+      - action: Post
+        rateLimit: "1m"
+  - call: "security_path_rename"
+    syscall: false
+    message: "File moved into the desktop settings (dconf) directory"
+    args:
+    - index: 0 # const struct path *old_dir
+      type: "path"
+      label: "from_dir"
+    - index: 1 # struct dentry *old_dentry
+      type: "string"
+      resolve: "d_name.name"
+      label: "from"
+    - index: 2 # const struct path *new_dir
+      type: "path"
+      label: "to_dir"
+    - index: 3 # struct dentry *new_dentry
+      type: "string"
+      resolve: "d_name.name"
+      label: "to"
+    selectors:
+    - matchArgs:
+      - args: [2]
+        operator: "Prefix"
+        values:
+        - "@HOME@/.config/dconf"
+      matchBinaries:
+      - operator: "NotIn"
+        values:
+        - "/usr/libexec/dconf-service"
+      matchActions:
+      - action: Post
+        rateLimit: "1m"

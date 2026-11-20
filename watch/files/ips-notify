@@ -29,7 +29,7 @@ esac
 logger -t ips-alert -p "$prio" -- "$title${body:+: $(printf '%s' "$body" | tr '\n' '|' | sed 's/|/ | /g')}" 2>/dev/null
 
 [ "$level" = log ] && exit 0
-command -v notify-send >/dev/null || exit 0
+command -v gdbus >/dev/null || command -v notify-send >/dev/null || exit 0
 
 # Titles and bodies carry text that came off the network or out of a process's arguments.
 # Notification bodies understand a little markup, so make sure none of it is taken as such.
@@ -41,15 +41,56 @@ body=$(printf '%s' "$body" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt
 #   journalctl -t ips-alert       a delivery that FAILED (also an alert in its own right)
 # "Delivered" means the notification service accepted it; whether a banner is then shown is
 # up to the desktop (Do Not Disturb, screen sharing, full screen).
+# The notification service is asked directly with gdbus, not through notify-send. Ubuntu
+# confines /usr/bin/notify-send with an AppArmor profile (/etc/apparmor.d/notify-send) that
+# refuses its connection to the session bus from inside a systemd sandbox that has a private
+# mount namespace (ProtectSystem=, PrivateTmp= and so on): "Could not connect: Permission
+# denied". Both watcher services run in one, so through notify-send none of their banners
+# ever appeared. gdbus has no such profile. notify-send remains the fallback without gdbus.
+#
+# gvstr TEXT prints TEXT as a quoted GVariant string: control characters dropped, bytes that
+# are not valid UTF-8 replaced, backslash, quote and newline escaped.
+gvstr() {
+    GVTEXT=$1 python3 -I -c '
+import os
+s = os.environb[b"GVTEXT"].decode("utf-8", "replace")
+s = "".join(c for c in s if c == "\n" or (c >= " " and c != "\x7f"))
+print("\x27" + s.replace("\\", "\\\\").replace("\x27", "\\\x27").replace("\n", "\\n") + "\x27", end="")'
+}
+
+# send_desktop UID USER URGENCY TITLE BODY: prints what went wrong on failure
+send_desktop() {
+    local uid=$1 user=$2 urgency=$3 t=$4 b=$5 byte=1
+    [ "$urgency" = critical ] && byte=2
+    if command -v gdbus >/dev/null && command -v python3 >/dev/null; then
+        # The error text (stderr) is wanted, gdbus's reply "(uint32 5,)" (stdout) is not
+        # shellcheck disable=SC2069
+        timeout 5 runuser -u "$user" -- env DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+            gdbus call --session --dest org.freedesktop.Notifications \
+            --object-path /org/freedesktop/Notifications --method org.freedesktop.Notifications.Notify \
+            "'IPS watch'" 0 "'security-high'" "$(gvstr "$t")" "$(gvstr "$b")" "[]" "{'urgency': <byte $byte>}" -- -1 2>&1 >/dev/null
+    else
+        timeout 5 runuser -u "$user" -- env DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+            notify-send -a "IPS watch" -u "$urgency" -i security-high -- "$t" "$b" 2>&1
+    fi
+}
+
 reached=0
 while read -r uid user _; do
     case $uid in '' | *[!0-9]*) continue ;; esac
     [ "$uid" -ge 1000 ] || continue
     [ -S "/run/user/$uid/bus" ] || continue
     reached=1
-    out=$(timeout 5 runuser -u "$user" -- env DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
-        notify-send -a "IPS watch" -u "$level" -i security-high -- "$title" "$body" 2>&1)
+    out=$(send_desktop "$uid" "$user" "$level" "$title" "$body")
     rc=$?
+    if [ $rc -ne 0 ]; then
+        # The text came off the network or out of a process's arguments: never let a message
+        # that will not parse be the reason an alert is not shown
+        first=$out
+        out=$(send_desktop "$uid" "$user" "$level" "$title" "(The details could not be shown here. See: journalctl -t ips-alert)")
+        rc=$?
+        [ $rc -ne 0 ] || logger -t ips-notify -p daemon.warning -- "$level notification for $user needed its text replaced (rejected: $(printf '%s' "$first" | tr '\n' ' ' | cut -c1-120)): $title" 2>/dev/null
+    fi
     if [ $rc -eq 0 ]; then
         logger -t ips-notify -p daemon.info -- "$level notification accepted for $user: $title" 2>/dev/null
     else

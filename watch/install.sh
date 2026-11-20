@@ -33,8 +33,8 @@ have_suricata=0 have_tetragon=0
 [ $have_suricata = 1 ] && echo "Suricata kit found" || echo "Suricata kit not found (run ../suricata/install.sh first to have it watched)"
 [ $have_tetragon = 1 ] && echo "Tetragon kit found" || echo "Tetragon kit not found (run ../tetragon/local_install.sh first to have it watched)"
 [ $have_suricata = 1 ] || [ $have_tetragon = 1 ] || die "nothing to watch yet: install Suricata and/or Tetragon first"
-command -v notify-send >/dev/null \
-    || echo "NOTE: notify-send is not installed (apt install libnotify-bin): alerts will go to the journal only"
+command -v gdbus >/dev/null || command -v notify-send >/dev/null \
+    || echo "NOTE: neither gdbus nor notify-send is installed (apt install libglib2.0-bin): alerts will go to the journal only"
 
 say "Installing scripts and settings"
 install -m 0755 -o root -g root "$HERE/files/ips-notify" /usr/local/sbin/ips-notify
