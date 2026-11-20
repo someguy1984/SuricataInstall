@@ -48,7 +48,7 @@ run() {
     fi
 }
 
-run "Suricata IPS" '[[ -f /etc/systemd/system/suricata.service.d/override.conf ]]' "$ROOT/check.sh"
+run "Suricata IPS" '[[ -f /etc/systemd/system/suricata.service.d/override.conf ]]' "$ROOT/suricata/check.sh"
 run "Control D DNS lockdown" '[[ -f /etc/systemd/system/dns-lockdown.service ]]' "$ROOT/controld/verify.sh"
 run "Tetragon" '[[ -f /etc/systemd/system/tetragon.service ]]' "$ROOT/tetragon/check.sh"
 

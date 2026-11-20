@@ -109,7 +109,7 @@ if [ -d /etc/suricata ] && getent group suricata >/dev/null; then
         install -m 0644 -o root -g suricata "$STATE/dns-lockdown.rules" "$SURICATA_RULES"
         echo "Installed $SURICATA_RULES ($(grep -c '^drop ' "$SURICATA_RULES") rules)"
         if ! grep -qs "^  - $SURICATA_RULES" /etc/suricata/suricata.yaml; then
-            echo "NOTE: Suricata's config doesn't load this file yet; run ../install.sh so it does"
+            echo "NOTE: Suricata's config doesn't load this file yet; run ../suricata/install.sh so it does"
         elif systemctl is-active --quiet suricata; then
             systemctl reload suricata
             echo "Reloading Suricata's rules (takes about a minute to take effect)"
@@ -118,7 +118,7 @@ if [ -d /etc/suricata ] && getent group suricata >/dev/null; then
     rm -f "$STATE/dns-lockdown.rules"
 else
     echo "Suricata is not installed: only the firewall layer is in place."
-    echo "../install.sh adds these rules when it is run after this script."
+    echo "../suricata/install.sh adds these rules when it is run after this script."
 fi
 
 # The sandbox is not optional (HARDEN=0 used to skip it): a sandbox ctrld does not start

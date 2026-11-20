@@ -29,7 +29,7 @@ x-droplet: &droplet
   restart: unless-stopped
 
 # Each service mounts the whole repo read-only at /opt/SuricataInstall, because the installers reuse
-# the laptop kit (tetragon/, controld/, files/), plus a volume for its mock certificate.
+# the laptop kit (tetragon/, controld/, suricata/), plus a volume for its mock certificate.
 
 services:
   hub:

@@ -12,8 +12,8 @@ It is built from the laptop kits at the top of this repository.
 | [`mock/`](mock/README.md) | A working Docker test bed: two Ubuntu 26.04 boxes (hub, and web with nginx and PHP 8.5 serving `web.dev.local` on 80 and 443) on a private network. `./mock.sh up && ./mock.sh test`. Its README says what it can and cannot test. |
 
 **Paths.** In the plans, `server_client/…`, `server_hub/…` and `mock/…` are relative to this folder. Paths to the
-laptop kit they reuse (`install.sh`, `check.sh`, `analyse.py`, `files/`, `tetragon/`, `controld/`, `watch/`, `tests/`,
-`Makefile`) are relative to the repository root.
+laptop kit they reuse (`suricata/` with its `install.sh`, `check.sh`, `analyse.py` and `files/`; `tetragon/`,
+`controld/`, `watch/`, `tests/`, `Makefile`) are relative to the repository root.
 
 ## The design in eight lines
 

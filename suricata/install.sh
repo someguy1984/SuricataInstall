@@ -14,11 +14,11 @@
 # and tested, and is only restarted (or just reloaded) once the test has passed. If anything
 # fails before that point the previous files are put back. Undo with ./uninstall.sh
 #
-# The rules that stop DNS leaving the machine belong to the Control D lockdown (controld/).
+# The rules that stop DNS leaving the machine belong to the Control D lockdown (../controld/).
 # They are installed here only if that lockdown is already in place; otherwise
 # controld/install.sh adds them later.
 #
-# Run with: sudo ./install.sh [CIDR ...]
+# Run with: sudo ./install.sh [CIDR ...]        (from this folder, or by its path from anywhere)
 #   HOME_NET follows this machine's own addresses automatically. CIDRs given here are kept
 #   in HOME_NET permanently (written to /etc/suricata/home-net.extra, replacing its contents),
 #   e.g. a NAS you trust:  sudo ./install.sh 192.168.1.20/32
@@ -151,7 +151,7 @@ install -m 0644 -o root -g suricata "$SRC/local.rules" $ETC/local.rules
 
 # The DNS rules drop all plain DNS leaving the machine, so they only go in where ctrld and
 # the lockdown are already installed. controld/install.sh fills the file in otherwise.
-dns_gen="$ROOT/controld/files/dns-lockdown-rules.sh"
+dns_gen="$(dirname "$ROOT")/controld/files/dns-lockdown-rules.sh"
 if systemctl is-enabled --quiet dns-lockdown.service 2>/dev/null && [[ -f $dns_gen ]]; then
     bash "$dns_gen" > $ETC/dns-lockdown.rules.new
     echo "DNS lockdown is installed: adding its rules ($(grep -c '^drop ' $ETC/dns-lockdown.rules.new) rules)"
@@ -159,7 +159,7 @@ elif [[ -f $dns_gen ]]; then
     bash "$dns_gen" --stub > $ETC/dns-lockdown.rules.new
     echo "DNS lockdown (controld/) is not installed: no DNS rules added. controld/install.sh adds them."
 else
-    echo "# Placeholder: controld/ was not found next to install.sh, so no DNS lockdown rules." > $ETC/dns-lockdown.rules.new
+    echo "# Placeholder: controld/ was not found next to suricata/, so no DNS lockdown rules." > $ETC/dns-lockdown.rules.new
 fi
 install -m 0644 -o root -g suricata $ETC/dns-lockdown.rules.new $ETC/dns-lockdown.rules
 rm -f $ETC/dns-lockdown.rules.new

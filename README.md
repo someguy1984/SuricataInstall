@@ -1,6 +1,6 @@
 To apply
 
-sudo ./install.sh
+(cd suricata && sudo ./install.sh)
 (cd controld && sudo ./install.sh)
 tetragon/local_install.sh
 (cd watch && sudo ./install.sh)
@@ -12,16 +12,16 @@ uninstaller and health check, and each can be re-run safely.
 
 | Kit | Folder | What it does |
 |-----|--------|--------------|
-| **Suricata IPS** | `.` (`install.sh`, `files/`) | All IPv4/IPv6 traffic goes through Suricata 8.x inline (NFQUEUE in the mangle table, so UFW still applies afterwards). High-confidence malicious traffic is dropped, the rest alerts. |
+| **Suricata IPS** | `suricata/` | All IPv4/IPv6 traffic goes through Suricata 8.x inline (NFQUEUE in the mangle table, so UFW still applies afterwards). High-confidence malicious traffic is dropped, the rest alerts. |
 | **Control D DNS lockdown** | `controld/` | Every DNS lookup has to go through `ctrld`: plain DNS, DoT and public DoH resolvers are refused in the firewall and dropped by Suricata; browsers' own DoH is switched off. |
 | **Tetragon** | `tetragon/` | Records what processes do on the machine itself (eBPF): every exec, plus policies for credential theft, persistence, privilege escalation, kernel tampering and tampering with this setup. |
 | **Alerting** | `watch/` | Tells you. A 15-minute health and activity check, and desktop notifications for Tetragon policy hits. Without it nothing here speaks up by itself. |
 
 ```
-├── install.sh, uninstall.sh   Suricata IPS            sudo ./install.sh [CIDR ...]
-├── check.sh                   its health check        sudo ./check.sh [--config-test] [--live]
-├── analyse.py                 report on recent logs   ./analyse.py [--minutes 5] [--json] [-v]
-├── files/                     everything the Suricata kit installs
+├── suricata/                  Suricata IPS            sudo ./install.sh [CIDR ...], sudo ./uninstall.sh
+│   ├── check.sh               its health check        sudo ./check.sh [--config-test] [--live]
+│   ├── analyse.py             report on recent logs   ./analyse.py [--minutes 5] [--json] [-v]
+│   └── files/                 everything the Suricata kit installs
 ├── controld/                  DNS lockdown            sudo ./install.sh, ./verify.sh, sudo ./uninstall.sh
 ├── tetragon/                  Tetragon                ./local_install.sh, sudo ./check.sh, ./local_uninstall.sh
 ├── watch/                     alerting                sudo ./install.sh, sudo ./uninstall.sh
@@ -38,7 +38,7 @@ uninstaller and health check, and each can be re-run safely.
 Any order works, but if you install Tetragon after the alerting kit, re-run `watch/install.sh` so it
 picks up the Tetragon notifier; this order needs no second pass:
 
-    sudo ./install.sh                  # Suricata IPS
+    (cd suricata && sudo ./install.sh) # Suricata IPS
     (cd controld && sudo ./install.sh) # DNS lockdown: needs ctrld running and answering first
     tetragon/local_install.sh          # Tetragon (asks for sudo itself)
     (cd watch && sudo ./install.sh)    # alerting: last, it watches whatever is installed
@@ -51,7 +51,7 @@ keep a copy when they replace one that had local edits).
 To see what an installer would do before letting it, rehearse it. It runs for real, but against
 copy-on-write copies of the system directories, with service restarts only recorded:
 
-    sudo tests/dry-run.sh ./install.sh          # likewise controld/install.sh, tetragon/local_install.sh, watch/install.sh
+    sudo tests/dry-run.sh suricata/install.sh   # likewise controld/install.sh, tetragon/local_install.sh, watch/install.sh
 
 `apt` is stubbed, so the kit's prerequisites (Suricata, ctrld, Tetragon) must already be installed;
 for a fresh machine use `make vm-test`.
@@ -64,7 +64,7 @@ not without a network. (That is about installing. Once installed there is one de
 
 | Installer | What you may notice | If it goes wrong |
 |-----------|---------------------|------------------|
-| `install.sh` | Nothing. Suricata keeps inspecting while the new config is prepared and tested, then restarts once: about a minute in which traffic passes uninspected. Open connections survive. | Before the test has passed: the previous config files are put back and the running Suricata is not restarted (`home-net.extra`, the rule sources and the rebuilt ruleset are not rolled back). After: traffic passes uninspected until Suricata is back (`--queue-bypass`). If the firewall rules can't be built they are removed, which also means uninspected, not blocked. |
+| `suricata/install.sh` | Nothing. Suricata keeps inspecting while the new config is prepared and tested, then restarts once: about a minute in which traffic passes uninspected. Open connections survive. | Before the test has passed: the previous config files are put back and the running Suricata is not restarted (`home-net.extra`, the rule sources and the rebuilt ruleset are not rolled back). After: traffic passes uninspected until Suricata is back (`--queue-bypass`). If the firewall rules can't be built they are removed, which also means uninspected, not blocked. |
 | `controld/install.sh` | DNS lookups fail for a few seconds while ctrld restarts, and only if its sandbox file changed. Browsers pick up their policy the next time they start. | A sandbox that ctrld doesn't come back under is replaced by the previous one automatically. If the firewall chain can't be built it is removed: DNS works, but is not locked. If ctrld still does not resolve once the sandbox is gone, the lockdown is lifted again (firewall chain, its boot unit and Suricata's DNS rules) and the installer stops. |
 | `tetragon/local_install.sh` | Nothing; Tetragon only observes. Nothing is recorded for the seconds it takes to restart. | The network is not involved. |
 | `watch/install.sh` | One test notification. | The network is not involved. |
@@ -80,7 +80,7 @@ If DNS or the network does break, these undo progressively more:
     sudo systemctl restart ctrld           # ctrld itself is stuck
     sudo systemctl stop suricata-nfqueue   # take Suricata out of the traffic path (start it to put it back)
     (cd controld && sudo ./uninstall.sh)   # remove the DNS lockdown, leave ctrld (its config and binary stay root-only)
-    sudo ./uninstall.sh --keep-logs        # remove Suricata
+    (cd suricata && sudo ./uninstall.sh --keep-logs)   # remove Suricata
 
 ### How the kits fit together
 
@@ -102,8 +102,11 @@ If DNS or the network does break, these undo progressively more:
 
 # Suricata IPS
 
+The kit lives in `suricata/`, and the commands in this part are run from there.
+
 ## Install
 
+    cd suricata
     sudo ./install.sh                       # install, configure, download rules, go inline
     sudo ./install.sh 192.168.1.20/32       # same, also keeping a trusted host/network in HOME_NET
 
@@ -115,12 +118,12 @@ What it does:
 2. Installs `suricata`, `iptables`, `curl` and `python3`. On a first install it stops Suricata (the
    package starts it in af-packet IDS mode); on a re-run Suricata keeps inspecting traffic.
 3. Saves the existing config once to `/var/lib/suricata-installer/suricata.yaml.orig`, then builds
-   the new one as a **candidate** (`/etc/suricata/suricata.yaml.new`) from `files/suricata.yaml`,
+   the new one as a **candidate** (`/etc/suricata/suricata.yaml.new`) from `suricata/files/suricata.yaml`,
    with this machine's default-route interface and HOME_NET filled in (see [HOME_NET](#home_net)).
    CIDRs passed as arguments are written to `/etc/suricata/home-net.extra` and always kept in
    HOME_NET. Installs `drop.conf`, `disable.conf`, `modify.conf`, `local.rules` and the DNS
    lockdown's rules (or their placeholder).
-4. Enables the rule sources in `files/rule-sources.conf` (disabling any no longer listed), then runs
+4. Enables the rule sources in `suricata/files/rule-sources.conf` (disabling any no longer listed), then runs
    `suricata-update` to download them, convert the high-confidence rules to drop and leave out the
    categories listed in `disable.conf`.
 5. Runs `suricata -T` on the candidate. **If anything fails up to here, the previous files in
@@ -133,7 +136,7 @@ What it does:
    `files/` to `/usr/local/lib/suricata-ips`. Then it restarts Suricata, or only reloads the rules
    if neither the yaml nor the service settings changed, and waits until it is attached to the queue.
 
-`install.sh` is safe to re-run, e.g. after editing anything in `files/`. A re-run restarts Suricata
+`install.sh` is safe to re-run, e.g. after editing anything in `suricata/files/`. A re-run restarts Suricata
 at most once, at the end; `stream.midstream` keeps already-open connections alive through it.
 
 ### HOME_NET
@@ -311,7 +314,7 @@ of root or of a user in the `suricata` group):
 
 ## What gets installed
 
-| From `files/`                   | Installed to                                            |
+| From `suricata/files/`                   | Installed to                                            |
 |---------------------------------|---------------------------------------------------------|
 | `suricata.yaml`                 | `/etc/suricata/suricata.yaml` (`@DEFAULT_IFACE@` and HOME_NET filled in) |
 | `drop.conf`, `disable.conf`, `modify.conf` | `/etc/suricata/` (rules converted to drop / left out / tweaked by suricata-update) |
@@ -338,7 +341,7 @@ eve.json only (no `stats.log`).
 
 ## Rules and blocking policy
 
-Sources (`files/rule-sources.conf`):
+Sources (`suricata/files/rule-sources.conf`):
 
 | Source                     | What it covers                                   |
 |----------------------------|--------------------------------------------------|
@@ -347,20 +350,20 @@ Sources (`files/rule-sources.conf`):
 | `abuse.ch/feodotracker`    | Botnet C2 IPs (Emotet, QakBot, Dridex, ...)      |
 | `abuse.ch/urlhaus`         | Malware distribution URLs (plain HTTP only)      |
 
-Converted to drop (`files/drop.conf`):
+Converted to drop (`suricata/files/drop.conf`):
 
 - classtypes `trojan-activity`, `command-and-control`, `exploit-kit`, `domain-c2`, `credential-theft`
 - ET groups `emerging-malware`, `emerging-mobile_malware`, `emerging-coinminer`, `ciarmy`, `compromised`, `drop`
 - every ET rule rated `confidence High` with severity `Major` or `Critical`
 - Suricata's own stream rule 2210057 (data injected into a TCP handshake), which ships as a drop;
-  `files/modify.conf` no longer turns it back into an alert
+  `suricata/files/modify.conf` no longer turns it back into an alert
 - all abuse.ch rules (SSLBL by message; Feodo Tracker and URLhaus are `trojan-activity`)
 
 The ET categories that describe policy or informational activity rather than attacks (INFO, HUNTING,
 POLICY, GAMES, CHAT, P2P, DNS, DYN_DNS, TOR, USER_AGENTS) stay alert-only, for the classtype lines as
 well as the confidence line. The whole-group lines are not affected.
 
-Left out altogether (`files/disable.conf`): the ActiveX, retired and SCADA categories, which can't
+Left out altogether (`suricata/files/disable.conf`): the ActiveX, retired and SCADA categories, which can't
 apply to this machine (about 700 rules). Three larger alert-only categories (web applications and
 web servers hosted here, dynamic-DNS lookups: about 13,000 rules) are listed there commented out;
 uncomment them if they are only noise for you. That is where most of the memory and reload time
@@ -393,7 +396,7 @@ none of the normal traffic seen would have been blocked.
 - **Suricata overloaded → excess packets dropped.** NFQ runs with `fail-open: no`: if the queue
   fills because Suricata can't keep up, packets are dropped rather than passed uninspected (TCP
   retransmits them). `check.sh` reports queue overflows; if they appear regularly, investigate
-  load or set `fail-open: yes` in `files/suricata.yaml` and re-run `install.sh`.
+  load or set `fail-open: yes` in `suricata/files/suricata.yaml` and re-run `install.sh`.
 - The rules sit in the mangle table, in a chain of their own (`SURICATA-NFQ`), so an ACCEPT verdict
   from Suricata still goes through UFW and stop/start only ever touch rules this kit created.
 - The daily rule update tests the new ruleset and keeps the old one if the test fails, then reloads
@@ -402,8 +405,8 @@ none of the normal traffic seen would have been blocked.
 ## Tuning
 
 Something legitimate blocked? Find its SID in `/var/log/suricata/eve.json` (`"event_type":"drop"`
-or alerts with `"action":"blocked"`), add it to `files/disable.conf` (or to `files/modify.conf`
-as `<sid> "drop" "alert"` to keep the alert), then `sudo ./install.sh`. If nothing else changed, that
+or alerts with `"action":"blocked"`), add it to `suricata/files/disable.conf` (or to `suricata/files/modify.conf`
+as `<sid> "drop" "alert"` to keep the alert), then re-run `suricata/install.sh`. If nothing else changed, that
 reloads the rules without restarting Suricata.
 
 ---
@@ -438,7 +441,7 @@ What it puts in place:
   first in FORWARD and covers VMs and containers routed through this machine (it is separate because
   the kernel does not allow a cgroup match on forwarded traffic).
 - **Suricata rules**, if Suricata is installed: see above. Without Suricata only the firewall layer
-  exists; `../install.sh` adds the rules when it is run afterwards.
+  exists; `../suricata/install.sh` adds the rules when it is run afterwards.
 - **One resolver list** for both: `controld/files/doh-resolvers.conf`. Add a hostname or IP there and re-run
   `install.sh`; hostnames become Suricata SNI rules, IPs become firewall rules.
 - **Browsers**: Firefox and the Chromium family (Chromium, and Chrome, Brave and Edge if installed)
@@ -575,7 +578,7 @@ you add it. `sudo tetragon/check.sh --canary` is an end-to-end test: it reads on
     make vm-test             # Suricata kit: install -> check -> uninstall in a fresh Ubuntu VM (needs multipass)
 
 `make lint` uses `shellcheck` and PyYAML when they are installed and says what it skipped when they
-are not. It also parses `files/suricata.yaml` and the regexes in `files/drop.conf`, the Python inside
+are not. It also parses `suricata/files/suricata.yaml` and the regexes in `suricata/files/drop.conf`, the Python inside
 `ips-watch`, ctrld's drop-ins, the units `tetragon/local_install.sh` writes, the tmpfiles and logrotate
 files, and notices Python
 files missing from the Makefile list. Not checked: Dockerfile, nginx, PowerShell/cmd, HTML and the

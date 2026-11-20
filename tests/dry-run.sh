@@ -1,11 +1,11 @@
 #!/bin/bash
 # Rehearse an installer without changing this machine.
 #
-#   sudo tests/dry-run.sh ./install.sh
+#   sudo tests/dry-run.sh suricata/install.sh
 #   sudo tests/dry-run.sh controld/install.sh
 #   sudo tests/dry-run.sh tetragon/local_install.sh
 #   sudo tests/dry-run.sh watch/install.sh
-#   sudo KEEP=1 tests/dry-run.sh ./install.sh      keep the files it wrote, to look at them
+#   sudo KEEP=1 tests/dry-run.sh suricata/install.sh      keep the files it wrote, to look at them
 #
 # The installer really runs: it downloads what it downloads, generates its files, and (for
 # Suricata) loads the whole ruleset into the new config to test it. But it runs in a private

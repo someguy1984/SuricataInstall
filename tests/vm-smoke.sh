@@ -43,7 +43,7 @@ step "DNS works before the install"
 vm getent hosts archive.ubuntu.com >/dev/null
 
 step "install.sh"
-vm sudo /home/ubuntu/ips/install.sh
+vm sudo /home/ubuntu/ips/suricata/install.sh
 
 step "DNS still works with Suricata inline (no ctrld here, so no DNS rules may be loaded)"
 vm getent hosts archive.ubuntu.com >/dev/null
@@ -51,24 +51,24 @@ vm getent hosts archive.ubuntu.com >/dev/null
 vm sudo sh -c 'test -f /etc/suricata/dns-lockdown.rules && ! grep -q "^drop " /etc/suricata/dns-lockdown.rules'
 
 step "check.sh --live"
-vm sudo /home/ubuntu/ips/check.sh --live
+vm sudo /home/ubuntu/ips/suricata/check.sh --live
 
 step "install.sh again (a re-run must keep Suricata up and end healthy)"
-vm sudo /home/ubuntu/ips/install.sh
-vm sudo /home/ubuntu/ips/check.sh
+vm sudo /home/ubuntu/ips/suricata/install.sh
+vm sudo /home/ubuntu/ips/suricata/check.sh
 
 step "A broken config must be refused and leave the working one in place"
-vm sudo cp /home/ubuntu/ips/files/suricata.yaml /home/ubuntu/suricata.yaml.good
-vm sudo sh -c 'echo "this-is: [not valid" >> /home/ubuntu/ips/files/suricata.yaml'
-if vm sudo /home/ubuntu/ips/install.sh; then
+vm sudo cp /home/ubuntu/ips/suricata/files/suricata.yaml /home/ubuntu/suricata.yaml.good
+vm sudo sh -c 'echo "this-is: [not valid" >> /home/ubuntu/ips/suricata/files/suricata.yaml'
+if vm sudo /home/ubuntu/ips/suricata/install.sh; then
     echo "FAIL: install.sh accepted a broken suricata.yaml"; exit 1
 fi
-vm sudo cp /home/ubuntu/suricata.yaml.good /home/ubuntu/ips/files/suricata.yaml
+vm sudo cp /home/ubuntu/suricata.yaml.good /home/ubuntu/ips/suricata/files/suricata.yaml
 vm sudo systemctl is-active --quiet suricata
-vm sudo /home/ubuntu/ips/check.sh
+vm sudo /home/ubuntu/ips/suricata/check.sh
 
 step "uninstall.sh"
-vm sudo /home/ubuntu/ips/uninstall.sh --yes
+vm sudo /home/ubuntu/ips/suricata/uninstall.sh --yes
 if vm sudo sh -c 'iptables -t mangle -S; ip6tables -t mangle -S' | grep -qE 'NFQUEUE|SURICATA-NFQ'; then
     echo "FAIL: firewall rules left behind after uninstall"; exit 1
 fi

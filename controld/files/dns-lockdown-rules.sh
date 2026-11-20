@@ -1,7 +1,7 @@
 #!/bin/bash
 # Print the Suricata rules for the DNS lockdown, built from doh-resolvers.conf.
 # The output is installed as /etc/suricata/dns-lockdown.rules by controld/install.sh, and by
-# the Suricata install.sh when the lockdown is already in place. Nothing runs this at runtime.
+# suricata/install.sh when the lockdown is already in place. Nothing runs this at runtime.
 #
 # Usage: dns-lockdown-rules.sh [LIST]   rules for the hostnames in LIST (default: doh-resolvers.conf here)
 #        dns-lockdown-rules.sh --stub   the placeholder used while the lockdown isn't installed

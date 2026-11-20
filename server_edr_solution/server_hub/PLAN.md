@@ -6,8 +6,8 @@ the HTTPS-visibility limit (client §1), the threat model (client §13), the NGI
 This plan holds the hub's side of the contract; the API reference is Appendix A.
 
 **Paths:** `server_client/…`, `server_hub/…`, `common/…` and `mock/…` are relative to `server_edr_solution/`. Paths to
-the laptop kit this reuses (`install.sh`, `check.sh`, `analyse.py`, `files/`, `tetragon/`, `controld/`, `watch/`,
-`tests/`, `Makefile`) are relative to the repository root. A local Docker test bed is in [`../mock/`](../mock/README.md).
+the laptop kit this reuses (`suricata/` with its `install.sh`, `check.sh`, `analyse.py` and `files/`; `tetragon/`,
+`controld/`, `watch/`, `tests/`, `Makefile`) are relative to the repository root. A local Docker test bed is in [`../mock/`](../mock/README.md).
 
 **Contents**
 

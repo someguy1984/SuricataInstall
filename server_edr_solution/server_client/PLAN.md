@@ -6,8 +6,8 @@ The verdict and the HTTPS limit are in §1, the threat model in §13, the NGINX2
 Section numbers are stable; phases (P1a, P1b, P2, P3, P4) are defined in §10 and marked in the text.
 
 **Paths:** `server_client/…`, `server_hub/…` and `mock/…` are relative to `server_edr_solution/`. Paths to the
-laptop kit this reuses (`install.sh`, `check.sh`, `analyse.py`, `files/`, `tetragon/`, `controld/`, `watch/`,
-`tests/`, `Makefile`) are relative to the repository root. A local Docker test bed is in [`../mock/`](../mock/README.md).
+laptop kit this reuses (`suricata/` with its `install.sh`, `check.sh`, `analyse.py` and `files/`; `tetragon/`,
+`controld/`, `watch/`, `tests/`, `Makefile`) are relative to the repository root. A local Docker test bed is in [`../mock/`](../mock/README.md).
 
 **Contents**
 
@@ -215,7 +215,7 @@ key). Later, not v1: a `bpf-filter` dropping server-to-client 443 (one-sided flo
 `ExecStart=` line: the packaged `/usr/bin/suricata --af-packet -c /etc/suricata/suricata.yaml --pidfile
 /run/suricata.pid --user suricata --group suricata` stays (an `ExecStart=` reset would lose `--af-packet`).
 `--user suricata` must stay (log group and agent reads depend on it). The list below is applied to the laptop
-`files/suricata-override.conf` when building the drop-in:
+`suricata/files/suricata-override.conf` when building the drop-in:
 
 - **Keep:** `ProtectSystem=strict`, `Protect*`, `Private*`, `Restrict*`, `LockPersonality`, `SystemCallArchitectures`
   (no `MemoryDenyWriteExecute`: it breaks the PCRE2 JIT). **Change:** `AmbientCapabilities=CAP_NET_RAW` only;
@@ -273,8 +273,8 @@ above stay exact. `edr-home-net` writes `home-net.extra` from the key. `[suricat
 No runtime metadata calls. At install the installer prints the detected set (from `ip -o addr`, plus the Reserved IP and public IPv6 from the metadata service when it reports them; those are saved to `[sites] extra_addresses`, which `edr-home-net` adds on every run) and asks for confirmation; `--home-net CIDR` overrides. `check.sh` FAILs if
 HOME_NET lacks an address from `ip -o addr`. The same set feeds §4.2's own-addresses never-ban list.
 
-**Reuse and packaging.** Reused: the candidate, test, commit or roll back pattern (`install.sh:62-95`, `:186`,
-`:203-204`), `suricata.apt-pin`, `drop.conf`/`modify.conf`/`disable.conf`, the laptop yaml as base (a server `include:`
+**Reuse and packaging.** Reused: the candidate, test, commit or roll back pattern (`suricata/install.sh:62-95`, `:187`,
+`:204-205`), `suricata.apt-pin`, `drop.conf`/`modify.conf`/`disable.conf`, the laptop yaml as base (a server `include:`
 overlay: verify precedence). Not reused: `suricata-nfqueue-apply.sh`, `suricata-nfqueue.service`, the NetworkManager
 hook. Suricata comes from the **OISF stable PPA** on both releases (8.0.8 at time of writing; pin `1:8.*`). Trade-off:
 26.04's archive has 8.0.3, so the PPA adds a third-party repository in return for currency in a parser of hostile

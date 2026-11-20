@@ -119,13 +119,13 @@ fi
 echo "== Suricata config"
 if python3 -I -c 'import yaml' 2>/dev/null; then
     # The template only parses once the interface placeholder is filled in
-    if out=$(sed 's/@DEFAULT_IFACE@/eth0/' files/suricata.yaml | python3 -I -c '
+    if out=$(sed 's/@DEFAULT_IFACE@/eth0/' suricata/files/suricata.yaml | python3 -I -c '
 import sys, yaml
 d = yaml.safe_load(sys.stdin)
 assert d["nfq"]["fail-open"] is False, "nfq.fail-open must be no"
 assert d["stream"]["midstream"] is True, "stream.midstream must be yes"
 assert d["security"]["landlock"]["enabled"] is True, "security.landlock.enabled must be yes"
-' 2>&1); then ok "files/suricata.yaml parses; fail-closed queue, midstream and landlock are set"; else bad "files/suricata.yaml: $out"; fi
+' 2>&1); then ok "suricata/files/suricata.yaml parses; fail-closed queue, midstream and landlock are set"; else bad "suricata/files/suricata.yaml: $out"; fi
     if out=$(python3 -I -c '
 import re, sys
 for n, line in enumerate(open(sys.argv[1]), 1):
@@ -134,7 +134,7 @@ for n, line in enumerate(open(sys.argv[1]), 1):
             re.compile(line[3:].strip())
         except re.error as e:
             print(f"line {n}: {e}"); sys.exit(1)
-' files/drop.conf 2>&1); then ok "files/drop.conf: every re: line compiles"; else bad "files/drop.conf: $out"; fi
+' suricata/files/drop.conf 2>&1); then ok "suricata/files/drop.conf: every re: line compiles"; else bad "suricata/files/drop.conf: $out"; fi
 else
     skip "PyYAML is not installed (apt install python3-yaml)"
 fi
@@ -197,7 +197,7 @@ for n, line in enumerate(open(sys.argv[1]), 1):
 echo "== systemd units"
 if command -v systemd-analyze >/dev/null; then
     # Missing binaries and units are expected on a machine where the kits aren't installed
-    out=$(systemd-analyze verify files/*.service files/*.timer controld/files/*.service watch/files/*.service watch/files/*.timer \
+    out=$(systemd-analyze verify suricata/files/*.service suricata/files/*.timer controld/files/*.service watch/files/*.service watch/files/*.timer \
         server_edr_solution/mock/hub/*.service server_edr_solution/mock/web/*.service 2>&1 \
         | grep -vE 'is not executable|No such file or directory|not found|Unit .* not found' || true)
     if [[ -z $out ]]; then ok "units parse"; else bad "systemd-analyze verify:"; sed 's/^/        /' <<<"$out"; fi
@@ -280,7 +280,7 @@ else
     skip "systemd-tmpfiles has no --dry-run here"
 fi
 if command -v logrotate >/dev/null; then
-    for f in files/suricata.logrotate controld/files/ctrld.logrotate; do
+    for f in suricata/files/suricata.logrotate controld/files/ctrld.logrotate; do
         # A copy: logrotate refuses a file that belongs to someone else. -d changes nothing.
         cp "$f" "$LINT_TMP/logrotate.conf"
         out=$(logrotate -d -s "$LINT_TMP/logrotate.state" "$LINT_TMP/logrotate.conf" 2>&1 | grep -E 'unknown option|error: .*logrotate\.conf' || true)

@@ -30,7 +30,7 @@ say "Pre-flight"
 have_suricata=0 have_tetragon=0
 [ -x /usr/local/lib/suricata-ips/check.sh ] && have_suricata=1
 [ -x /usr/local/lib/tetragon-tools/check.sh ] && have_tetragon=1
-[ $have_suricata = 1 ] && echo "Suricata kit found" || echo "Suricata kit not found (run ../install.sh first to have it watched)"
+[ $have_suricata = 1 ] && echo "Suricata kit found" || echo "Suricata kit not found (run ../suricata/install.sh first to have it watched)"
 [ $have_tetragon = 1 ] && echo "Tetragon kit found" || echo "Tetragon kit not found (run ../tetragon/local_install.sh first to have it watched)"
 [ $have_suricata = 1 ] || [ $have_tetragon = 1 ] || die "nothing to watch yet: install Suricata and/or Tetragon first"
 command -v notify-send >/dev/null \

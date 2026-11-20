@@ -6,8 +6,8 @@
 #   make vm-test         Suricata kit install -> check -> uninstall cycle in a fresh Ubuntu VM (needs multipass)
 
 SHELL := /bin/bash
-SH_FILES := install.sh uninstall.sh check.sh status.sh \
-	files/suricata-home-net.sh files/suricata-nfqueue-apply.sh files/90-suricata-home-net \
+SH_FILES := status.sh suricata/install.sh suricata/uninstall.sh suricata/check.sh \
+	suricata/files/suricata-home-net.sh suricata/files/suricata-nfqueue-apply.sh suricata/files/90-suricata-home-net \
 	controld/install.sh controld/uninstall.sh controld/verify.sh \
 	controld/files/dns-lockdown.sh controld/files/dns-lockdown-rules.sh \
 	tetragon/config.sh tetragon/local_install.sh tetragon/local_uninstall.sh \
@@ -16,7 +16,7 @@ SH_FILES := install.sh uninstall.sh check.sh status.sh \
 	tests/firewall-netns.sh tests/analyse-smoke.sh tests/watch-smoke.sh tests/dry-run.sh tests/vm-smoke.sh tests/lint.sh \
 	server_edr_solution/mock/mock.sh server_edr_solution/mock/common/mock-tls.sh \
 	windows_qemu/inspect.sh windows_qemu/run_windows_qemu.sh windows_qemu/run_windows_sentinel_replica.sh
-PY_FILES := analyse.py tetragon/viewer/server.py watch/files/tetragon-notify.py \
+PY_FILES := suricata/analyse.py tetragon/viewer/server.py watch/files/tetragon-notify.py \
 	windows_qemu/monitor.py windows_qemu/replica/analyze_run.py windows_qemu/replica/make_key_dmpstore.py \
 	windows_qemu/replica/qmp_watch.py
 

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Exercise the two firewall scripts (files/suricata-nfqueue-apply.sh and
+# Exercise the two firewall scripts (suricata/files/suricata-nfqueue-apply.sh and
 # controld/files/dns-lockdown.sh) in a throwaway network namespace. The namespace has its
 # own, empty netfilter tables, so nothing here touches this machine's real firewall.
 # systemctl, systemd-run and logger are replaced by stubs for the same reason.
@@ -8,7 +8,7 @@
 set -uo pipefail
 
 ROOT="$(dirname "$(dirname "$(readlink -f "$0")")")"
-NFQ="$ROOT/files/suricata-nfqueue-apply.sh"
+NFQ="$ROOT/suricata/files/suricata-nfqueue-apply.sh"
 LOCK="$ROOT/controld/files/dns-lockdown.sh"
 
 [[ $EUID -eq 0 ]] || { echo "Run as root (sudo $0)"; exit 1; }

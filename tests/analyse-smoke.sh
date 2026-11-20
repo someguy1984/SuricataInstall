@@ -6,7 +6,7 @@
 set -uo pipefail
 
 ROOT="$(dirname "$(dirname "$(readlink -f "$0")")")"
-AN="$ROOT/analyse.py"
+AN="$ROOT/suricata/analyse.py"
 
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
