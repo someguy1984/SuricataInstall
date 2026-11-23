@@ -127,7 +127,7 @@ RULES = (
           "Read the heartbeat's policy list (name, mode, would_be_kills); restart Tetragon; run edr-check on the host.",
           kinds=("health.enforcement_gone",), hb_keys=("tetragon", "kernel")),
     _rule("agent_silent", "containment", "Agent silent", "HIGH; CRITICAL within 30 minutes of a rule above",
-          "No heartbeat for five minutes (late at four).",
+          "No heartbeat for five minutes.",
           "Down, tampered with or blinded. Silent 14 days: a daily 'retire it?' line, paging continues.",
           hub_side="hosts.last_seen", hub_kind="hub.agent_silent"),
     _rule("reboot", "containment", "Reboot: notice then a new boot id within 10 minutes / a new boot id with no notice",
@@ -239,6 +239,11 @@ RULES = (
           "The daily summary of MEDIUM and LOW findings.",
           "Read it; run 'edr-hub status' for the live state.",
           hub_side="daily", hub_kind="hub.digest"),
+    _rule("crit_cap", "hub", "More CRITICAL alerts from one host than the cap allows", "HIGH",
+          "One host sent more than 10 CRITICAL alerts in 30 minutes: the rest were held back for that host only.",
+          "Read the host's incidents ('edr-hub incidents --open', 'edr-hub events --host HOST --min-sev critical'): a host that "
+          "floods CRITICAL events is broken or compromised.",
+          hub_side="per-host CRITICAL cap", hub_kind="hub.crit_cap"),
     _rule("storm", "hub", "Alerts suppressed by storm control", "HIGH",
           "More than 20 messages in ten minutes: the rest were held back.",
           "Run 'edr-hub incidents' and 'edr-hub status' for what is open.",
@@ -357,6 +362,19 @@ def rule_for(kind):
         if any("*" in k and fnmatch.fnmatchcase(kind, k) for k in rule["kinds"]):
             return rule
     return None
+
+
+def dedup_kind(kind):
+    """The kind part of a dedup key. A kind the table names exactly keeps its own key. Every other kind a client may
+    invent shares one key per rule (a glob row such as tamper.*) or one key in all, so a host cannot make as many
+    alert_state rows or pages as it can make kind names."""
+    if not isinstance(kind, str):
+        return "other"
+    for rule in RULES:
+        if kind in rule["kinds"] or kind == rule["hub_kind"]:
+            return kind
+    rule = rule_for(kind)
+    return "glob:" + rule["id"] if rule else "other"
 
 
 _GENERIC = {
@@ -576,7 +594,7 @@ def _rate(conn, host_row, event):
     elif kind in ("inventory.uncovered_webroots", "inventory.uncovered_fpm_binaries", "inventory.uncovered_pool_users"):
         sev, by = _floor(client, "MEDIUM"), "coverage_drift"
     elif kind == "inventory.deleted_exe":
-        by = "deleted_exe"                       # the client rates it (HIGH only for nginx, php-fpm, sshd, public listeners)
+        sev, by = _floor(client, "HIGH"), "deleted_exe"       # the table says HIGH; the hub, not the client, owns the rating
 
     # A scanner or web signal from a never-ban range is a hint worth a digest line
     if kind in ("suricata.alert", "ssh.fail", "canary.tripwire") and sev_rank(sev) < sev_rank("MEDIUM"):

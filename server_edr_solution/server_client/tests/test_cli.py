@@ -240,8 +240,37 @@ class TestDiscover(CliCase):
         self.write(os.path.join(d, "cmdline"), "nginx: master process /usr/sbin/nginx\0")
         os.symlink("/opt/nginx/sbin/nginx (deleted)", os.path.join(d, "exe"))
         found, notes = discover.discover(self.paths, runner=self.fake_run(), which=lambda *a, **k: None,
-                                         fpm_pool_glob=os.path.join(self.root, "none", "*.conf"))
+                                         fpm_pool_glob=os.path.join(self.root, "none", "*.conf"), proc_owner=os.getuid())
         self.assertEqual(found[("sites", "nginx_bin")], "/opt/nginx/sbin/nginx")
+
+    def test_a_process_that_only_looks_like_the_nginx_master_is_not_run_as_root(self):
+        """A web user can start `exec -a "nginx: master process" /tmp/x`. discover runs as root and runs `nginx -V`."""
+        d = os.path.join(self.proc, "777")
+        os.makedirs(d)
+        self.write(os.path.join(d, "comm"), "nginx\n")
+        self.write(os.path.join(d, "cmdline"), "nginx: master process /tmp/x\0")
+        evil = self.write(os.path.join(self.root, "tmp", "evil"), "#!/bin/sh\n", 0o755)
+        os.symlink(evil, os.path.join(d, "exe"))
+        ran = []
+
+        def run(argv, **kw):
+            ran.append(argv)
+            return self.fake_run()(argv, **kw)
+        kw = dict(runner=run, which=lambda *a, **k: None, fpm_pool_glob=os.path.join(self.root, "none", "*.conf"))
+        # the process belongs to someone other than root (here: not the expected owner): ignored, and nothing is run
+        found, notes = discover.discover(self.paths, proc_owner=os.getuid() + 1, **kw)
+        self.assertNotIn(("sites", "nginx_bin"), found)
+        self.assertEqual([a for a in ran if a[0] != "ip"], [])
+        # a root-owned process whose program anyone can write is ignored too
+        os.chmod(evil, 0o777)
+        found, notes = discover.discover(self.paths, proc_owner=os.getuid(), **kw)
+        self.assertNotIn(("sites", "nginx_bin"), found)
+        self.assertEqual([a for a in ran if a[0] != "ip"], [])
+        os.chmod(evil, 0o755)
+        found, notes = discover.discover(self.paths, proc_owner=os.getuid(), **kw)
+        self.assertEqual(found[("sites", "nginx_bin")], evil)
+        import inspect
+        self.assertEqual(inspect.signature(discover.discover).parameters["proc_owner"].default, 0)    # real runs trust root only
 
     def test_include_limits(self):
         depth = os.path.join(self.root, "deep")

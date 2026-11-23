@@ -35,7 +35,7 @@ class VersionTests(unittest.TestCase):
     CASES = [
         ("1.24.0-2ubuntu7.20", "1.24.0-2ubuntu7.19"), ("1.24.0-2ubuntu7.20", "1.24.0-2ubuntu7.20"), ("1.24.0-2ubuntu7.9", "1.24.0-2ubuntu7.20"),
         ("1.30.7-1~noble", "1.30.7"), ("1.30.6-1~noble", "1.30.7-1~noble"), ("1.0~rc1", "1.0"), ("1:1.0", "2.0"), ("1.0", "0:1.0"),
-        ("1.0-1", "1.0-1~noble"), ("1.0+b1", "1.0"), ("a", "1"), ("1.a", "1.1"), ("1.0.0", "1.0"), ("007", "7"), ("1.2.3~", "1.2.3"),
+        ("1.0-1", "1.0-1~noble"), ("1.0+b1", "1.0"), ("1.a", "1.1"), ("1.0.0", "1.0"), ("007", "7"), ("1.2.3~", "1.2.3"),
         ("7.0.0-38.38~24.04.4", "7.0.0-38.38"), ("6.8.0-147.147", "6.8.0-147"), ("7.0.0-37.37~24.04.1", "7.0.0-38.38~24.04.4"),
         ("1.28.3-2ubuntu1.13", "1.28.3-2ubuntu1.12"), ("1.2-3-4", "1.2-3-5"), ("2:0.9", "1:9.9"), ("1.0~~", "1.0~"), ("1.0-0", "1.0"),
     ]
@@ -53,8 +53,8 @@ class VersionTests(unittest.TestCase):
         alphabet = "0123456789.+~-:abz"
         checked = 0
         for _ in range(400):
-            a = "".join(rng.choice(alphabet) for _ in range(rng.randint(1, 9)))
-            b = "".join(rng.choice(alphabet) for _ in range(rng.randint(1, 9)))
+            a = rng.choice("0123456789") + "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 8)))      # a version starts with a digit
+            b = rng.choice("0123456789") + "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 8)))
             try:
                 got = adv.dpkg_compare(a, b)
             except ValueError:
@@ -384,6 +384,52 @@ class InventoryTests(unittest.TestCase):
         self.assertEqual(adv.release_codename("resolute"), "resolute")
         self.assertIsNone(adv.release_codename("Debian 13"))
         self.assertIsNone(adv.release_codename(None))
+
+
+class VersionGuardTests(unittest.TestCase):
+    def test_a_string_that_is_not_a_version_is_never_newer_than_a_fix(self):
+        for bad in ("none", "unknown", "(none)", "n/a", "\x00", "", " ", "-", "x1.0", "1.0\x00", "1 .0", "1.0;rm", "v1.2", "\u0661.0", "9" * 300):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                adv.dpkg_compare(bad, "1.0")
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                adv.upstream_of(bad)
+
+    def test_debian_versions_still_parse(self):
+        for good in ("1.24.0-2ubuntu7.20", "1:1.0", "0:1", "1.30.7-1~noble", "2.0+dfsg-1", "1~rc1", "7.0.0-38.38~24.04.4", "1.2.3-4-5"):
+            self.assertEqual(adv.dpkg_compare(good, good), 0, good)
+
+    def test_the_kernel_path_gives_unknown_for_garbage(self):
+        table = adv.load(hub_common.Paths(state_dir="/nonexistent-edr-test", lib_dir=os.path.join(HERE, "..", "hub")))
+        out = adv.evaluate_kernel(table, release="noble", running="Ubuntu none-generic 6.8.1", sctp=True, now_ms=at("2026-11-23"))
+        self.assertNotIn("fixed", {v["status"] for v in out})
+
+
+class OverrideFileTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="edr-adv2-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.paths = hub_common.Paths(state_dir=self.tmp, lib_dir=os.path.join(HERE, "..", "hub"))
+        os.makedirs(self.paths.advisories_d)
+
+    def test_links_fifos_and_directories_are_skipped_and_named(self):
+        d = self.paths.advisories_d
+        real = os.path.join(self.tmp, "real.json")
+        with open(real, "w") as f:
+            json.dump({"rows": []}, f)
+        os.symlink(real, os.path.join(d, "link.json"))
+        os.mkfifo(os.path.join(d, "fifo.json"))
+        os.mkdir(os.path.join(d, "dir.json"))
+        table = adv.load(self.paths)
+        for name in ("link.json", "fifo.json", "dir.json"):
+            self.assertTrue(any(p.startswith(name + " skipped") for p in table.problems), (name, table.problems))
+        self.assertEqual(len(table.rows), 8)
+
+    def test_a_regular_override_still_loads(self):
+        row = {"id": "mine", "origin": "ubuntu", "release": "noble", "packages": ["nginx"], "compare": "dpkg", "fixed_in": "9.9",
+               "cves": [], "needs_feature": None, "ref": "https://example.com/x"}
+        with open(os.path.join(self.paths.advisories_d, "a.json"), "w") as f:
+            json.dump({"rows": [row]}, f)
+        self.assertIn("mine", [r["id"] for r in adv.load(self.paths).rows])
 
 
 if __name__ == "__main__":

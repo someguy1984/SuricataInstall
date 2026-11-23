@@ -1,4 +1,4 @@
-"""The status files the root helpers write (contract section 8), read once a minute.
+"""The status files the root helpers write, read once a minute.
 
 Every file is read the way hostile input is read: no symlink, regular files only, size capped, parsed with
 json, and a missing, oversized or unparsable file means "unknown" and never an exception. Out of them come

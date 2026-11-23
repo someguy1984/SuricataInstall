@@ -629,5 +629,88 @@ class ProcessTests(OutCase):
         self.assertEqual(self.server.requests[0]["body"], hub_alerts.render("webhook", p)["body"])
 
 
+class DeadlineAndBackoffTests(OutCase):
+    def test_a_server_that_drips_its_headers_is_cut_at_the_wall_clock_deadline(self):
+        def behavior(h):
+            return 200, {}, 0
+        self.serve(behavior=behavior)
+        # a raw TLS server that sends the status line and then one header byte a second
+        import ssl as _ssl
+        ctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(os.path.join(self.certs, "srv.pem"), os.path.join(self.certs, "srv.key"))
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        self.addCleanup(srv.close)
+
+        def serve():
+            try:
+                conn, _ = srv.accept()
+                tls = ctx.wrap_socket(conn, server_side=True)
+                tls.settimeout(5)
+                data = b""
+                while b"\r\n\r\n" not in data:
+                    data += tls.recv(4096)
+                tls.sendall(b"HTTP/1.0 200 OK\r\n")
+                for _ in range(20):
+                    time.sleep(0.5)
+                    tls.sendall(b"X")
+            except OSError:
+                pass
+            finally:
+                try:
+                    tls.close()
+                except (OSError, UnboundLocalError):
+                    pass
+        threading.Thread(target=serve, daemon=True).start()
+        old = edr_hub_out.TIMEOUT_S
+        edr_hub_out.TIMEOUT_S = 1.5
+        try:
+            started = time.time()
+            ok, err, _ra = edr_hub_out.http_send("POST", "https://localhost:%d/x" % srv.getsockname()[1], {}, b"{}",
+                                                 edr_hub_out.make_context(self.ca_pem), allow_private=True)
+            took = time.time() - started
+        finally:
+            edr_hub_out.TIMEOUT_S = old
+        self.assertFalse(ok)
+        self.assertEqual(err, "timeout")
+        self.assertLess(took, 3)
+
+    def test_the_reply_body_is_never_read(self):
+        self.serve(status=200)
+        self.secrets(webhook_url=self.url())
+        self.sock.options = {"ntfy_url": "", "webhook_ca_pem": self.ca_pem}
+        self.sock.items = [self.job(1)]
+        self.worker().take_and_send()
+        self.assertTrue(self.sock.results[0]["ok"])
+
+    def test_a_critical_does_not_wait_behind_a_long_back_off_for_more_than_five_minutes(self):
+        self.serve(status=429, headers={"Retry-After": "3600"})
+        self.secrets(webhook_url=self.url())
+        self.sock.options = {"ntfy_url": "", "webhook_ca_pem": self.ca_pem}
+        clock = [1000.0]
+        w = edr_hub_out.Worker(self.paths, allow_private=True, clock=lambda: clock[0])
+        self.sock.items = [dict(self.job(1), severity="CRITICAL")]
+        w.take_and_send()
+        self.assertEqual(self.sock.results[0]["retry_after"], 300)              # told to try again in 5 minutes, not 60
+        # a HIGH behind the same hold is held for the full back-off, a CRITICAL only until 5 minutes have passed
+        high = lambda n: dict(self.job(n, severity="HIGH"), severity="HIGH")
+        self.sock.items = [high(2)]
+        w.take_and_send()
+        self.assertEqual(self.sock.results[1]["error"], "held by Retry-After")
+        self.assertGreater(self.sock.results[1]["retry_after"], 3000)
+        clock[0] += 301
+        self.sock.items = [dict(self.job(3), severity="CRITICAL")]
+        before = len(self.server.requests)
+        w.take_and_send()
+        self.assertEqual(len(self.server.requests), before + 1)                 # the CRITICAL was sent again after 5 minutes
+        self.sock.items = [high(4)]
+        before = len(self.server.requests)
+        w.take_and_send()
+        self.assertEqual(len(self.server.requests), before)                      # the HIGH is still held
+
+
+
+
 if __name__ == "__main__":
     unittest.main()

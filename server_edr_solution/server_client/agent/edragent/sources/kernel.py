@@ -12,7 +12,7 @@ from .. import tail
 from .base import Source, cut_line, parse_ip
 
 _PREFIX = re.compile(r"^(?:<\d+>)?(?:\[\s*\d+\.\d+\]\s*)?")
-_LINE = re.compile(r"^(edr-(?:bigconn|dnslock|egress)): ?(.*)$", re.DOTALL)
+_LINE = re.compile(r"^(edr-(?:bigconn|dnslock|egress)): ?(.*)\Z", re.DOTALL)
 _KV = re.compile(r"\b([A-Z]+)=(\S*)")
 _METADATA = "169.254.169.254"
 

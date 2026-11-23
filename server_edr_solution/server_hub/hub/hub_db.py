@@ -366,7 +366,7 @@ class Writer:
         info = {"state": self.state, "detail": self.state_detail, "queue": self.q.qsize(), "cap_bytes": self.cap_bytes}
         return info
 
-    # -- the API of contract section 5.3 --
+    # -- the API the other hub modules use --
     def call(self, fn, timeout=10.0):
         """Run fn(conn) in the writer's transaction and return its result after the commit."""
         if self.thread is not None and threading.current_thread() is self.thread:
@@ -388,7 +388,7 @@ class Writer:
             try:
                 return fn(conn)
             except Exception as e:      # noqa: BLE001 - logged, never raised into the writer loop
-                self.hub.log("ERROR", "posted writer job failed: %s: %s" % (type(e).__name__, e))
+                self.hub.log("ERROR", "posted writer job failed: %s" % type(e).__name__)
         self._enqueue(logged)
 
     def _enqueue(self, fn):

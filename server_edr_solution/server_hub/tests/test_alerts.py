@@ -10,7 +10,12 @@ sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(HERE, "..", "hub"))
 
 import hub_alerts    # noqa: E402
+import hub_rules     # noqa: E402
 from test_engine_support import HubTestCase, T0, MIN, HOUR   # noqa: E402
+
+# kinds the rules table names exactly: each keeps its own dedup key (a kind a client invents does not)
+KNOWN = sorted({k for r in hub_rules.RULES for k in r["kinds"] + (r["hub_kind"],) if k and "*" not in k})
+assert len(KNOWN) >= 35
 
 HOSTILE = "\x1b]8;;http://evil.example/\x07click\x1b]8;;\x07 ‮drowssap <!channel> <@U123> <https://evil.example|safe> & `rm -rf` @here \x00\x9b2J"
 
@@ -40,13 +45,13 @@ class NotifyTests(HubTestCase):
 
     def test_minimum_severity(self):
         self.assertEqual(self.notify(severity="MEDIUM"), 0)
-        self.assertEqual(self.notify(severity="LOW", kind="a.b"), 0)
-        self.assertEqual(self.notify(severity="INFO", kind="a.c", always=True), 1)
+        self.assertEqual(self.notify(severity="LOW", kind=KNOWN[0]), 0)
+        self.assertEqual(self.notify(severity="INFO", kind=KNOWN[1], always=True), 1)
         self.hub.settings["alert_min_severity"] = "CRITICAL"
-        self.assertEqual(self.notify(severity="HIGH", kind="a.d"), 0)
-        self.assertEqual(self.notify(severity="CRITICAL", kind="a.e"), 1)
+        self.assertEqual(self.notify(severity="HIGH", kind=KNOWN[2]), 0)
+        self.assertEqual(self.notify(severity="CRITICAL", kind=KNOWN[3]), 1)
         self.hub.settings["alert_min_severity"] = "MEDIUM"
-        self.assertEqual(self.notify(severity="MEDIUM", kind="a.f"), 1)
+        self.assertEqual(self.notify(severity="MEDIUM", kind=KNOWN[4]), 1)
 
     def test_one_row_per_enabled_channel(self):
         self.hub.settings["ntfy_url"] = "https://ntfy.example.com"
@@ -88,13 +93,13 @@ class NotifyTests(HubTestCase):
     def test_storm_control_twenty_per_ten_minutes_then_one_summary(self):
         sent = 0
         for i in range(30):
-            sent += self.notify(kind="k.%d" % i, now=T0 + i * 1000)
+            sent += self.notify(kind=KNOWN[i], now=T0 + i * 1000)
         self.assertEqual(sent, 20)
-        self.assertEqual(self.notify(severity="CRITICAL", kind="k.crit", now=T0 + 40 * 1000), 1)       # CRITICAL is exempt
-        self.assertEqual(self.notify(kind="k.late", now=T0 + 5 * MIN), 0)
+        self.assertEqual(self.notify(severity="CRITICAL", kind=KNOWN[31], now=T0 + 40 * 1000), 1)       # CRITICAL is exempt
+        self.assertEqual(self.notify(kind=KNOWN[32], now=T0 + 5 * MIN), 0)
         before = len(self.hub.outbox())
         # the window is over: the next message first sends one "N alerts suppressed" summary
-        n = self.notify(kind="k.after", now=T0 + 11 * MIN)
+        n = self.notify(kind=KNOWN[33], now=T0 + 11 * MIN)
         self.assertEqual(n, 2)
         titles = self.hub.titles()
         self.assertEqual(len(titles), before + 2)
@@ -103,7 +108,7 @@ class NotifyTests(HubTestCase):
 
     def test_flush_storm_from_the_tick(self):
         for i in range(25):
-            self.notify(kind="k.%d" % i, now=T0 + i)
+            self.notify(kind=KNOWN[i], now=T0 + i)
         n = self.hub.writer.call(lambda c: hub_alerts.flush_storm(c, self.hub, T0 + 11 * MIN))
         self.assertEqual(n, 1)
         self.assertTrue(any("alerts suppressed" in t for t in self.hub.titles()))
@@ -117,6 +122,60 @@ class NotifyTests(HubTestCase):
         self.hub.writer.call(lambda c: c.execute("UPDATE maintenance SET until=?", (T0 - 1,)))
         self.notify(kind="x.y")
         self.assertNotIn("maintenance window", self.hub.outbox()[-1]["payload"]["fields"])
+
+    def test_kinds_the_table_does_not_name_share_one_dedup_key_per_host(self):
+        for i in range(30):
+            self.notify(severity="HIGH", kind="x.invented%d" % i, now=T0 + i)
+        self.assertEqual(len(self.hub.outbox()), 1)
+        rows = self.hub.q("SELECT COUNT(*) FROM alert_state WHERE key LIKE ?", (self.host["uuid"] + "|%",))[0][0]
+        self.assertEqual(rows, 1)
+        for i in range(30):                                        # a glob row (tamper.*) shares one key as well
+            self.notify(severity="HIGH", kind="tamper.made_up%d" % i, now=T0 + 100 + i)
+        self.assertEqual(self.hub.q("SELECT COUNT(*) FROM alert_state WHERE key LIKE ?", (self.host["uuid"] + "|%",))[0][0], 2)
+        self.assertEqual(hub_rules.dedup_kind("tetragon.web-exec"), "tetragon.web-exec")
+        self.assertEqual(hub_rules.dedup_kind("hub.agent_silent"), "hub.agent_silent")
+
+    def test_one_host_cannot_page_more_than_ten_critical_in_30_minutes_and_gets_one_summary(self):
+        other = self.hub.add_host("web2")
+        crit = lambda: len([o for o in self.hub.outbox() if o["severity"] == "CRITICAL" and o["payload"]["host"] == "web1"])
+        summaries = lambda: [o for o in self.hub.outbox() if o["payload"]["kind"] == "hub.crit_cap"]
+        for i in range(25):
+            self.notify(severity="CRITICAL", kind=KNOWN[i], now=T0 + i * 1000)
+        self.assertEqual(crit(), 10)
+        self.notify(severity="CRITICAL", kind=KNOWN[30], now=T0 + 26 * 1000)
+        self.assertEqual(crit(), 10)
+        # the summary was queued by the next call after the cap was hit, once; the minute stage can send it too
+        self.hub.writer.call(lambda c: hub_alerts.flush_host_caps(c, self.hub, T0 + 60 * 1000))
+        self.assertEqual(len(summaries()), 1)
+        self.assertEqual(summaries()[0]["severity"], "HIGH")
+        self.assertEqual(summaries()[0]["payload"]["host"], "web1")
+        self.assertRegex(summaries()[0]["payload"]["title"], r"^\d+ more CRITICAL alerts from this host suppressed$")
+        self.hub.writer.call(lambda c: hub_alerts.flush_host_caps(c, self.hub, T0 + 120 * 1000))
+        self.assertEqual(len(summaries()), 1)                       # one per 30 minutes
+        # another host is not affected by the first host's cap
+        self.assertEqual(self.notify(severity="CRITICAL", kind=KNOWN[0], host=other, now=T0 + 30 * 1000), 1)
+        # after 30 minutes the host may page again; new suppressions get a new summary 30 minutes after the last one
+        self.notify(severity="CRITICAL", kind=KNOWN[0], now=T0 + 31 * MIN)
+        self.assertEqual(crit(), 11)
+        for i in range(12):
+            self.notify(severity="CRITICAL", kind=KNOWN[i + 1], now=T0 + 31 * MIN + 1000 * i)
+        self.assertEqual(crit(), 20)
+        self.hub.writer.call(lambda c: hub_alerts.flush_host_caps(c, self.hub, T0 + 40 * MIN))
+        self.assertEqual(len(summaries()), 2)                       # the second came 30 minutes after the first
+        for i in range(12):                                          # more pages used up and suppressed
+            self.notify(severity="CRITICAL", kind=KNOWN[i + 1], now=T0 + 45 * MIN + 1000 * i)
+        self.hub.writer.call(lambda c: hub_alerts.flush_host_caps(c, self.hub, T0 + 50 * MIN))
+        self.assertEqual(len(summaries()), 2)                       # not before 30 minutes have passed since the last one
+        self.hub.writer.call(lambda c: hub_alerts.flush_host_caps(c, self.hub, T0 + 63 * MIN))
+        self.assertEqual(len(summaries()), 3)
+
+    def test_admin_notices_and_high_alerts_do_not_use_the_critical_cap(self):
+        for i in range(15):
+            self.notify(severity="CRITICAL", kind=KNOWN[i], now=T0 + i)
+        before = len(self.hub.outbox())
+        self.hub.writer.call(lambda c: hub_alerts.admin_notice(c, self.hub, "token created", "x", "y", now=T0 + 20))
+        self.notify(severity="HIGH", kind=KNOWN[20], now=T0 + 21)
+        self.assertEqual(len(self.hub.outbox()), before + 2)
 
     def test_hostile_fields_are_sanitised_in_the_payload(self):
         evil_host = self.hub.add_host("web9", reported_name=HOSTILE)

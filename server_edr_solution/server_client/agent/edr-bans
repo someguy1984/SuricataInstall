@@ -6,7 +6,7 @@ applies. It trusts nothing it reads: /run/edr-agent/bans.json belongs to the age
 compromised, so every field is checked, the never-ban literals are compiled in, and the nft
 script is built only from str(ipaddress.ip_network(...)) and integers.
 
-Input   /run/edr-agent/bans.json   (agent, hostile)            see contract section 8
+Input   /run/edr-agent/bans.json   (agent, hostile)
         /etc/edr-agent/pause.json  (root, {"until": epoch})    while valid: ban and feed sets are emptied
         /etc/edr-agent/local.conf  ([bans] bigconn_bytes, bigconn_cap; [sites] web_users)
         /var/lib/edr-bans/state.json   the last good state, absolute expiries
@@ -54,6 +54,7 @@ COVER_CAP = {"ban4": V4_SPACE // 1000, "ban6": 16 * 2 ** 96,
              "feed4": V4_SPACE // 50, "feed6": 1024 * 2 ** 96}
 NEW_FEED_COVER_V4 = V4_SPACE * 5 // 1000        # 0.5% of IPv4 per update
 MAX_NEW_HUB_BANS = 20
+HUB_WINDOW_S = 600
 SOURCES = ("local", "fleet", "operator")
 REASONS = ("ssh_fail", "tripwire", "suricata", "bigconn", "window_update", "fleet_quorum", "operator")
 FEED_NAMES = ("spamhaus_drop_v4", "spamhaus_drop_v6", "dshield")
@@ -251,7 +252,7 @@ def coverage(nets):
 
 # ---- Validation ---------------------------------------------------------------------------------
 def empty_state():
-    return {"v": 1, "written_at": 0, "empty": False, "never": [], "bans": [], "feeds": {}, "paused_until": 0}
+    return {"v": 1, "written_at": 0, "empty": False, "never": [], "bans": [], "feeds": {}, "paused_until": 0, "hub_new": []}
 
 
 def _int(v):
@@ -331,12 +332,16 @@ def validate(doc, now, never_fixed, prev, breaker=True):
             continue
         src = b.get("source") if b.get("source") in SOURCES else "unknown"
         reason = b.get("reason") if b.get("reason") in REASONS else "unknown"
-        if breaker and src in ("fleet", "operator") and str(net) not in prev_bans:
+        if src in ("fleet", "operator") and str(net) not in prev_bans:
             new_hub += 1
-            if new_hub > MAX_NEW_HUB_BANS:
-                refuse(str(net), "more than %d new hub bans in one update" % MAX_NEW_HUB_BANS)
-                continue
         kept.append((net, exp, src, reason))
+    # The breaker, read strictly: more than 20 new hub bans in one update or in 10 minutes refuses the WHOLE hub
+    # part of this update (the hub bans already in force stay, local bans apply as usual).
+    hub_new_times = [t for t in prev.get("hub_new", []) if _int(t) and 0 <= now - t < HUB_WINDOW_S]
+    if breaker and new_hub and (new_hub > MAX_NEW_HUB_BANS or new_hub + len(hub_new_times) > MAX_NEW_HUB_BANS):
+        kept = [k for k in kept if not (k[2] in ("fleet", "operator") and str(k[0]) not in prev_bans)]
+        refuse("breaker", "%d new hub bans (+%d in 10 min): the hub part is refused" % (new_hub, len(hub_new_times)))
+        new_hub = 0
     merged = merge_overlaps([(n, e) for n, e, _, _ in kept])
     meta = {}
     for n, e, s, r in kept:
@@ -393,7 +398,8 @@ def validate(doc, now, never_fixed, prev, breaker=True):
             raise Refuse("guard: %s coverage above the cap" % group)
 
     state = {"v": 1, "written_at": wa, "empty": empty,
-             "never": sorted({str(n) for n in extra}), "bans": bans, "feeds": feeds, "paused_until": 0}
+             "never": sorted({str(n) for n in extra}), "bans": bans, "feeds": feeds, "paused_until": 0,
+             "hub_new": (hub_new_times + [now] * new_hub)[-200:]}
     return state, refused
 
 
@@ -414,24 +420,38 @@ def load_state(paths, now, never_fixed):
                          0, never_fixed, {}, breaker=False)
         pu = doc.get("paused_until", 0)
         st["paused_until"] = pu if _int(pu) else 0
+        hn = doc.get("hub_new", [])
+        st["hub_new"] = [t for t in hn if _int(t)][-200:] if isinstance(hn, list) else []
         return st
     except (OSError, ValueError, Refuse, AttributeError, TypeError):
         return empty_state()
 
 
 # ---- Machine addresses -------------------------------------------------------------------------------
-def machine_nets(paths):
-    """The machine's own addresses, gateway, resolvers and DoH stamps, and live SSH sessions.
+def machine_nets(paths, conf=None):
+    """What may never be banned, from sources only root can write: the machine's own addresses, gateway,
+    resolvers and DoH stamps, live SSH sessions, local.conf ([bans] admin_ip and allow_cidr, [sites] vpc_cidr
+    and extra_addresses) and the hub addresses (the root-written drop-in of edr-agent.service and
+    /var/lib/edr-install/hub-addresses.json). The agent's own `never` field only adds to this.
 
-    Each is a single address. Anything unreadable is skipped: the compiled-in literals still hold.
+    Anything unreadable is skipped: the compiled-in literals still hold.
     """
     found = set()
 
-    def add(text):
+    def add(text, lenient=False):
         try:
             net = norm_net(text)
         except ValueError:
-            return
+            if not lenient:
+                return
+            try:
+                net = ipaddress.ip_network(text, strict=False) if isinstance(text, str) and CIDR_RE.fullmatch(text) else None
+            except ValueError:
+                net = None
+            if net is None:
+                return
+            if net.version == 6 and net.prefixlen >= 96 and net.subnet_of(V4MAPPED):
+                return
         if len(found) < 4096:
             found.add(net)
 
@@ -474,6 +494,21 @@ def machine_nets(paths):
             add(s)
     for a in ssh_sessions(paths):
         add(a)
+    for c in (conf or {}).get("never_cfg", []):
+        add(c, lenient=True)
+    for ln in lines("/etc/systemd/system/edr-agent.service.d/10-hub.conf", 65536):
+        m = re.match(r"\s*IPAddressAllow\s*=(.*)\Z", ln)
+        for tok in (m.group(1).split() if m else []):
+            if tok != "localhost":
+                add(tok, lenient=True)
+    try:
+        data, _ = read_regular(paths.p("/var/lib/edr-install/hub-addresses.json"), 65536)
+        doc = json.loads(data.decode("utf-8", "replace"))
+        items = doc.get("addresses", []) if isinstance(doc, dict) else doc
+        for a in (items if isinstance(items, list) else [])[:64]:
+            add(a, lenient=True)
+    except (OSError, ValueError, RecursionError):
+        pass
     return sorted(found, key=lambda n: (n.version, int(n.network_address)))
 
 
@@ -546,6 +581,9 @@ def read_conf(paths, files_dir):
             cp.read_string(data.decode("utf-8", "replace"))
         except (OSError, ValueError, configparser.Error):
             continue
+    never_cfg = []
+    for sec, key in (("bans", "admin_ip"), ("bans", "allow_cidr"), ("sites", "vpc_cidr"), ("sites", "extra_addresses")):
+        never_cfg += [x for x in re.split(r"[,\s]+", cp.get(sec, key, fallback="")) if x][:512]
     big, cap, users, web = DEFAULT_BIGCONN, None, [], True
     try:
         b = parse_size(cp.get("bans", "bigconn_bytes", fallback="4G"))
@@ -573,7 +611,7 @@ def read_conf(paths, files_dir):
                     continue
                 if uid not in users and len(users) < 16:
                     users.append(uid)
-    return {"bigconn_bytes": big, "bigconn_cap": cap, "web_uids": users}
+    return {"bigconn_bytes": big, "bigconn_cap": cap, "web_uids": users, "never_cfg": never_cfg}
 
 
 def pause_until(paths, now):
@@ -807,7 +845,7 @@ def apply_once(paths, rooted, dry, print_only, files_dir, base, now):
     persist = not ((dry or print_only) and not rooted)    # a dry run on the real paths writes nothing
     """One pass. Returns (exit code, read again); read-again means bans.json changed meanwhile."""
     conf = read_conf(paths, files_dir)
-    machine = machine_nets(paths)
+    machine = machine_nets(paths, conf)
     never_fixed = NeverList(machine)
     prev = load_state(paths, now, never_fixed)
     paused = pause_until(paths, now)
@@ -895,6 +933,8 @@ def apply_once(paths, rooted, dry, print_only, files_dir, base, now):
         except OSError as e:
             error = error or "cannot write state.json: %s" % clean(e, 120)
 
+    if not error and any(r["cidr"] == "breaker" for r in refused):
+        error = "hub bans refused: " + next(r["why"] for r in refused if r["cidr"] == "breaker")
     last_apply = {"ok": not error, "at": now, "error": clean(error, 200), "refused": refused[:REFUSED_KEPT]}
     if len(refused) > REFUSED_KEPT:
         last_apply["refused_total"] = len(refused)

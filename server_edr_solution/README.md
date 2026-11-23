@@ -3,13 +3,31 @@
 A small, self-hosted EDR for DigitalOcean Ubuntu 24.04/26.04 web servers that run nginx, PHP and Laravel.
 It is built from the laptop kits at the top of this repository.
 
-**Status: design and test bed. The client and hub themselves are not written yet.**
+**Status: the client and the hub are written for phases P1a, P1b and P2 (hub section 11, client section 10), and have
+not yet been run on any real or mock machine.**
 
 | Folder | What it is |
 |--------|------------|
-| [`server_client/`](server_client/PLAN.md) | The plan for the droplet kit: Suricata IDS, nftables bans, Tetragon web policies, DNS over HTTPS, and a sandboxed Python agent with small root helpers. It installs from a checked tarball with `--hub IP:PORT --token-file FILE`, or with neither to run alone. Also holds the threat model, the configuration and safety-rail tables, the runbooks, and NGINX2Root worked through as an example (Appendix A). |
-| [`server_hub/`](server_hub/PLAN.md) | The plan for the hub: mutual-TLS ingest and a separate short-lived enrollment port, tokens, SQLite with tiered retention, correlation, alerts, fleet bans, encrypted backups, and a local dashboard reached through an SSH tunnel. The API both sides build from is its Appendix A. |
-| [`mock/`](mock/README.md) | A working Docker test bed: two Ubuntu 26.04 boxes (hub, and web with nginx and PHP 8.5 serving `web.dev.local` on 80 and 443) on a private network. `./mock.sh up && ./mock.sh test`. Its README says what it can and cannot test. |
+| [`server_client/`](server_client/PLAN.md) | The droplet kit. Built: the installer (`install.sh`, `uninstall.sh`, `check.sh`) that installs from a checked tarball with `--hub IP:PORT --token-file FILE`, or with neither to run alone; the sandboxed Python agent (`agent/`, in-process modules and small root helpers: bans, inventory, disk guard, DNS watch, policy check); the nftables and systemd files; the Tetragon web policies; the Suricata and DNS-lock wiring. The plan also holds the threat model, the configuration and safety-rail tables, the runbooks, and NGINX2Root worked through as an example (Appendix A). |
+| [`server_hub/`](server_hub/PLAN.md) | The hub. Built: mutual-TLS ingest and a separate short-lived enrollment port, tokens and our own CA, SQLite with tiered retention, correlation and incidents, the alert outbox and the outbound worker, the three local sockets and the `edr-hub` command line, the audit chain, encrypted backup, restore and CA export, a local dashboard reached through an SSH tunnel, and `install.sh`, `uninstall.sh` and `check.sh`. Fleet bans and IP feeds are P3 and are not built. The API both sides build from is the plan's Appendix A. |
+| [`mock/`](mock/README.md) | A Docker test bed: two Ubuntu 26.04 boxes (hub, and web with nginx and PHP 8.5 serving `web.dev.local` on 80 and 443) on a private network. `./mock.sh up && ./mock.sh test` is the part that already worked before the installers existed. The steps that install both kits from their tarballs, enroll, check end to end and uninstall (`dist`, `install-hub`, `install-web`, `enroll`, `e2e`, `uninstall`) are written and have not been run. Its README says what it can and cannot test. |
+
+**How to check it.** Nothing here has been run as an installer on a host.
+
+- `make lint`: syntax and style of every shell and Python file, the Tetragon policies, the units, the release tarballs.
+- `make unit`: the hub's and the agent's unit tests (no root, no network).
+- `sudo make test`: the firewall scripts and the server kit's three nftables tables in throwaway network namespaces.
+- `python3 -I server_edr_solution/tests/e2e_local.py`: a real hub and a real agent on loopback in temporary directories,
+  with the agent's sources fed from recorded input.
+- `server_edr_solution/mock/mock.sh`: the Docker route above, for the installers themselves.
+
+**What has not been done.** No run in the mock or a VM yet. The Tetragon policies have never been loaded into a kernel.
+No installer has run on a real host. Python 3.12 (Ubuntu 24.04) is untested; development used 3.14. The phase exit
+criteria of client section 10 are not met.
+
+**Layout.** `server_hub/hub/edr_hub.py` and `server_client/agent/edr-agent.py` are entry scripts: their logic is in
+sibling modules (`hub_*.py` beside the hub, the `edragent/` package beside the agent), and the command-line tools
+(`edr-hub`, the agent's helper scripts) are Python files with no `.py` suffix.
 
 **Paths.** In the plans, `server_client/…`, `server_hub/…` and `mock/…` are relative to this folder. Paths to the
 laptop kit they reuse (`suricata/` with its `install.sh`, `check.sh`, `analyse.py` and `files/`; `tetragon/`,

@@ -95,8 +95,22 @@ class NginxConf:
                     self._parse(match, depth + 1)
 
 
-def _proc_scan(proc_dir, comm_prefix, cmd_marker):
-    """Executables of running masters: [(pid, exe)] where /proc/<pid>/cmdline starts with the marker."""
+def _trusted_binary(path, owner_uid):
+    """A program that `discover` may run as root: owned by root (owner_uid) and not writable by anyone else.
+    A path that no longer exists (a deleted binary) is only named, never run."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return True
+    return st.st_uid == owner_uid and not st.st_mode & 0o022
+
+
+def _proc_scan(proc_dir, comm_prefix, cmd_marker, owner_uid=0):
+    """Executables of running masters: [(pid, exe)] where /proc/<pid>/cmdline starts with the marker.
+
+    comm and cmdline are the process's own to set: a web user can start `exec -a "nginx: master process" /tmp/x`. The
+    masters of nginx and php-fpm run as root, so a process of any other user is not one, and its program is not
+    trusted either: `discover` runs as root and goes on to run `nginx -V`."""
     found = []
     try:
         names = os.listdir(proc_dir)
@@ -106,6 +120,8 @@ def _proc_scan(proc_dir, comm_prefix, cmd_marker):
         if not name.isdigit():
             continue
         try:
+            if os.stat(os.path.join(proc_dir, name)).st_uid != owner_uid:
+                continue
             with open(os.path.join(proc_dir, name, "comm")) as f:
                 comm = f.read(64).strip()
             if not comm.startswith(comm_prefix):
@@ -116,6 +132,8 @@ def _proc_scan(proc_dir, comm_prefix, cmd_marker):
                 continue
             exe = os.readlink(os.path.join(proc_dir, name, "exe"))
         except OSError:
+            continue
+        if not _trusted_binary(_strip_deleted(exe), owner_uid):
             continue
         found.append((int(name), exe))
     return found
@@ -176,13 +194,13 @@ def _vpc(route_text):
     return _unique(out)[:8]
 
 
-def discover(paths, runner=subprocess.run, webroots=(), nginx_conf=None, fpm_pool_glob=None, which=shutil.which):
+def discover(paths, runner=subprocess.run, webroots=(), nginx_conf=None, fpm_pool_glob=None, which=shutil.which, proc_owner=0):
     """Everything found, as ({(section, key): text}, [notes]). A missing item is simply absent."""
     found, notes = {}, []
     proc = paths.proc_dir
     # nginx binary: the running master first, then PATH, then `nginx -V` must work
     nginx = ""
-    for pid, exe in _proc_scan(proc, "nginx", "nginx: master"):
+    for pid, exe in _proc_scan(proc, "nginx", "nginx: master", proc_owner):
         nginx = _strip_deleted(exe)
         break
     if not nginx:
@@ -205,12 +223,12 @@ def discover(paths, runner=subprocess.run, webroots=(), nginx_conf=None, fpm_poo
         if parsed.limit_hit:
             notes.append("nginx include limits were hit; the web roots may be incomplete")
     # php-fpm: running masters (exact binary), then installed ones
-    fpm = [_strip_deleted(exe) for _, exe in _proc_scan(proc, "php-fpm", "php-fpm: master")]
+    fpm = [_strip_deleted(exe) for _, exe in _proc_scan(proc, "php-fpm", "php-fpm: master", proc_owner)]
     fpm += [p for p in sorted(glob.glob(paths._p("/usr/sbin/php-fpm[0-9]*"))) if os.access(p, os.X_OK)]
     found_fpm = _unique(fpm)
     if found_fpm:
         found[("sites", "phpfpm_bins")] = ",".join(found_fpm)
-    cli = [p for p in sorted(glob.glob(paths._p("/usr/bin/php[0-9]*"))) if re.search(r"/php\d+(\.\d+)?$", p) and os.access(p, os.X_OK)]
+    cli = [p for p in sorted(glob.glob(paths._p("/usr/bin/php[0-9]*"))) if re.search(r"/php\d+(\.\d+)?\Z", p) and os.access(p, os.X_OK)]
     if cli:
         found[("sites", "php_cli_bins")] = ",".join(_unique(os.path.realpath(p) for p in cli))
     users += _pool_users(fpm_pool_glob or paths._p("/etc/php/*/fpm/pool.d/*.conf"))

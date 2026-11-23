@@ -60,11 +60,12 @@ CTL_VERBS = frozenset({
 UI_VERBS = frozenset({"login.redeem", "host.mark-moved", "host.maintenance"})
 OUT_VERBS = frozenset({"outbox.take", "outbox.result", "feed.job", "feed.result"})
 SOCKET_VERBS = {"ctl": CTL_VERBS, "ui": UI_VERBS, "out": OUT_VERBS}
+ALL_VERBS = CTL_VERBS | UI_VERBS | OUT_VERBS
 SOCKET_KIND = {"ctl": "cli", "ui": "ui", "out": "system"}
 SOCKET_USER = {"ctl": None, "ui": "edr-hub-ui", "out": "edr-hub-out"}
 
-_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
-_SESSION_RE = re.compile(r"^[0-9a-f]{8}$")
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}\Z")
+_SESSION_RE = re.compile(r"^[0-9a-f]{8}\Z")
 
 
 # ---- late imports, so tests can replace the other agents' modules -------------------------------
@@ -126,9 +127,9 @@ class Ctx:
             self.short = "ui:" + session
         elif sock == "ctl":
             loginuid = str(actor.get("loginuid", ""))
-            loginuid = loginuid if loginuid.isdigit() and len(loginuid) <= 10 else "unknown"
+            loginuid = loginuid if loginuid.isdigit() and loginuid.isascii() and len(loginuid) <= 10 else "unknown"
             sudo = str(actor.get("sudo_user", ""))
-            sudo = sudo if re.match(r"^[A-Za-z0-9._-]{1,32}$", sudo) else ""
+            sudo = sudo if re.match(r"^[A-Za-z0-9._-]{1,32}\Z", sudo) else ""
             self.detail = "uid=%d pid=%d loginuid=%s" % (uid, pid, loginuid) + (" sudo=%s" % sudo if sudo else "")
             self.short = sudo or ("uid" + loginuid if loginuid != "unknown" else "uid%d" % uid)
         else:
@@ -377,8 +378,19 @@ class Sockets:
             pass
 
     def _audit_quiet(self, ctx, action, target, outcome, details=None):
-        """Audit a refusal or failure; never raises."""
+        """Audit a refusal or failure; never raises.
+
+        On ui.sock and out.sock a refusal or an invalid request is folded like an unauthenticated failure (PLAN
+        section 5): one row per (socket, verb, minute) with a count, under the same daily cap, because the process
+        on the other end may be compromised. ctl.sock is root and keeps one row each.
+        """
         try:
+            if ctx.sock != "ctl" and outcome in ("denied", "invalid"):
+                verb = target if target in ALL_VERBS else (action if action in ALL_VERBS else "unknown")
+                self.hub.writer.call(lambda conn: hub_audit.append(
+                    conn, actor_kind=ctx.kind, actor_detail="socket=%s verb=%s" % (ctx.sock, verb), action=action,
+                    target=verb, outcome=outcome, fold=True))
+                return
             self.hub.writer.call(lambda conn: hub_audit.append(
                 conn, actor_kind=ctx.kind, actor_detail=ctx.detail, action=action, target=target,
                 outcome=outcome, details=details))
@@ -433,11 +445,8 @@ class Sockets:
                              details={"uuid": uuid, "from": old, "to": new_state})
             text = "host %s (%s) %s" % (clean(name, 63), uuid, {"revoke": "revoked", "retire": "retired",
                                                                "mark-moved": "marked moved"}[verb])
-            if notify_high:
-                self._notice(conn, ctx, "host " + {"revoke": "revoked", "retire": "retired"}[verb], text)
-            else:
-                _alerts().notify(conn, self.hub, severity="INFO", kind="admin.host-moved", summary=text,
-                                 host=row, fields={"by": ctx.short})
+            # mark-moved revokes the certificate too, and it is the one destructive verb the dashboard has: HIGH, always sent
+            self._notice(conn, ctx, "host " + {"revoke": "revoked", "retire": "retired", "mark-moved": "marked moved"}[verb], text)
             return {"host": name, "uuid": uuid, "state": new_state}
         return self._write(ctx, action, ref, work)
 

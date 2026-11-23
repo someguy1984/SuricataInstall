@@ -93,6 +93,32 @@ class ReadCommandTests(CliCase):
                             (self.uuid, hub_common.now_ms() + 600_000, "x", 1))
         self.assertIn("maintenance until", self.ok("host", "list"))
 
+    def test_a_host_is_late_between_four_and_five_minutes_without_a_heartbeat(self):
+        now = hub_common.now_ms()
+        for seen, label in ((now - 3 * 60_000, "ok"), (now - 4 * 60_000 - 5000, "late"), (now - 6 * 60_000, "silent")):
+            self.hub.db.execute("UPDATE hosts SET last_seen=? WHERE uuid=?", (seen, self.uuid))
+            out = self.ok("host", "list")
+            self.assertEqual("(late)" in out, label == "late", (label, out))
+            self.assertEqual(json.loads(self.ok("host", "list", "--json").splitlines()[0])["late"], label == "late")
+
+    def test_late_is_not_shown_in_a_maintenance_window_or_for_a_retired_host(self):
+        now = hub_common.now_ms()
+        self.hub.db.execute("UPDATE hosts SET last_seen=? WHERE uuid=?", (now - 270_000, self.uuid))
+        self.hub.db.execute("INSERT INTO maintenance (host, until, set_by, set_at) VALUES (?,?,?,?)", (self.uuid, now + 600_000, "x", 1))
+        self.assertNotIn("(late)", self.ok("host", "list"))
+        self.hub.db.execute("DELETE FROM maintenance")
+        self.assertIn("(late)", self.ok("host", "list"))
+        self.hub.db.execute("UPDATE hosts SET state='retired' WHERE uuid=?", (self.uuid,))
+        self.assertNotIn("(late)", self.ok("host", "list", "--all"))
+
+    def test_host_show_cleans_every_field_including_the_applied_policy_revision(self):
+        self.hub.db.execute("UPDATE hosts SET policy_rev_applied=?, policy_rev=?, state_since=? WHERE uuid=?",
+                            ("abcd\x1b[31mred\x1b]8;;x\x07", "12\u202e34", hub_common.now_ms(), self.uuid))
+        out = self.ok("host", "web-1", "show")
+        for bad in ("\x1b", "\x07", "\u202e"):
+            self.assertNotIn(bad, out)
+        self.assertIn("\\u001b", out)
+
     def test_events_filters(self):
         h2 = S.add_host(self.hub.db, "web-2")
         now = hub_common.now_ms()

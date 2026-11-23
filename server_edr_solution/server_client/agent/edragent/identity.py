@@ -19,15 +19,16 @@ import os
 import re
 import shutil
 import ssl
+import stat
 import subprocess
 import time
 import uuid
 
 from . import transport as tr
 from .bans import cfg_get, parse_duration, parse_ip, norm_ip
-from .spool import atomic_write, parse_rfc3339, read_file_safe
+from .spool import atomic_write, parse_rfc3339, read_file_safe, read_json_safe
 
-GEN_RE = re.compile(r"^gen-([0-9]{1,6})$")
+GEN_RE = re.compile(r"^gen-([0-9]{1,6})\Z")
 DROPIN_REL = "/etc/systemd/system/edr-agent.service.d/10-hub.conf"
 ROLLBACK_UNIT = "edr-agent-rehome-rollback"
 PAUSE_UNIT = "edr-agent-pause-end"
@@ -37,8 +38,8 @@ DEFAULT_PORT = 8443
 DEFAULT_ENROLL_PORT = 8444
 CA_MAX = 2048
 CERT_MAX = 8192
-TOKEN_RE = re.compile(r"^([A-Za-z0-9_-]{4,64})\.([A-Za-z0-9_-]{8,128})\.([0-9a-f]{64})$")
-DROPLET_RE = re.compile(r"^[A-Za-z0-9._:-]{1,64}$")
+TOKEN_RE = re.compile(r"^([A-Za-z0-9_-]{4,64})\.([A-Za-z0-9_-]{8,128})\.([0-9a-f]{64})\Z")
+DROPLET_RE = re.compile(r"^[A-Za-z0-9._:-]{1,64}\Z")
 
 
 class IdentityError(Exception):
@@ -80,14 +81,14 @@ def _children(b, start, end):
 def _der_time(b, tag, s, e):
     t = b[s:e].decode("ascii")
     if tag == 0x17:
-        m = re.match(r"^(\d\d)(\d\d)(\d\d)(\d\d)(\d\d)(\d\d)Z$", t)
+        m = re.match(r"^(\d\d)(\d\d)(\d\d)(\d\d)(\d\d)(\d\d)Z\Z", t)
         if not m:
             raise ValueError("time")
         y = int(m.group(1))
         y += 2000 if y < 50 else 1900
         rest = [int(m.group(i)) for i in range(2, 7)]
     elif tag == 0x18:
-        m = re.match(r"^(\d{4})(\d\d)(\d\d)(\d\d)(\d\d)(\d\d)Z$", t)
+        m = re.match(r"^(\d{4})(\d\d)(\d\d)(\d\d)(\d\d)(\d\d)Z\Z", t)
         if not m:
             raise ValueError("time")
         y = int(m.group(1))
@@ -316,6 +317,58 @@ def load_current(paths):
     return load_gen(paths, name)
 
 
+# ---- Root's own record of the hub addresses ----------------------------------------------------
+# identity/ belongs to the agent, so nothing in it may decide what root writes into the unit's IPAddressAllow=
+# drop-in. Root keeps the addresses it validated itself in a file the agent cannot write, and builds the drop-in
+# from that record (or from the values it holds in memory) only. The same reason is behind render.hub_addresses().
+
+TRUSTED_REL = "/var/lib/edr-install/hub-addresses.json"
+
+
+def trusted_path(paths):
+    root = str(getattr(paths, "root", "") or "").rstrip("/")
+    return root + TRUSTED_REL
+
+
+def _clean_addresses(values):
+    out = []
+    for a in values if isinstance(values, list) else []:
+        ip = parse_ip(a) if isinstance(a, str) else None
+        if ip is not None and str(ip) not in out:
+            out.append(str(ip))
+    return out[:4]
+
+
+def read_trusted(paths):
+    """{"addresses": [...], "rehome": {"old": [...], "new": [...]}?} from root's record, or None."""
+    d = read_json_safe(trusted_path(paths), 64 * 1024)
+    if not isinstance(d, dict) or d.get("v") != 1:
+        return None
+    out = {"addresses": _clean_addresses(d.get("addresses"))}
+    rh = d.get("rehome")
+    if isinstance(rh, dict):
+        out["rehome"] = {"old": _clean_addresses(rh.get("old")), "new": _clean_addresses(rh.get("new"))}
+    return out
+
+
+def write_trusted(paths, addresses, rehome=None):
+    doc = {"v": 1, "addresses": _clean_addresses(list(addresses))}
+    if rehome is not None:
+        doc["rehome"] = {"old": _clean_addresses(list(rehome["old"])), "new": _clean_addresses(list(rehome["new"]))}
+    p = trusted_path(paths)
+    os.makedirs(os.path.dirname(p), 0o700, exist_ok=True)
+    atomic_write(p, json.dumps(doc), 0o600)
+
+
+def dropin_addresses(text):
+    """The addresses of the last IPAddressAllow= assignment in a drop-in text (an empty one resets, as in systemd)."""
+    addrs = []
+    for line in (text or "").splitlines():
+        if line.startswith("IPAddressAllow="):
+            addrs = _clean_addresses(line.split("=", 1)[1].split())
+    return addrs
+
+
 # ---- Host id and droplet id ----------------------------------------------------------------
 
 def host_id_path(paths):
@@ -407,7 +460,7 @@ def parse_token(text):
 def parse_hub(text):
     """'IP:PORT' or '[v6]:PORT' -> (ip string, port)."""
     t = (text or "").strip()
-    m = re.match(r"^\[([^\]]+)\]:([0-9]{1,5})$", t) or re.match(r"^([0-9.]+):([0-9]{1,5})$", t)
+    m = re.match(r"^\[([^\]]+)\]:([0-9]{1,5})\Z", t) or re.match(r"^([0-9.]+):([0-9]{1,5})$", t)
     if not m:
         raise IdentityError("--hub must be IP:PORT (an IPv6 address in brackets)", 3)
     ip = parse_ip(m.group(1))
@@ -654,7 +707,10 @@ class SystemOps:
             return 1
 
     def chown_agent(self, path):
-        self.calls.append(["chown", path])
+        """Give a file, or a directory tree, to edr-agent. Root works in a tree the agent owns, so the walk is
+        by directory descriptors: it never follows a symlink, never descends into anything that is not a real
+        directory, and skips a file with more than one link."""
+        self.calls.append(["chown", str(path)])
         if self.dev or os.geteuid() != 0:
             return
         try:
@@ -663,10 +719,71 @@ class SystemOps:
             uid, gid = pwd.getpwnam("edr-agent").pw_uid, grp.getgrnam("edr-agent").gr_gid
         except KeyError:
             return
-        for root, dirs, files in os.walk(path):
-            for n in [root] + [os.path.join(root, f) for f in files]:
+        path = str(path)
+        try:
+            st = os.lstat(path)
+        except OSError:
+            return
+        if stat.S_ISREG(st.st_mode):
+            try:
+                os.chown(path, uid, gid, follow_symlinks=False)
+            except OSError:
+                pass
+            return
+        if not stat.S_ISDIR(st.st_mode):
+            return
+        try:
+            top = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        except OSError:
+            return
+        try:
+            self._chown_tree(top, uid, gid, os.fstat(top), 0)
+        finally:
+            os.close(top)
+
+    def _chown_tree(self, dirfd, uid, gid, st, depth):
+        try:
+            os.fchown(dirfd, uid, gid)
+            names = os.listdir(dirfd)
+        except OSError:
+            return
+        if depth > 8:
+            return
+        for name in names:
+            try:
+                st = os.stat(name, dir_fd=dirfd, follow_symlinks=False)
+            except OSError:
+                continue
+            mode = st.st_mode
+            if stat.S_ISDIR(mode):
                 try:
-                    os.chown(n, uid, gid, follow_symlinks=False)
+                    sub = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dirfd)
+                except OSError:
+                    continue                               # swapped for a symlink or removed: not a real directory now
+                try:
+                    now = os.fstat(sub)
+                    if (now.st_dev, now.st_ino) == (st.st_dev, st.st_ino):
+                        self._chown_tree(sub, uid, gid, now, depth + 1)
+                finally:
+                    os.close(sub)
+            elif stat.S_ISREG(mode):
+                if st.st_nlink != 1:
+                    continue
+                try:
+                    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dirfd)
+                except OSError:
+                    continue
+                try:
+                    now = os.fstat(fd)
+                    if stat.S_ISREG(now.st_mode) and now.st_nlink == 1 and (now.st_dev, now.st_ino) == (st.st_dev, st.st_ino):
+                        os.fchown(fd, uid, gid)
+                except OSError:
+                    pass
+                finally:
+                    os.close(fd)
+            elif stat.S_ISLNK(mode):
+                try:
+                    os.chown(name, uid, gid, dir_fd=dirfd, follow_symlinks=False)    # the link itself, never its target
                 except OSError:
                     pass
 
@@ -749,6 +866,7 @@ def commit_identity(paths, gen_n, reply, enroll_port, droplet_id, ops):
     ops.chown_agent(d)
     write_host_id(paths, reply["host_uuid"])
     write_stored_droplet_id(paths, droplet_id)
+    write_trusted(paths, reply["addresses"])                 # what root validated, outside the agent's tree
     ops.write_dropin(reply["addresses"])
     ops.daemon_reload()
     flip_current(paths, gen_name(gen_n))
@@ -973,11 +1091,14 @@ def rehome(paths, cfg, *, hub, port, enroll_port, token, droplet_id, hostname, o
         shutil.rmtree(gen_path(paths, n), ignore_errors=True)
         log("rehome failed before anything changed: %s" % exc.__class__.__name__)
         return 2
-    st = {"v": 1, "step": 2, "prev": old.name, "new": new_name, "old_addresses": old.addresses,
+    # The old hub's addresses come from root's own record or the drop-in root wrote, never from hub.conf
+    old_addrs = (read_trusted(paths) or {}).get("addresses") or dropin_addresses(ops.read_dropin()) or []
+    st = {"v": 1, "step": 2, "prev": old.name, "new": new_name, "old_addresses": old_addrs,
           "new_addresses": rep["addresses"], "new_host_uuid": rep["host_uuid"], "old_host_uuid": old.host_uuid,
           "had_dropin": False, "armed_at": 0, "droplet_id": droplet_id}
     try:
         # step 3: arm the timed rollback (state first, so a firing timer finds it)
+        write_trusted(paths, old_addrs, {"old": old_addrs, "new": rep["addresses"]})
         _save_state(paths, st)
         ops.arm_rollback_timer(lib_dir or str(paths.lib_dir))
         st.update(step=3, armed_at=int(time.time()))
@@ -987,7 +1108,7 @@ def rehome(paths, cfg, *, hub, port, enroll_port, token, droplet_id, hostname, o
         if saved is not None:
             atomic_write(os.path.join(identity_dir(paths), "rehome-dropin.saved"), saved, 0o600)
             st["had_dropin"] = True
-        ops.write_dropin(old.addresses + [a for a in rep["addresses"] if a not in old.addresses])
+        ops.write_dropin(old_addrs + [a for a in rep["addresses"] if a not in old_addrs])
         ops.daemon_reload()
         if drop_spool:
             atomic_write(os.path.join(identity_dir(paths), "drop-spool.flag"), "1\n", 0o644)
@@ -1027,13 +1148,23 @@ def finish_commit(paths, ops, st, *, log=None, requester=None, lib_dir=None):
         write_stored_droplet_id(paths, st["droplet_id"])
     st["step"] = 7
     _save_state(paths, st)
+    trusted = read_trusted(paths) or {}
+    rh = trusted.get("rehome")
+    new_addrs = (rh["new"] if rh else None) or _clean_addresses(st.get("new_addresses")) or []
+    old_addrs = (rh["old"] if rh else None) or _clean_addresses(st.get("old_addresses")) or []
+    if not new_addrs:
+        log("root holds no validated address list for the new hub: the drop-in is left as it is")
+        return 2
     prev = load_gen(paths, st["prev"])
     if prev is not None and not st.get("deregistered"):
+        if old_addrs:
+            prev.addresses = old_addrs                  # root dials the addresses it validated, not the ones in hub.conf
         oc = deregister(paths, "rehome", ident=prev, timeout=5.0, requester=requester)
         log("old hub deregister: %s" % (oc.action if oc else "skipped"))
         st["deregistered"] = True
         _save_state(paths, st)
-    ops.write_dropin(new.addresses)
+    ops.write_dropin(new_addrs)
+    write_trusted(paths, new_addrs)
     ops.daemon_reload()
     shutil.rmtree(gen_path(paths, int(GEN_RE.match(st["prev"]).group(1))), ignore_errors=True)
     for f in ("rehome.json", "rehome-dropin.saved"):
@@ -1061,9 +1192,10 @@ def rollback(paths, ops, *, log=None, lib_dir=None):
         finish_commit(paths, ops, st, log=log, lib_dir=lib_dir)
         return 0
     prev = load_gen(paths, st["prev"])
-    saved = read_file_safe(os.path.join(identity_dir(paths), "rehome-dropin.saved"), 64 * 1024)
-    saved = saved.decode("utf-8", "replace") if saved is not None else None
-    old_addrs = prev.addresses if prev else st.get("old_addresses", [])
+    trusted = read_trusted(paths) or {}
+    rh = trusted.get("rehome")
+    # root's record first; the saved copy and hub.conf sit in the agent's tree and are never used for the drop-in
+    old_addrs = (rh["old"] if rh else None) or _clean_addresses(st.get("old_addresses")) or []
     step = st.get("step", 0)
 
     def attempt(what, fn, *a):
@@ -1075,7 +1207,9 @@ def rollback(paths, ops, *, log=None, lib_dir=None):
     if step >= 5 and prev is not None:
         attempt("point current back", flip_current, paths, st["prev"])
     if step >= 4:
-        attempt("restore the drop-in", ops.restore_dropin, saved if st.get("had_dropin") else None, old_addrs)
+        if old_addrs:
+            attempt("restore the drop-in", ops.write_dropin, old_addrs)
+            attempt("update root's address record", write_trusted, paths, old_addrs)
         attempt("daemon-reload", ops.daemon_reload)
     if step >= 5:
         attempt("restart edr-agent", ops.restart_agent)

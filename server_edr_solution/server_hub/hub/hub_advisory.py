@@ -11,6 +11,7 @@ import glob
 import json
 import os
 import re
+import stat
 from datetime import datetime, timezone
 
 ROW_KEYS = ("id", "origin", "release", "packages", "compare", "fixed_in", "cves", "needs_feature", "ref")
@@ -70,10 +71,15 @@ def _verrevcmp(a, b):
     return 0
 
 
+_VERSION_RE = re.compile(r"^(?:[0-9]+:)?[0-9][A-Za-z0-9.+~:-]*\Z")
+VERSION_MAX = 200
+
+
 def parse_version(text):
-    """(epoch, upstream, revision) of a Debian version string. Raises ValueError on an empty one."""
-    if not isinstance(text, str) or not text.strip():
-        raise ValueError("empty version")
+    """(epoch, upstream, revision) of a Debian version string. Raises ValueError unless it is a version: an optional
+    epoch, then a digit, then only the characters Debian allows (so "none", "unknown" and NUL are not versions)."""
+    if not isinstance(text, str) or not text.strip() or len(text) > VERSION_MAX or not _VERSION_RE.match(text.strip()):
+        raise ValueError("not a version")
     v = text.strip()
     epoch = 0
     if ":" in v:
@@ -115,7 +121,7 @@ def validate(doc):
     if not isinstance(doc, dict):
         return ["top level is not an object"]
     updated = doc.get("updated")
-    if not isinstance(updated, str) or not re.match(r"^\d{4}-\d\d-\d\d$", updated):
+    if not isinstance(updated, str) or not re.match(r"^\d{4}-\d\d-\d\d\Z", updated):
         problems.append("updated must be YYYY-MM-DD")
     else:
         try:
@@ -189,10 +195,26 @@ class Advisories:
 
 
 def _read_json(path):
-    if os.path.getsize(path) > FILE_MAX_BYTES:
-        raise ValueError("file over 1 MiB")
-    with open(path, encoding="utf-8") as f:
-        return json.load(f)
+    """Read a JSON file that is not a link, a FIFO or a device, and is at most 1 MiB. Raises OSError or ValueError."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise ValueError("not a regular file")
+        if st.st_size > FILE_MAX_BYTES:
+            raise ValueError("file over 1 MiB")
+        chunks, total = [], 0
+        while True:
+            b = os.read(fd, 1 << 16)
+            if not b:
+                break
+            total += len(b)
+            if total > FILE_MAX_BYTES:
+                raise ValueError("file over 1 MiB")
+            chunks.append(b)
+    finally:
+        os.close(fd)
+    return json.loads(b"".join(chunks).decode("utf-8"))
 
 
 def load(paths):
@@ -341,7 +363,7 @@ def kernel_version(text):
     if len(tok) != 1:
         return None
     ver = re.sub(r"-[a-z][a-z0-9]*(-[a-z0-9]+)*$", "", tok[0])      # strip the flavour: -generic, -aws, -gcp-64k
-    if re.match(r"^\d+\.\d+\.\d+-\d+\.\d+(~[0-9A-Za-z.]+)?$", ver):
+    if re.match(r"^\d+\.\d+\.\d+-\d+\.\d+(~[0-9A-Za-z.]+)?\Z", ver):
         return ver
     return None
 
@@ -511,6 +533,23 @@ def evaluate_inventory(adv, inv, now_ms, first_seen=None):
     if running is not None:
         findings.extend(_kernel_findings(adv, release, running, sctp_chk, now_ms))
     return findings
+
+
+def inventory_definite(inv):
+    """Whether this inventory answered the nginx and the kernel questions for certain. An unknown or missing check is
+    not an answer: a row that has no finding is 'fixed' only when its group is definite."""
+    checks = _checks(inv)
+    chk = checks.get("nginx_pkg")
+    nginx = isinstance(chk, dict) and (chk.get("status") is False or (chk.get("status") is True and bool(_packages(chk))))
+    running = None
+    kc = checks.get("kernel_pending")
+    if isinstance(kc, dict):
+        for key in ("signature", "version_signature", "running", "version"):
+            if isinstance(kc.get(key), str):
+                running = kc[key]
+                break
+    kernel = running is not None and kernel_version(running) is not None and _sctp_loadable(checks.get("sctp")) is not None
+    return {"nginx": bool(nginx), "kernel": bool(kernel)}
 
 
 def _sctp_loadable(check):

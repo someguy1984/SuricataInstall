@@ -845,7 +845,7 @@ class TestErrorsAndCounts(Base):
 
 
 class TestEdrBansReadsOurFile(Base):
-    """The root helper (agent 6) must accept what the engine writes: run `edr-bans --print-script`
+    """The root helper must accept what the engine writes: run `edr-bans --print-script`
     on it. The helper only prints; it writes nothing and calls no nft."""
 
     HELPER = os.path.join(support.CODE, "edr-bans")

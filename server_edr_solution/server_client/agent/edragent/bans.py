@@ -3,7 +3,7 @@
 The unprivileged agent decides and writes /run/edr-agent/bans.json; the root helper edr-bans
 applies it. Everything the hub may send is bounded here as well (peers only in P2).
 
-What `observe()` reads from an event (the keys agent 4's sources must set):
+What `observe()` reads from an event (the keys the sources set):
 
     ssh.fail                 src_ip, src_trust=tcp
     ssh.login                src_ip, src_trust=tcp          (remembered 30 days: never banned for SSH failures)
@@ -134,7 +134,7 @@ def parse_rate(value, default):
         except (TypeError, ValueError):
             return default
     if isinstance(value, str):
-        m = re.match(r"^\s*(\d{1,6})\s*(?:/|per)\s*(.+?)\s*$", value, re.I)
+        m = re.match(r"^\s*(\d{1,6})\s*(?:/|per)\s*(.+?)\s*\Z", value, re.I)
         if m:
             w = parse_duration(m.group(2))
             if w and w > 0 and int(m.group(1)) > 0:
@@ -161,8 +161,8 @@ def as_int(value, default):
 
 # ---- Addresses ----------------------------------------------------------------------------
 
-_V4_RE = re.compile(r"^(?:0|[1-9][0-9]{0,2})(?:\.(?:0|[1-9][0-9]{0,2})){3}$")
-_PREFIX_RE = re.compile(r"^(?:0|[1-9][0-9]{0,2})$")
+_V4_RE = re.compile(r"^(?:0|[1-9][0-9]{0,2})(?:\.(?:0|[1-9][0-9]{0,2})){3}\Z")
+_PREFIX_RE = re.compile(r"^(?:0|[1-9][0-9]{0,2})\Z")
 
 
 def parse_ip(text):
@@ -423,7 +423,7 @@ def hub_addresses_from_identity(identity_dir):
     except OSError:
         return out
     for name in names:
-        if not re.match(r"^gen-[0-9]+$", name):
+        if not re.match(r"^gen-[0-9]+\Z", name):
             continue
         raw = read_file_safe(os.path.join(str(identity_dir), name, "hub.conf"), 16 * 1024)
         if not raw:

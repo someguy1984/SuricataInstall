@@ -270,7 +270,7 @@ class PendingTests(S.HubTestCase):
         self.raw_line()
         self.assertEqual(self.ingest(), 1)
         actions = [r["action"] for r in self.rows("SELECT * FROM audit ORDER BY id")]
-        self.assertEqual(actions, ["pending-audit.bad-line", "file-op.backup"])
+        self.assertEqual(sorted(actions), ["file-op.backup", "pending-audit.bad-line"])      # the bad lines are one summary row, after the good ones
 
     def test_missing_file_is_fine(self):
         self.assertEqual(self.ingest(), 0)
@@ -317,6 +317,56 @@ class PendingTests(S.HubTestCase):
         self.assertEqual(self.ingest(), 2)
         self.assertEqual(len(self.rows("SELECT * FROM audit")), 2)
         self.assertTrue(self.hub.logs)
+
+    def test_a_world_writable_or_linked_pending_file_is_not_read_and_is_reported_once_a_day(self):
+        self.raw_line()
+        os.chmod(self.paths.pending_audit, 0o666)
+        self.assertEqual(self.ingest(), 0)
+        self.assertEqual(self.ingest(), 0)
+        rows = self.rows("SELECT action, outcome FROM audit")
+        self.assertEqual(rows, [{"action": "pending-audit.untrusted", "outcome": "denied"}])      # one row for the day
+        self.assertEqual(len(self.alerts.notices), 1)
+        self.assertIn("writable by group or others", self.alerts.notices[0][1])
+        os.chmod(self.paths.pending_audit, 0o640)
+        self.assertEqual(self.ingest(), 1)                                  # trusted again: the line is taken in
+        os.rename(self.paths.pending_audit, self.paths.pending_audit + ".real")
+        os.symlink(self.paths.pending_audit + ".real", self.paths.pending_audit)
+        self.hub.db.execute("DELETE FROM meta WHERE key='pending_audit_untrusted_day'")
+        self.assertEqual(self.ingest(), 0)
+        self.assertIn("link", self.rows("SELECT details FROM audit WHERE action='pending-audit.untrusted'")[-1]["details"])
+
+    def test_the_installed_hub_accepts_only_root_as_owner(self):
+        self.raw_line()
+        real = os.fstat
+
+        def as_user(fd):
+            st = real(fd)
+            return os.stat_result((st.st_mode, st.st_ino, st.st_dev, st.st_nlink, 1000, st.st_gid, st.st_size, 0, 0, 0))
+        fd, reason = hub_audit._open_trusted(self.paths.pending_audit, installed=False)
+        self.assertIsNotNone(fd)
+        os.close(fd)
+        with mock.patch("hub_audit.os.fstat", as_user):
+            fd, reason = hub_audit._open_trusted(self.paths.pending_audit, installed=True)
+            self.assertIsNone(fd)
+            self.assertEqual(reason, "it is not owned by root")
+
+    def test_one_ingest_takes_at_most_200_lines_and_10_notices_then_one_summary(self):
+        for i in range(450):
+            self.raw_line(id="b%03d" % i, op="restore")
+        self.assertEqual(self.ingest(), 200)
+        self.assertEqual(len(self.alerts.notices), 11)                       # 10 notices and the summary
+        self.assertIn("190 more", self.alerts.notices[-1][1])
+        self.assertEqual(self.ingest(), 200)
+        self.assertEqual(self.ingest(), 50)
+        self.assertEqual(self.ingest(), 0)
+        self.assertEqual(len(self.rows("SELECT * FROM audit WHERE action='file-op.restore'")), 450)
+
+    def test_bad_lines_are_one_summary_row_per_ingest(self):
+        with open(self.paths.pending_audit, "wb") as f:
+            f.write(b"{}\n" * 100 + b"[1]\n" * 5 + b"x" * 5000 + b"\n")
+        self.ingest()
+        rows = self.rows("SELECT details FROM audit WHERE action='pending-audit.bad-line'")
+        self.assertEqual([json.loads(r["details"])["count"] for r in rows], [106])
 
     def test_is_scheduled_run_reads_the_cgroup(self):
         f = os.path.join(self.root, "cg")

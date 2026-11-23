@@ -30,6 +30,11 @@ class SocketCase(S.HubTestCase):
     def ctl(self, cmd, args=None):
         return S.ctl(self.paths, cmd, args)
 
+    def flush_folds(self):
+        """Folded refusals are written when their minute is over: make it over."""
+        import hub_audit
+        self.hub.writer.call(lambda conn: hub_audit.flush_folds(conn, hub_common.now_ms() + 120000))
+
     def ui(self, cmd, args=None, actor=UI_ACTOR):
         return S.send(self.paths.ui_sock, {"cmd": cmd, "args": args or {}, "actor": actor})
 
@@ -64,7 +69,14 @@ class TransportTests(SocketCase):
                      "alert.test", "ui-login.mint", "audit.verify", "reissue-cert", "agent-hash.add", "status",
                      "incident.resolve", "outbox.take"):
             self.bad(self.ui(verb), "denied", 3)
-        self.assertEqual(sum(1 for a in self.audit_actions() if a == ("ui", "socket.refused", "denied")), 14)
+        self.flush_folds()
+        rows = self.rows("SELECT actor_detail, action, target, details FROM audit WHERE action='socket.refused'")
+        self.assertEqual(len(rows), 14)                                    # one folded row per verb, with a count
+        self.assertEqual({r["actor_detail"] for r in rows}, {"socket=ui verb=%s" % v for v in
+                                                              ("token.create", "host.revoke", "host.retire", "host.adopt", "settings.set",
+                                                               "never-ban.add", "alert.test", "ui-login.mint", "audit.verify", "reissue-cert",
+                                                               "agent-hash.add", "status", "incident.resolve", "outbox.take")})
+        self.assertTrue(all(json.loads(r["details"])["count"] == 1 for r in rows))
 
     def test_ctl_does_not_take_login_redeem_or_out_verbs(self):
         self.bad(self.ctl("login.redeem", {"code": "x"}), "denied", 3)
@@ -186,11 +198,22 @@ class HostVerbTests(SocketCase):
         self.assertIn(("cli", "host.retire", "invalid"), self.audit_actions())
         self.bad(self.ctl("host.revoke", {}), "invalid", 3)
 
-    def test_mark_moved_raises_only_an_info_notice(self):
+    def test_mark_moved_raises_an_admin_notice_because_it_revokes_the_certificate(self):
         self.ok(self.ctl("host.mark-moved", {"host": "web-1"}))
         self.assertEqual(self.state(), "moved")
+        self.assertEqual([n[0] for n in self.alerts.notices], ["host marked moved"])     # HIGH, always sent (admin_notice)
+        self.assertIn("web-1", self.alerts.notices[0][1])
+        self.assertEqual(self.enroll.revoked_certs, [self.uuid])
+
+    def test_the_dashboards_mark_moved_is_announced_too(self):
+        self.ok(self.ui("host.mark-moved", {"host": "web-1"}))
+        self.assertEqual([n[0] for n in self.alerts.notices], ["host marked moved"])
+        self.assertIn("ui session=0a1b2c3d", self.alerts.notices[0][2])
+
+    def test_maintenance_stays_an_info_notice(self):
+        self.ok(self.ctl("host.maintenance", {"host": "web-1", "for": "30m"}))
         self.assertEqual(self.alerts.notices, [])
-        self.assertEqual(self.alerts.notifies[0]["severity"], "INFO")
+        self.assertEqual(self.alerts.notifies[-1]["severity"], "INFO")
 
     def test_ui_may_mark_moved_and_is_named_in_the_audit(self):
         self.ok(self.ui("host.mark-moved", {"host": "web-1"}))
@@ -478,7 +501,9 @@ class LoginTests(SocketCase):
         self.mint()
         for code in ("wrong", "", None, 5, "x" * 500):
             self.bad(self.ui("login.redeem", {"code": code}), "denied", 3)
-        self.assertEqual(len([a for a in self.audit_actions() if a == ("ui", "login.redeem", "denied")]), 5)
+        self.flush_folds()
+        rows = self.rows("SELECT details FROM audit WHERE action='login.redeem' AND outcome='denied'")
+        self.assertEqual([json.loads(r["details"])["count"] for r in rows], [5])      # folded: one row, a count of five
 
     def test_more_than_five_failures_a_minute_raises_one_notice(self):
         for _ in range(5):
@@ -599,6 +624,35 @@ class OutboxTests(SocketCase):
         self.seed()
         self.ok(self.out("outbox.take"))
         self.assertEqual(self.audit_actions(), [])
+
+
+class FoldedRefusalTests(SocketCase):
+    def test_refusals_on_ui_and_out_are_one_row_per_socket_verb_and_minute(self):
+        for i in range(60):
+            self.ui("token.create", {"name": "x%d" % i})
+            self.ui("made.up.%d" % i)
+            self.out("host.revoke")
+        self.assertEqual(self.rows("SELECT COUNT(*) AS n FROM audit")[0]["n"], 0)       # nothing yet: the minute is not over
+        self.flush_folds()
+        rows = {r["actor_detail"]: json.loads(r["details"])["count"] for r in
+                self.rows("SELECT actor_detail, details FROM audit ORDER BY id")}
+        self.assertEqual(rows, {"socket=ui verb=token.create": 60, "socket=ui verb=unknown": 60, "socket=out verb=host.revoke": 60})
+
+    def test_the_daily_cap_and_summary_row_apply(self):
+        import hub_audit
+        from unittest import mock
+        with mock.patch("hub_audit.FOLD_ROWS_PER_DAY", 2):
+            for verb in ("token.create", "host.revoke", "settings.set", "status"):
+                self.ui(verb)
+            self.flush_folds()
+            self.assertEqual(self.rows("SELECT COUNT(*) AS n FROM audit WHERE action='socket.refused'")[0]["n"], 2)
+            self.hub.writer.call(lambda conn: hub_audit.flush_folds(conn, hub_common.now_ms() + 2 * 86400 * 1000))
+        self.assertEqual(len(self.rows("SELECT * FROM audit WHERE action='client-failures.capped'")), 1)
+
+    def test_ctl_refusals_keep_one_row_each(self):
+        for _ in range(3):
+            self.ctl("no.such.verb")
+        self.assertEqual(self.rows("SELECT COUNT(*) AS n FROM audit WHERE action='socket.refused'")[0]["n"], 3)
 
 
 class IngestLoopTests(S.HubTestCase):

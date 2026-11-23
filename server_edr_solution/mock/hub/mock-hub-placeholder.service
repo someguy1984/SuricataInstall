@@ -1,6 +1,6 @@
-# Stands in for edr-hub until server_hub/install.sh exists: a TLS 1.3 listener on the hub port, so
-# the private network, the port and TLS can be tested from the web box. Disable it before installing
-# the real hub:  systemctl disable --now mock-hub-placeholder
+# Stands in for edr-hub until it is installed: a TLS 1.3 listener on the hub port, so the private
+# network, the port and TLS can be tested from the web box. `mock.sh install-hub` disables it before
+# installing the real hub (systemctl disable --now mock-hub-placeholder); `mock.sh uninstall` enables it again.
 [Unit]
 Description=Mock: TLS placeholder for edr-hub on :8443
 After=network-online.target mock-tls.service

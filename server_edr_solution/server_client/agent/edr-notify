@@ -10,8 +10,14 @@ copy is sent once. It sends only kind, severity, host and a 200-character summar
 channel, never excerpts. It has its own copy of the payload templates: hub code is not shared.
 
 url line   `https://ntfy.example/topic` (host name contains "ntfy"), `ntfy+URL`, `slack+URL`, or any
-           other https URL (a Slack-compatible webhook).
-Usage    edr-notify [--cred-dir DIR] [--state-dir DIR] [--dry-run] [--max-send N]
+           other https URL (a Slack-compatible webhook). Only https: the URL is a secret and the alerts are
+           about the host, so neither crosses the network in clear. The certificate and the host name are
+           verified (the system CAs), redirects are refused, the reply is read to at most 4 KiB, and nothing
+           from an event ever goes into the URL or a header: the target and every header are fixed.
+Network    The unit allows `localhost` and, in /etc/systemd/system/edr-notify.service.d/10-allow.conf, the
+           addresses `edr-agent apply-config` resolved for the URL's host (a root step: the sandbox itself
+           has IPAddressDeny=any and cannot be talked into reaching anything else).
+Usage    edr-notify [--cred-dir DIR] [--state-dir DIR] [--dry-run] [--max-send N] [--timeout SECONDS]
          The directories default to $CREDENTIALS_DIRECTORY and $STATE_DIRECTORY (set by systemd).
          --dry-run  print the messages instead of sending them; the state is not changed.
 Python standard library only, run as: python3 -I edr-notify
@@ -22,6 +28,7 @@ import json
 import os
 import re
 import socket
+import ssl
 import stat
 import sys
 import urllib.error
@@ -36,6 +43,7 @@ SEV = ["INFO", "LOW", "MEDIUM", "HIGH", "CRITICAL"]
 MAX_LINES_BYTES = 8 * 1024 * 1024
 MAX_LINE = 64 * 1024
 MAX_SEND = 20
+TIMEOUT = 5.0
 SUMMARY = 200
 
 
@@ -71,8 +79,10 @@ def parse_url(line):
         if line.startswith(pre):
             kind, line = pre[:-1], line[len(pre):]
     u = urllib.parse.urlsplit(line)
-    if u.scheme not in ("https", "http") or not u.hostname:
-        raise ValueError("the url is not an http or https URL")
+    if u.scheme != "https" or not u.hostname:
+        raise ValueError("the url is not an https URL (plain http is refused)")
+    if u.username or u.password:
+        raise ValueError("the url must not carry a user name or password")
     if kind is None:
         kind = "ntfy" if "ntfy" in u.hostname.lower() else "slack"
     if kind == "ntfy":
@@ -110,13 +120,17 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 def post(url, data, timeout=5):
+    """POST once. True on a 2xx. No redirect is followed, no proxy from the environment is used, the certificate and
+    the host name are verified, and at most 4 KiB of the reply is read."""
     req = urllib.request.Request(url, data=data, method="POST", headers={"Content-Type": "application/json", "User-Agent": "edr-notify/" + VERSION})
-    opener = urllib.request.build_opener(NoRedirect)
+    ctx = ssl.create_default_context()
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect, urllib.request.HTTPSHandler(context=ctx))
     try:
         with opener.open(req, timeout=timeout) as r:
             r.read(4096)
             return 200 <= r.status < 300
-    except (urllib.error.URLError, OSError, ValueError):
+    except (urllib.error.URLError, OSError, ValueError, ssl.SSLError):
         return False
 
 
@@ -147,7 +161,7 @@ def pending(lines, last_id):
 def main(argv):
     cred = os.environ.get("CREDENTIALS_DIRECTORY", "")
     state_dir = os.environ.get("STATE_DIRECTORY", "")
-    dry, max_send, i = False, MAX_SEND, 0
+    dry, max_send, timeout, i = False, MAX_SEND, TIMEOUT, 0
     while i < len(argv):
         a = argv[i]
         nxt = argv[i + 1] if i + 1 < len(argv) else None
@@ -159,6 +173,8 @@ def main(argv):
             dry = True
         elif a == "--max-send" and nxt:
             max_send = int(nxt); i += 1
+        elif a == "--timeout" and nxt:
+            timeout = min(30.0, max(0.2, float(nxt))); i += 1
         else:
             print("usage: edr-notify [--cred-dir DIR] [--state-dir DIR] [--dry-run]", file=sys.stderr)
             return 2
@@ -201,7 +217,7 @@ def main(argv):
             print(msg.decode())
             sent += 1
             continue
-        if post(url, msg):
+        if post(url, msg, timeout):
             sent += 1
             advance_to = lid
             _save(state_path, lid)
@@ -212,7 +228,7 @@ def main(argv):
         rest = len(wanted) - sent
         if rest > 0:
             summary = {"sev": "HIGH", "kind": "notify.suppressed", "summary": "%d more alert(s) not sent; see alerts.jsonl on the host" % rest}
-            post(url, build_message(kind, topic, summary, host))
+            post(url, build_message(kind, topic, summary, host), timeout)
         if everything:
             _save(state_path, everything[-1][0])           # everything up to the last line has been handled
     print("edr-notify: sent %d of %d new alert(s)%s" % (sent, len(wanted), " (a send failed: will retry)" if failed else ""))

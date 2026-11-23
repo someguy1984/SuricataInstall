@@ -1,6 +1,6 @@
-"""Test support for the agent's hub-side tests (agent 5): a throwaway CA made with the openssl CLI
+"""Test support for the agent's hub-side tests: a throwaway CA made with the openssl CLI
 under the strict profiles of hub section 2, a small TLS 1.3 test server on 127.0.0.1 that plays
-the hub, and fakes for the modules agent 4 writes (installed only when the real import fails).
+the hub, and fakes for the agent's core modules (installed only when the real import fails).
 
 The file holds no tests. It is named test_transport_pki so that it sits among the transport tests.
 """
@@ -330,7 +330,7 @@ class FakeHub(threading.Thread):
         tls.sendall(head.encode() + body)
 
 
-# ---- fakes for what agent 4 writes (only when the real import fails) -------------------------
+# ---- fakes for the agent's core modules (only when the real import fails) -------------------------
 
 def install_fakes():
     try:

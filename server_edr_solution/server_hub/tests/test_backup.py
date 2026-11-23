@@ -9,6 +9,7 @@ import sqlite3
 import subprocess
 import sys
 import tarfile
+import time
 import unittest
 from unittest import mock
 
@@ -298,6 +299,44 @@ class BackupTests(BackupCase):
         W(junk, "wb", b"x" * 500)
         with self.assertRaises(hub_backup.BackupError):
             hub_backup._unpack(junk, a.paths.backup_pass)
+
+
+class BackupSourceTests(BackupCase):
+    def test_a_symlinked_ca_certificate_is_refused_and_a_symlinked_revoked_list_is_left_out_with_a_warning(self):
+        a = self.box()
+        a.settings()
+        a.fill()
+        secret = os.path.join(self.root, "root-only.txt")
+        W(secret, "ROOTONLY")
+        os.unlink(a.paths.revoked)
+        os.symlink(secret, a.paths.revoked)
+        self.assertEqual(hub_backup.backup(a.paths, log=self.say), 0)
+        self.assertTrue(any("left out of the backup" in x and "revoked.txt" in x for x in self.log))
+        out = os.path.join(a.paths.backup_dir, os.listdir(a.paths.backup_dir)[0])
+        dest = os.path.join(self.root, "unpacked")
+        os.makedirs(dest)
+        hub_backup._unpack(out, a.paths.backup_pass, dest)
+        self.assertNotIn("ROOTONLY", R(os.path.join(dest, "ca", "revoked.txt")))
+        pem = a.paths.ca_cert
+        os.rename(pem, pem + ".real")
+        os.symlink(pem + ".real", pem)
+        self.assertEqual(hub_backup.backup(a.paths, log=self.say), 3)
+
+    def test_a_symlinked_database_is_refused(self):
+        a = self.box()
+        a.settings()
+        a.fill()
+        os.rename(a.paths.db, a.paths.db + ".real")
+        os.symlink(a.paths.db + ".real", a.paths.db)
+        self.assertEqual(hub_backup.backup(a.paths, log=self.say), 3)
+
+    def test_ca_export_refuses_a_linked_key(self):
+        a = self.box()
+        a.settings()
+        os.rename(a.paths.ca_key, a.paths.ca_key + ".real")
+        os.symlink(a.paths.ca_key + ".real", a.paths.ca_key)
+        self.assertEqual(hub_backup.ca_export(a.paths, CA_PASS, out=os.path.join(self.root, "x.enc"), log=self.say), 3)
+        self.assertFalse(os.path.exists(os.path.join(self.root, "x.enc")))
 
 
 class CaExportTests(BackupCase):
@@ -605,6 +644,51 @@ class RestoreTests(BackupCase):
         b = self.box("b")
         b.settings()
         self.assertEqual(hub_backup.restore(b.paths, os.path.join(self.root, "nope.bak"), log=self.say), 3)
+
+    def test_restore_refuses_a_link_in_the_state_directory_and_changes_nothing(self):
+        a = self.box("a")
+        path = self.made_backup(a)
+        key = self.export_key(a)
+        b = self.box("b", ca_cn="Fresh CA")
+        b.settings()
+        shutil.copy(a.paths.backup_pass, b.paths.backup_pass)
+        b.db.close()
+        victim = os.path.join(self.root, "victim")
+        W(victim, "VICTIM")
+        os.symlink(victim, b.paths.settings + ".link")
+        os.rename(b.paths.settings, b.paths.settings + ".real")
+        os.symlink(b.paths.settings + ".real", b.paths.settings)
+        before = self.slurp(b.paths.db)
+        self.assertEqual(hub_backup.restore(b.paths, path, ca_key=key, ca_passphrase=CA_PASS, log=self.say), 3)
+        self.assertTrue(any("is a link" in x for x in self.log))
+        self.assertEqual(self.slurp(b.paths.db), before)
+        self.assertEqual(R(victim), "VICTIM")
+
+    def test_the_aside_directory_has_a_random_name_and_a_planted_name_is_not_used(self):
+        a = self.box("a")
+        path = self.made_backup(a)
+        key = self.export_key(a)
+        b = self.box("b", ca_cn="Fresh CA")
+        b.settings()
+        shutil.copy(a.paths.backup_pass, b.paths.backup_pass)
+        b.db.close()
+        elsewhere = os.path.join(self.root, "elsewhere")
+        os.makedirs(elsewhere)
+        for stamp in ("20200101T000000Z", time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())):
+            os.symlink(elsewhere, os.path.join(b.paths.state_dir, "restore-aside-" + stamp))
+        self.assertEqual(hub_backup.restore(b.paths, path, ca_key=key, ca_passphrase=CA_PASS, log=self.say), 0, self.log)
+        self.assertEqual(os.listdir(elsewhere), [])
+        real = [d for d in os.listdir(b.paths.state_dir) if d.startswith("restore-aside-") and not os.path.islink(os.path.join(b.paths.state_dir, d))]
+        self.assertEqual(len(real), 1)
+        self.assertEqual(os.stat(os.path.join(b.paths.state_dir, real[0])).st_mode & 0o777, 0o700)
+
+    def test_a_restore_leaves_no_temporary_file_behind(self):
+        a = self.box("a")
+        path = self.made_backup(a)
+        a.db.close()
+        self.assertEqual(hub_backup.restore(a.paths, path, log=self.say), 0, self.log)
+        for base, _dirs, files in os.walk(a.paths.state_dir):
+            self.assertEqual([f for f in files if ".restore-" in f], [], base)
 
 
 if __name__ == "__main__":

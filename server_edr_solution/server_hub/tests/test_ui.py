@@ -459,6 +459,18 @@ class ReadTests(UiCase):
                             (old, "webhook", "HIGH", "{}", old, "failed"))
         self.assertTrue(self.ok("/api/status")["alerts_failing"])
 
+    def test_the_fleet_page_marks_a_host_late_between_four_and_five_minutes(self):
+        now = hub_common.now_ms()
+        for seen, state, window, late in ((now - 3 * 60_000, "active", False, False), (now - 270_000, "active", False, True),
+                                          (now - 270_000, "active", True, False), (now - 270_000, "retired", False, False),
+                                          (now - 6 * 60_000, "active", False, False)):
+            self.hub.db.execute("UPDATE hosts SET last_seen=?, state=? WHERE uuid=?", (seen, state, self.uuid))
+            self.hub.db.execute("DELETE FROM maintenance")
+            if window:
+                self.hub.db.execute("INSERT INTO maintenance (host, until, set_by, set_at) VALUES (?,?,?,?)", (self.uuid, now + 600_000, "x", 1))
+            hosts = {h["name"]: h for h in self.ok("/api/fleet")["hosts"]}
+            self.assertEqual(hosts["web-1"]["late"] if "web-1" in hosts else False, late, (state, window))
+
     def test_fleet_lists_hosts_with_health_and_notes(self):
         S.add_host(self.hub.db, "gone", state="retired")
         now = hub_common.now_ms()

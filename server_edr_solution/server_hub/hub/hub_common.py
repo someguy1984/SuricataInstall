@@ -25,10 +25,10 @@ MIN_CLIENT_SCHEMA = EVENT_SCHEMA - 1
 SEVERITIES = ("INFO", "LOW", "MEDIUM", "HIGH", "CRITICAL")
 SOURCES = ("tetragon", "suricata", "nginx", "journal", "kernel", "inventory", "agent", "canary")
 SRC_TRUST = ("tcp", "claimed", "none")
-KIND_RE = re.compile(r"^[a-z0-9_.-]{1,64}$")
-HOST_NAME_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61})$")
-EVENT_ID_RE = re.compile(r"^[0-9a-f]{8}:[0-9]{1,20}$")
-REV_RE = re.compile(r"^[0-9a-f]{16}$")
+KIND_RE = re.compile(r"^[a-z0-9_.-]{1,64}\Z")
+HOST_NAME_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61})\Z")
+EVENT_ID_RE = re.compile(r"^[0-9a-f]{8}:[0-9]{1,20}\Z")
+REV_RE = re.compile(r"^[0-9a-f]{16}\Z")
 
 # Policy document vocabularies (Appendix A, Closed vocabularies)
 BAN_SOURCES = ("fleet", "operator")
@@ -182,7 +182,7 @@ def now_ms():
     return time.time_ns() // 1_000_000
 
 
-_RFC3339 = re.compile(r"^(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)(?:\.(\d{1,6}))?Z$")
+_RFC3339 = re.compile(r"^(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)(?:\.(\d{1,6}))?Z\Z")
 
 
 def rfc3339_to_ms(text):
@@ -202,8 +202,8 @@ def ms_to_rfc3339(ms):
     return dt.strftime("%Y-%m-%dT%H:%M:%S") + ".%03dZ" % (ms % 1000)
 
 
-_DURATION = re.compile(r"^(\d+)([smhd])$")
-_SIZE = re.compile(r"^(\d+)([KMG])?$")
+_DURATION = re.compile(r"^(\d+)([smhd])\Z")
+_SIZE = re.compile(r"^(\d+)([KMG])?\Z")
 
 
 def parse_duration(text):
@@ -318,7 +318,7 @@ def _sev(v):
 
 
 def _hhmm(v):
-    if not re.match(r"^([01]\d|2[0-3]):[0-5]\d$", str(v)):
+    if not re.match(r"^([01]\d|2[0-3]):[0-5]\d\Z", str(v)):
         raise ValueError("must be HH:MM (UTC)")
     return str(v)
 
@@ -342,7 +342,7 @@ def _choice(*allowed):
 
 def _https_url_or_empty(v):
     v = str(v)
-    if v and not re.match(r"^https://[A-Za-z0-9.-]+(:\d{1,5})?(/[\x21-\x7e]*)?$", v):
+    if v and not re.match(r"^https://[A-Za-z0-9.-]+(:\d{1,5})?(/[\x21-\x7e]*)?\Z", v):
         raise ValueError("must be an https URL")
     return v
 
@@ -414,7 +414,7 @@ def validate_setting(key, value):
     if key == "ui_host":
         items = value if isinstance(value, list) else [x for x in str(value).split(",") if x]
         for item in items:
-            if not re.match(r"^(\[[0-9a-fA-F:]+\]|[A-Za-z0-9.-]+):\d{1,5}$", item):
+            if not re.match(r"^(\[[0-9a-fA-F:]+\]|[A-Za-z0-9.-]+):\d{1,5}\Z", item):
                 raise ValueError("each entry must be HOST:PORT")
         return items
     return check(value)

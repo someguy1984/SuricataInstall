@@ -357,7 +357,7 @@ class Cleaner:
         except OSError:
             return
         try:
-            names = [n for n in os.listdir(dfd) if n.startswith("tetragon") and n != "tetragon.log" and re.search(r"\.log(\.gz)?$|\.gz$", n)]
+            names = [n for n in os.listdir(dfd) if n.startswith("tetragon") and n != "tetragon.log" and re.search(r"\.log(\.gz)?$|\.gz\Z", n)]
             def mtime(n):
                 try:
                     return os.stat(n, dir_fd=dfd, follow_symlinks=False).st_mtime

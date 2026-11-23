@@ -63,10 +63,10 @@ FIELD_MAX = 2048
 SOCK_REPLY_MAX = 256 * 1024
 SETTINGS_RELOAD_S = 30
 
-TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{20,100}$")
-REF_RE = re.compile(r"^[A-Za-z0-9-]{1,64}$")
-DURATION_RE = re.compile(r"^\d{1,3}[mh]$")
-KIND_FILTER_RE = re.compile(r"^[a-z0-9_.-]{1,64}\*?$")
+TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{20,100}\Z")
+REF_RE = re.compile(r"^[A-Za-z0-9-]{1,64}\Z")
+DURATION_RE = re.compile(r"^\d{1,3}[mh]\Z")
+KIND_FILTER_RE = re.compile(r"^[a-z0-9_.-]{1,64}\*?\Z")
 
 HTTP_TEXT = {
     400: "bad request", 401: "login required", 403: "forbidden", 404: "not found", 405: "method not allowed",
@@ -477,6 +477,16 @@ def exposure_state(inv):
     return ("unknown", unknown) if unknown else ("ok", [])
 
 
+LATE_MS, SILENT_MS = 4 * 60 * 1000, 5 * 60 * 1000
+
+
+def is_late(state, last_seen, maintenance_until, now):
+    """No heartbeat for 4 to 5 minutes, outside an operator's window: "late" (PLAN section 4; HIGH comes at 5)."""
+    if state not in ("active", "pending") or maintenance_until or not last_seen:
+        return False
+    return LATE_MS <= now - int(last_seen) < SILENT_MS
+
+
 def api_fleet(app, conn, query, session):
     now = hub_common.now_ms()
     incidents = dict(conn.execute("SELECT host, COUNT(*) FROM incidents WHERE state!='resolved' GROUP BY host").fetchall())
@@ -497,6 +507,7 @@ def api_fleet(app, conn, query, session):
             "cert_not_after": r["cert_not_after"], "policy_rev": r["policy_rev"], "policy_rev_applied": r["policy_rev_applied"],
             "open_incidents": incidents.get(r["uuid"], 0),
             "maintenance_until": r["m_until"], "maintenance_by": cut(r["m_by"] or "", 200) if r["m_until"] else None,
+            "late": is_late(r["state"], r["last_seen"], r["m_until"], now),
             "health": _host_health(hb), "exposure": exposure, "exposure_checks": exposure_checks,
         })
     return {"hosts": hosts}
@@ -513,7 +524,7 @@ def _int_arg(query, key, default=None, lo=0, hi=2 ** 62):
     raw = query.get(key, [None])[0]
     if raw is None or raw == "":
         return default
-    if not raw.isdigit() or not lo <= int(raw) <= hi:
+    if not (raw.isdigit() and raw.isascii()) or not lo <= int(raw) <= hi:
         raise ApiError(400, "bad " + key)
     return int(raw)
 
@@ -688,8 +699,8 @@ GET_ROUTES = {
     "/api/incidents": api_incidents, "/api/tokens": api_tokens, "/api/audit": api_audit, "/api/settings": api_settings,
 }
 GET_PREFIX_ROUTES = (
-    ("/api/event/", re.compile(r"^\d{1,18}$"), api_event, int),
-    ("/api/incident/", re.compile(r"^\d{1,18}$"), api_incident, int),
+    ("/api/event/", re.compile(r"^\d{1,18}\Z"), api_event, int),
+    ("/api/incident/", re.compile(r"^\d{1,18}\Z"), api_incident, int),
     ("/api/host/", REF_RE, api_host, str),
 )
 
@@ -814,7 +825,7 @@ class Handler(BaseHTTPRequestHandler):
         if length is None:
             self.fail(411)
             return None
-        if not length.isdigit():
+        if not (length.isdigit() and length.isascii()):
             self.fail(400)
             return None
         if int(length) > BODY_MAX:
@@ -970,7 +981,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.fail(429)
         try:
             last = self.headers.get("Last-Event-ID", "")
-            sent = int(last) if last.isdigit() and len(last) < 19 else None
+            sent = int(last) if last.isdigit() and last.isascii() and len(last) < 19 else None
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-store")

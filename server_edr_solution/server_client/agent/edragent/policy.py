@@ -15,7 +15,7 @@ from . import transport as tr
 from .bans import (BANS_MAX, FEED_CIDRS_MAX, HUB_ADDRESSES_MAX, PEERS_MAX, MAX_TTL_S, parse_ip, parse_net)
 from .spool import atomic_write, read_json_safe
 
-REV_RE = re.compile(r"^[0-9a-f]{16}$")
+REV_RE = re.compile(r"^[0-9a-f]{16}\Z")
 SOURCES = ("fleet", "operator")
 REASON_IDS = ("fleet_quorum", "operator")
 FEED_NAMES = ("spamhaus_drop_v4", "spamhaus_drop_v6", "dshield")

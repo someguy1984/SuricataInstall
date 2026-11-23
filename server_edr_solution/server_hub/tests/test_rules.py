@@ -249,5 +249,16 @@ class RunbookTests(unittest.TestCase):
             self.assertIn(head, text)
 
 
+class DeletedExeAndLateTests(HubTestCase):
+    def test_deleted_exe_is_rated_high_by_the_hub(self):
+        host = self.hub.add_host("web1")
+        for client in ("LOW", "MEDIUM", "HIGH"):
+            self.assertEqual(hub_rules.rate(self.hub.writer.conn, host, ev("inventory.deleted_exe", client)), ("HIGH", "deleted_exe" if client != "HIGH" else None))
+
+    def test_there_is_no_unused_late_constant(self):
+        import hub_engine
+        self.assertFalse(hasattr(hub_engine, "LATE_MS"))
+
+
 if __name__ == "__main__":
     unittest.main()

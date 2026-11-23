@@ -22,21 +22,22 @@ from .base import Source, cut_line, parse_ip, parse_clf_time
 
 ERROR_LINE_MAX_FOR_ADDRESS = 2040
 HOLD_ATTRIBUTED_S = 2.0
+CORROBORATE_WAIT_S = 5.0
 GLIBC_HOLD_LINES = 4
 GLIBC_HOLD_SECONDS = 5.0
 LOG_FORMAT_BAD_MIN = 20
 LOG_FORMAT_REMINDER_S = 6 * 3600
 
-_ERR_RE = re.compile(r"^(\d{4}/\d\d/\d\d \d\d:\d\d:\d\d) \[(\w+)\] (\d+)#(\d+): (.*)$", re.DOTALL)
+_ERR_RE = re.compile(r"^(\d{4}/\d\d/\d\d \d\d:\d\d:\d\d) \[(\w+)\] (\d+)#(\d+): (.*)\Z", re.DOTALL)
 _RECORD_START = re.compile(r"^\d{4}/\d\d/\d\d \d\d:\d\d:\d\d \[\w+\] \d+#\d+: ")
 _CLIENT_RE = re.compile(r", client: ([0-9A-Fa-f:.]{2,45}), server: ")
 _GLIBC_RE = re.compile(
     r"^(free\(\): |malloc\(\): |realloc\(\): |double free or corruption|double free detected|corrupted size|"
     r"corrupted double-linked list|munmap_chunk\(\)|malloc_consolidate\(\)|invalid pointer|free\(\): invalid)")
-_CRASH_RE = re.compile(r"^worker process (\d+) exited on signal (\d+)(?: \(core dumped\))?$")
+_CRASH_RE = re.compile(r"^worker process (\d+) exited on signal (\d+)(?: \(core dumped\))?\Z")
 _RESOLVER_RE = re.compile(r"^could not cancel .*resolving")
 _PRESSURE_RE = re.compile(r"^(?:\d+ )?worker_connections are not enough, reusing connections")
-_EXHAUSTED_RE = re.compile(r"^(\d+) worker_connections are not enough$")
+_EXHAUSTED_RE = re.compile(r"^(\d+) worker_connections are not enough\Z")
 _WINDOW_RE = re.compile(r"^client violated connection flow control: received WINDOW_UPDATE frame with window increment")
 
 
@@ -66,10 +67,49 @@ class ErrorLogSource(Source):
         self.reader = tail.Tailer(self.path, label, ctx.paths.cursors_dir, first_start=first_start, clock=ctx.clock)
         self.held = []          # (time, text) of unprefixed glibc abort lines
         self.attributed = []    # (time, events): events with an address, waiting to see what the next line is
+        self.waiting = []       # (deadline, event): address rules passed, waiting for the access log to confirm the address
 
     def poll(self, now):
-        events = self.process_lines(self.reader.poll(), now)
+        events = self.process_lines(self.reader.poll(), now) + self.settle(now)
         return self.notice_events(self.label) + events
+
+    # The address of an error.log line is something a web user can try to forge (nginx does not escape the file), and a
+    # ban on it would lock out whoever the attacker names. So it is ban evidence (src_trust tcp) only when the access
+    # log, which the web user cannot forge, shows a request from the same address inside the ring's window. Without that
+    # (the access log unreadable, its format not starting with $remote_addr, no request from the address) the event is
+    # still raised, but the address is `claimed`: it can never become a ban or a fleet vote.
+    def _corroborated(self, ip, now):
+        ctx = self.ctx
+        return ctx.access_usable is not False and ctx.ring.has(ip, now)
+
+    def _corroborate(self, events, now):
+        out = []
+        for e in events:
+            if e.get("src_ip") and e.get("src_trust") == "tcp":
+                if self._corroborated(e["src_ip"], now):
+                    e.setdefault("details", {})["addr_corroborated"] = True
+                else:
+                    self.waiting.append((now + CORROBORATE_WAIT_S, e))
+                    continue
+            out.append(e)
+        return out
+
+    def settle(self, now=None, force=False):
+        """Events whose address the access log has confirmed, or (after a few seconds, or at the end) downgraded to claimed."""
+        now = self.ctx.clock() if now is None else now
+        out, rest = [], []
+        for deadline, e in self.waiting:
+            if self._corroborated(e["src_ip"], now):
+                e.setdefault("details", {})["addr_corroborated"] = True
+                out.append(e)
+            elif force or now >= deadline:
+                e["src_trust"] = "claimed"
+                e.setdefault("details", {})["addr_corroborated"] = False
+                out.append(e)
+            else:
+                rest.append((deadline, e))
+        self.waiting = rest
+        return out
 
     def process_lines(self, lines, now=None):
         """parse_line over a run of physical lines, with one extra check on every event that carries an address.
@@ -97,14 +137,15 @@ class ErrorLogSource(Source):
                 self.attributed.append((now, keep))
         if self.attributed and now - self.attributed[-1][0] >= HOLD_ATTRIBUTED_S:
             out.extend(self.attributed.pop()[1])        # no line followed: it was the end of the file, so far
-        return out
+        return self._corroborate(out, now)
 
     def finish(self):
-        """Release what is still waiting (at shutdown, and in tests)."""
+        """Release what is still waiting (at shutdown, and in tests): unconfirmed addresses become claimed."""
         out = []
         while self.attributed:
             out.extend(self.attributed.pop()[1])
-        return out
+        now = self.ctx.clock()
+        return self._corroborate(out, now) + self.settle(now, force=True)
 
     def parse_line(self, line, now=None):
         now = self.ctx.clock() if now is None else now
@@ -170,8 +211,8 @@ _Q = r'"((?:[^"\\]|\\.){0,4096})"'
 _ACC_RE = re.compile(r'^(\S{1,45}) \S+ \S+ \[([^\]\n]{1,40})\] ' + _Q + r' (\d{3}) (\d{1,12}|-)'
                      r'(?: "((?:[^"\\]|\\.){0,2048})" "((?:[^"\\]|\\.){0,1024})")?'
                      r'(?: "((?:[^"\\]|\\.){0,512})")?(?: .*)?$', re.DOTALL)
-_REQ_RE = re.compile(r"^([A-Za-z]{1,16}) (\S{0,4096})(?: HTTP/\d(?:\.\d)?)?$")
-_XFF_RE = re.compile(r"^[0-9A-Fa-f:., ]+$")
+_REQ_RE = re.compile(r"^([A-Za-z]{1,16}) (\S{0,4096})(?: HTTP/\d(?:\.\d)?)?\Z")
+_XFF_RE = re.compile(r"^[0-9A-Fa-f:., ]+\Z")
 
 DEFAULT_TRIPWIRES = [
     {"path": "/_ignition/execute-solution"}, {"path": "/_ignition/health-check"},
@@ -347,6 +388,7 @@ class AccessLogSource(Source):
                 "an nginx access_log format does not start with $remote_addr: no address is taken from the access log",
                 details={"format": bad_format, "source": "inventory"}))
         self.format_disabled = bool(bad_format)
+        ctx.access_usable = not (self.format_disabled or self.reader.error is not None or ctx.log_format_ok is False)
         changed, reasons = ctx.update_proxy()
         if changed:
             if reasons:

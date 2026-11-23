@@ -16,6 +16,7 @@ Fleet bans, votes and acknowledgement are P3 and are not here. Standard library 
 import contextlib
 import itertools
 import json
+import math
 import os
 import shutil
 import threading
@@ -32,7 +33,6 @@ MIN = 60 * 1000
 HOUR = 60 * MIN
 DAY = 24 * HOUR
 
-LATE_MS = 4 * MIN                     # agent-silent: "late"
 SILENT_MS = 5 * MIN                   # agent-silent: HIGH
 GRACE_MS = 7 * MIN                    # 2 x heartbeat interval + 5 minutes after any start
 HUB_DOWN_ALERT_MS = 10 * MIN
@@ -75,20 +75,44 @@ def _meta_set(conn, key, value):
                  (key, str(value)))
 
 
+MAX_MS = 7_258_118_400_000            # 2200-01-01: a client number beyond this is "far in the future", never an error
+
+
 def _ms(value):
-    """Epoch milliseconds from an int or float (seconds or ms), a digit string or an RFC 3339 string; None if unknown."""
+    """Epoch milliseconds from an int or float (seconds or ms), a digit string or an RFC 3339 string; None if unknown.
+    A client may send any number: the result is never above MAX_MS and this never raises."""
     if value is None or isinstance(value, bool):
         return None
+    if isinstance(value, float):
+        if math.isnan(value) or value < 0:
+            return None
+        if math.isinf(value):
+            return MAX_MS
     if isinstance(value, (int, float)):
-        return int(value if value > 1e11 else value * 1000)
+        if value < 0:
+            return None
+        return min(int(value if value > 1e11 else value * 1000), MAX_MS)
     if isinstance(value, str):
-        if value.isdigit():
+        if value.isdigit() and len(value) <= 40:
             return _ms(int(value))
         try:
-            return rfc3339_to_ms(value)
-        except ValueError:
+            return min(rfc3339_to_ms(value), MAX_MS)
+        except (ValueError, OverflowError):
             return None
     return None
+
+
+def _num(value, hi=2 ** 62):
+    """A client number as a float within [0, hi], or None (not a number, NaN, negative). Never raises."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        v = float(value)
+    except OverflowError:
+        return float(hi)
+    if math.isnan(v) or v < 0:
+        return None
+    return min(v, float(hi))
 
 
 def _json(text, default=None):
@@ -550,11 +574,13 @@ def _free_pct(disk):
     if not isinstance(disk, dict):
         return None
     for key in ("free_pct", "free_percent"):
-        if isinstance(disk.get(key), (int, float)) and not isinstance(disk.get(key), bool):
-            return float(disk[key])
+        v = _num(disk.get(key), 1000)
+        if v is not None:
+            return v
     for key in ("used_pct", "used_percent"):
-        if isinstance(disk.get(key), (int, float)) and not isinstance(disk.get(key), bool):
-            return 100.0 - float(disk[key])
+        v = _num(disk.get(key), 1000)
+        if v is not None:
+            return 100.0 - v
     for v in disk.values():
         if isinstance(v, dict):
             r = _free_pct(v)
@@ -643,8 +669,15 @@ def _hb_identity(conn, hub, host, prev, hb, now):
     uuid = host["uuid"]
     droplet, enrolled = hb.get("droplet_id"), prev.get("droplet_id")
     if isinstance(droplet, str) and droplet and enrolled and droplet != enrolled:
-        event, _ = _track(conn, "dup|droplet|%s|%s" % (uuid, droplet[:40]), 1, now)
-        if event == "new":
+        # one row per host, holding the last 3 claimed ids: a client cannot make a row per value it invents
+        drow = state_get(conn, "dup|droplet|" + uuid)
+        seen_ids = _json(drow["data"], {}).get("ids", []) if drow else []
+        new_id = droplet[:40] not in seen_ids
+        if new_id:
+            seen_ids = (seen_ids + [droplet[:40]])[-3:]
+        state_put(conn, "dup|droplet|" + uuid, first=drow["first"] if drow else now, last=now, count=(drow["count"] if drow else 0) + (1 if new_id else 0),
+                  data={"ids": seen_ids})
+        if new_id:
             _finding(conn, hub, host, "duplicate_identity", "HIGH",
                      "Duplicate identity: %s now reports another droplet id" % clean(host["name"], 64), now, chain="tamper",
                      signal="duplicate_identity", fields={"from": clean(_g(host, "enrolled_from", ""), 64)})
@@ -654,7 +687,7 @@ def _hb_identity(conn, hub, host, prev, hb, now):
     ids = [h[0] for h in hist if isinstance(h, list) and h]
     if isinstance(boot, str) and boot:
         if ids and boot != ids[-1] and boot in ids and now - dict((h[0], h[1]) for h in hist)[boot] < DAY:
-            if _once(conn, "dup|boot|%s|%s|%d" % (uuid, boot[:36], now // HOUR), now):
+            if _once(conn, "dup|boot|%s|%d" % (uuid, now // HOUR), now):
                 _finding(conn, hub, host, "duplicate_identity", "HIGH",
                          "Duplicate identity: two live boot ids on %s" % clean(host["name"], 64), now, chain="tamper",
                          signal="duplicate_identity")
@@ -706,12 +739,16 @@ def _hb_policy(conn, hub, host, prev, hb, now):
 
 def _hb_pause(conn, hub, host, prev, hb, now):
     until = _ms(hb.get("paused_until"))
+    clamped = False
+    if until and until > now + DAY:                   # a pause is 24 hours at most (client PLAN 4.7)
+        until, clamped = now + DAY, True
     active = bool(until and until > now)
     row = state_get(conn, "pause|" + host["uuid"])
     last_until = _json(row["data"], {}).get("until") if row else None
     event, _ = _track(conn, "pause|" + host["uuid"], 1 if active else 0, now, extra={"until": until if active else last_until})
     if active and (event == "new" or (last_until and until != last_until and event is None)):
-        _finding(conn, hub, host, "paused", "MEDIUM", "%s is paused until %s" % (clean(host["name"], 64), ms_to_rfc3339(until)), now)
+        _finding(conn, hub, host, "paused", "MEDIUM", "%s is paused until %s%s" % (
+            clean(host["name"], 64), ms_to_rfc3339(until), " (the host claims more than 24 hours: counted as 24 hours)" if clamped else ""), now)
 
 
 def _hb_nft(conn, hub, host, prev, hb, now):
@@ -738,10 +775,10 @@ def _hb_conntrack(conn, hub, host, prev, hb, now):
     ct = hb.get("conntrack")
     if not isinstance(ct, dict):
         return
-    count, maxi = ct.get("count"), ct.get("max")
-    if not all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in (count, maxi)) or maxi <= 0:
+    count, maxi = _num(ct.get("count")), _num(ct.get("max"))
+    if count is None or maxi is None or maxi <= 0:
         return
-    ratio = count / maxi
+    ratio = min(count / maxi, 10.0)                 # a count far above the maximum is still just "full"
     level = 2 if ratio >= 0.9 else 1 if ratio >= 0.7 else 0
     event, _ = _track(conn, "conntrack|" + host["uuid"], level, now)
     if event in ("new", "up"):
@@ -753,13 +790,14 @@ def _hb_suricata(conn, hub, host, prev, hb, now):
     sd = hb.get("suricata_drops")
     if not isinstance(sd, dict):
         return
-    packets, drops = sd.get("packets"), sd.get("drops")
-    if not all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in (packets, drops)) or packets <= 0:
+    packets, drops = _num(sd.get("packets")), _num(sd.get("drops"))
+    if packets is None or drops is None or packets <= 0:
         return
-    event, _ = _track(conn, "suridrop|" + host["uuid"], 1 if drops / packets > 0.01 else 0, now)
+    share = min(drops / packets, 1.0)
+    event, _ = _track(conn, "suridrop|" + host["uuid"], 1 if share > 0.01 else 0, now)
     if event == "new":
         _finding(conn, hub, host, "suricata_drops", "MEDIUM",
-                 "Suricata on %s dropped %.1f%% of packets" % (clean(host["name"], 64), 100.0 * drops / packets), now)
+                 "Suricata on %s dropped %.1f%% of packets" % (clean(host["name"], 64), 100.0 * share), now)
 
 
 def _hb_cert(conn, hub, host, prev, hb, now):
@@ -876,8 +914,16 @@ def _advisory_eval(conn, hub, host, inv, now, daily):
                          dedup_key="adv|%s|%s|%d" % (host["uuid"], rid, now // DAY if daily else 0))
         else:
             _note(conn, host, "advisory_exposed", f["severity"], text, now, variant=rid)
+    # Gone from the findings means "fixed" only when the inventory gave a definite answer. An unknown or missing
+    # check says nothing: the 24-hour exposure clock (first) and the last severity stay as they were.
+    definite = hub_advisory.inventory_definite(inv)
     for rid in list(sevs):
-        if rid not in seen:                     # fixed since the last look
+        if rid in seen:
+            continue
+        if rid in ("nginx-unknown", "nginx-origin", "kernel-unknown"):     # a "status unknown" note: gone when no longer reported
+            sevs.pop(rid, None)
+            first.pop(rid, None)
+        elif definite["kernel" if rid.startswith("kernel-") else "nginx"]:
             sevs.pop(rid, None)
             first.pop(rid, None)
     state_put(conn, key, first=row["first"] if row else now, last=now, data={"first": first, "sev": sevs})
@@ -1125,6 +1171,14 @@ def _digest_due(conn, hub, now):
     return (slot if now >= slot and (last is None or last < slot) else None), last
 
 
+def prune_alert_state(conn, now):
+    """Delete alert_state rows nobody touched for 7 days. A condition that is still set (level 1 to 3), an open
+    survived-the-kill task and the storm row stay. Returns the number of rows deleted."""
+    cur = conn.execute("DELETE FROM alert_state WHERE last<? AND key NOT LIKE 'task|%' AND key!='storm' "
+                       "AND data NOT GLOB '*\"level\": [1-9]*'", (now - 7 * DAY,))
+    return cur.rowcount
+
+
 def _digest(conn, hub, now):
     slot, last = _digest_due(conn, hub, now)
     if slot is None:
@@ -1138,6 +1192,7 @@ def _digest(conn, hub, now):
             if isinstance(inv, dict):
                 _advisory_eval(conn, hub, host, inv, now, daily=True)
     conn.execute("DELETE FROM alert_state WHERE key LIKE 'once|%' AND last<?", (now - 7 * DAY,))
+    prune_alert_state(conn, now)
     lines, counts = build_digest(conn, hub, since, now)
     notify(conn, hub, severity="LOW", always=True, kind="hub.digest", now=now,
            summary="Daily digest for %s" % ms_to_rfc3339(now)[:10], lines=lines,
@@ -1208,7 +1263,7 @@ class Engine:
         self._stage("hosts", lambda c: _hosts_checks(c, hub, now, self.grace_until))
         if now - self._t_minute >= MIN:
             self._t_minute = now
-            self._stage("storm", lambda c: hub_alerts.flush_storm(c, hub, now))
+            self._stage("storm", lambda c: hub_alerts.flush_storm(c, hub, now) + hub_alerts.flush_host_caps(c, hub, now))
             self._stage("digest", lambda c: _digest(c, hub, now))
         if now - self._t_health >= 5 * MIN:
             self._t_health = now

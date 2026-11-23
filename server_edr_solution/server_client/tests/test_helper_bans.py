@@ -116,17 +116,41 @@ class TestValidation(unittest.TestCase):
                              {"cidr": "21.1.2.3/32", "expires": NOW + 50}, {"cidr": "22.0.0.0/16"}]))
         self.assertEqual([(b["cidr"], b["expires"]) for b in s["bans"]], [("21.1.0.0/16", NOW + 9000), ("22.0.0.0/16", NOW + 3600)])
 
-    def test_breaker_on_new_hub_bans(self):
+    def test_breaker_refuses_the_whole_hub_part_of_an_update(self):
         many = [{"cidr": "23.%d.0.1/32" % n, "source": "fleet", "reason": "fleet_quorum"} for n in range(50)]
-        s, refused = validate(doc(many))
-        self.assertEqual(len(s["bans"]), 20)
-        self.assertEqual(len(refused), 30)
-        # a ban that was already there does not count as new
-        prev = dict(B.empty_state(), bans=[{"cidr": "23.%d.0.1/32" % n, "expires": NOW + 99, "source": "fleet", "reason": "fleet_quorum"} for n in range(50)])
-        s, refused = validate(doc(many), prev)
-        self.assertEqual(len(s["bans"]), 50)
-        # local bans are never throttled by the breaker
-        s, _ = validate(doc([{"cidr": "24.%d.0.1/32" % n} for n in range(50)]))
+        local = [{"cidr": "24.1.0.1/32"}]
+        s, refused = validate(doc(many + local))
+        self.assertEqual([b["cidr"] for b in s["bans"]], ["24.1.0.1/32"])            # no new hub ban at all; the local one applies
+        self.assertEqual([r["cidr"] for r in refused], ["breaker"])
+        self.assertIn("hub part is refused", refused[0]["why"])
+        # exactly 20 are fine
+        s, refused = validate(doc(many[:20] + local))
+        self.assertEqual(len(s["bans"]), 21)
+        self.assertEqual(refused, [])
+        # hub bans already in force stay when a later update trips the breaker, and the ones that were there do not count as new
+        prev = dict(B.empty_state(), bans=[{"cidr": "23.%d.0.1/32" % n, "expires": NOW + 99, "source": "fleet", "reason": "fleet_quorum"} for n in range(5)])
+        s, refused = validate(doc(many + local), prev)
+        self.assertEqual(sorted(b["cidr"] for b in s["bans"] if b["source"] == "fleet"), ["23.%d.0.1/32" % n for n in range(5)])
+        self.assertEqual(len(s["bans"]), 6)
+        s, refused = validate(doc(many[:5] + local), prev)
+        self.assertEqual(len(s["bans"]), 6)
+        self.assertEqual(refused, [])
+
+    def test_breaker_counts_ten_minutes_too(self):
+        first = [{"cidr": "23.%d.0.1/32" % n, "source": "fleet", "reason": "fleet_quorum"} for n in range(15)]
+        s1, r1 = validate(doc(first))
+        self.assertEqual((len(s1["bans"]), r1), (15, []))
+        self.assertEqual(len(s1["hub_new"]), 15)
+        more = first + [{"cidr": "25.%d.0.1/32" % n, "source": "fleet", "reason": "fleet_quorum"} for n in range(10)]
+        s2, r2 = validate(doc(more), s1)                      # 10 new now, 15 a moment ago: 25 in 10 minutes
+        self.assertEqual(len(s2["bans"]), 15)
+        self.assertEqual([r["cidr"] for r in r2], ["breaker"])
+        # after the window the same update goes through
+        later = dict(s1, hub_new=[t - 700 for t in s1["hub_new"]])
+        s3, r3 = validate(doc(more), later)
+        self.assertEqual((len(s3["bans"]), r3), (25, []))
+        # local bans are never throttled
+        s, _ = validate(doc([{"cidr": "26.%d.0.1/32" % n} for n in range(50)]))
         self.assertEqual(len(s["bans"]), 50)
 
     def test_empty_feed_never_replaces_a_non_empty_one(self):
@@ -318,6 +342,19 @@ class TestRuns(TmpCase):
         rc, out, _ = run_helper("edr-bans", ["--dry-run", "--now", str(NOW), "--files-dir", FILES, "--root", ""], env={"EDR_AGENT_ROOT": ""})
         # the real paths are only read; with no bans.json the script holds just the base
         self.assertIn(rc, (0, 1))
+
+    def test_a_tripped_breaker_is_reported_in_last_apply(self):
+        many = [{"cidr": "23.%d.0.1/32" % n, "source": "fleet", "reason": "fleet_quorum"} for n in range(30)]
+        self.write_bans(doc(many + [{"cidr": "24.1.0.1/32"}]))
+        rc, out, _ = self.run_bans()
+        self.assertEqual(rc, 0)
+        la = self.counters()["last_apply"]
+        self.assertFalse(la["ok"])
+        self.assertIn("hub bans refused", la["error"])
+        self.assertEqual(la["refused"][0]["cidr"], "breaker")
+        self.assertIn("24.1.0.1/32 timeout", out)
+        self.assertNotIn("23.0.0.1/32 timeout", out)
+        self.assertEqual([b["cidr"] for b in self.state()["bans"]], ["24.1.0.1/32"])
 
     def test_authenticated_ssh_session_is_never_banned(self):
         rec = bytearray(B.UTMP_SIZE)

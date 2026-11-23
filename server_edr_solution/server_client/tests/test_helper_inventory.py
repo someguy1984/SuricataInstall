@@ -301,7 +301,7 @@ class InvCase(TmpCase):
         return [f for f in doc["findings"] if f["check"] == check]
 
 
-@unittest.skipUnless(os.path.isfile(ADV), "common/advisories.json is written by agent 2")
+@unittest.skipUnless(os.path.isfile(ADV), "common/advisories.json is missing")
 class TestAdvisoryEvaluation(InvCase):
     def exposed(self):
         self.put("/etc/nginx/nginx.conf", "http { server { listen 443 ssl http2; ssl_certificate /x; } }")
@@ -543,7 +543,8 @@ class TestStateBaselines(InvCase):
         d = self.run_inv({})
         sev = {f["summary"].split()[0] + f["sev"] for f in self.findings(d, "auth_state")}
         self.assertEqual(len(self.findings(d, "auth_state")), 3)
-        self.assertIn("HIGH", [f["sev"] for f in self.findings(d, "auth_state")])
+        # every change is HIGH: a new uid-0 account, a changed sudoers, a changed authorized_keys (hub plan rule table, client 4.7)
+        self.assertEqual([f["sev"] for f in self.findings(d, "auth_state")], ["HIGH", "HIGH", "HIGH"])
         # nothing in the output names the new account: hashes only
         self.assertNotIn("toor", json.dumps(d))
         d = self.run_inv({})

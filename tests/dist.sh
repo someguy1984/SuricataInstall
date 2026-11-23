@@ -69,6 +69,10 @@ stage_client() {   # stage_client DIR
         [[ -e $d/tetragon/policies/$p.yaml ]] || cp -a "tetragon/policies/$p.yaml" "$d/tetragon/policies/$p.yaml"
     done
     cp -a controld/files/dns-lockdown-rules.sh "$d/files/dns-lockdown-rules.sh"
+    cp -a tetragon/config.sh "$d/tetragon/config.sh"      # the Tetragon version pin, read by the server check.sh and installer
+    # the advisory table: edr-inventory judges package fixes from it (the installer copies it beside the code)
+    mkdir -p "$d/common"
+    cp -a "$SE/common/advisories.json" "$d/common/advisories.json"
     clean_tree "$d"
     printf '%s\n' "$CLIENT_VERSION" > "$d/VERSION"
 }

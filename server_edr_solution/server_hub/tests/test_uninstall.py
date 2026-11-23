@@ -285,6 +285,23 @@ class PlanTests(PlanCase):
             f.write("{broken")
         self.assertIn("ports 8443, 8444 and 8450", self.plan().stdout)
 
+    def test_yes_never_answers_a_purge_question_and_purge_needs_a_terminal(self):
+        with open(SCRIPT) as f:
+            text = f.read()
+        func = re.search(r"^confirm\(\) \{.*?^\}", text, re.S | re.M).group(0)
+        for prompt, answer, expect_yes in (("Continue?", "y", True), ("Type 'purge'", "purge", False), ("Last chance", "delete everything", False)):
+            r = subprocess.run(["bash", "-c", "ASSUME_YES=1\n%s\nconfirm \"%s\" \"%s\"" % (func, prompt, answer)], capture_output=True,
+                               text=True, stdin=subprocess.DEVNULL, timeout=20)
+            self.assertEqual(r.returncode == 0, expect_yes, prompt)
+        gate = text.index("[[ $PURGE -eq 1 && ! -t 0 ]]")
+        self.assertLess(gate, text.rindex('say "Step 1: final backup"'))
+        self.assertIn("exit 3", text[gate:gate + 400])
+
+    def test_the_mock_never_uses_purge(self):
+        mock = os.path.join(os.path.dirname(SCRIPT), "..", "mock", "mock.sh")
+        with open(mock) as f:
+            self.assertNotIn("--purge", f.read().replace("MOCK_", ""))
+
     def test_purge_plan_has_the_three_warnings_in_order_and_asks_twice(self):
         self.manifest()
         out = self.plan("--purge").stdout

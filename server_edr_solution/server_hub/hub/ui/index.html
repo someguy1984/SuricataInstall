@@ -294,9 +294,10 @@ dd { margin: 0; word-break: break-word; }
         hosts.map(function (h) {
           var notes = [];
           if (h.maintenance_until) { notes.push('maintenance until ' + fmtTime(h.maintenance_until)); }
+          if (h.late) { notes.push('late: no heartbeat for over 4 minutes'); }
           if (h.health && h.health.maintenance_until) { notes.push('host declares maintenance'); }
           if (h.health && h.health.paused_until) { notes.push('paused'); }
-          return [h.name, el('span', STATE_CLASS[h.state] || '', h.state), fmtAge(h.last_seen), h.agent_version,
+          return [h.name, el('span', STATE_CLASS[h.state] || '', h.state + (h.late ? ' (late)' : '')), fmtAge(h.last_seen), h.agent_version,
             (h.peer_ips && h.peer_ips[0]) || '-', h.open_incidents, healthText(h.health || {}),
             el('span', EXPOSURE_CLASS[h.exposure] || '', h.exposure + (h.exposure_checks && h.exposure_checks.length ? ' (' + h.exposure_checks.join(', ') + ')' : '')),
             notes.join('; ')];

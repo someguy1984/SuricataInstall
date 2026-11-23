@@ -232,11 +232,13 @@ class TestRefusals(RenderCase):
 
 
 class TestDropinAndCredential(RenderCase):
-    def enroll(self, addresses):
+    def enroll(self, addresses, dropin=True):
         d = os.path.join(self.paths.identity_dir, "gen-1")
         os.makedirs(d)
         self.write(os.path.join(d, "hub.conf"), "[hub]\naddresses = %s\nport = 8443\nenroll_port = 8444\nhost_uuid = x\nca_sha256 = %s\n" % (",".join(addresses), "a" * 64))
         os.symlink("gen-1", os.path.join(self.paths.identity_dir, "current"))
+        if dropin:                                    # what root wrote at enrollment
+            self.write(self.paths.dropin_path, "[Service]\nIPAddressAllow=\nIPAddressAllow=%s\n" % " ".join(addresses))
 
     def test_local_mode_has_no_dropin(self):
         files, _, _ = self.render(ONE)
@@ -248,12 +250,22 @@ class TestDropinAndCredential(RenderCase):
         self.assertEqual(files["systemd/edr-agent.service.d/10-hub.conf"], "[Service]\nIPAddressAllow=\nIPAddressAllow=203.0.113.5 198.51.100.9\n")
         self.assertEqual(render.render_dropin([]), None)
 
-    def test_a_broken_hub_conf_gives_no_dropin(self):
-        d = os.path.join(self.paths.identity_dir, "gen-1")
-        os.makedirs(d)
-        self.write(os.path.join(d, "hub.conf"), "garbage")
-        os.symlink("gen-1", os.path.join(self.paths.identity_dir, "current"))
+    def test_the_agents_own_hub_conf_is_not_trusted_for_the_allowlist(self):
+        self.enroll(["203.0.113.5"])
+        with open(os.path.join(self.paths.identity_dir, "gen-1", "hub.conf"), "w") as f:         # the agent edits its own file
+            f.write("[hub]\naddresses = 198.51.100.66\nport = 8443\nenroll_port = 8444\nhost_uuid = x\nca_sha256 = %s\n" % ("a" * 64))
+        files, _, _ = self.render(ONE)
+        self.assertEqual(files["systemd/edr-agent.service.d/10-hub.conf"], "[Service]\nIPAddressAllow=\nIPAddressAllow=203.0.113.5\n")
+        self.assertNotIn("198.51.100.66", "".join(files.values()))
+
+    def test_an_identity_with_no_dropin_gives_none_and_a_garbled_one_is_cleaned(self):
+        self.enroll(["203.0.113.5"], dropin=False)
         self.assertEqual(self.render(ONE)[0].get("systemd/edr-agent.service.d/10-hub.conf"), None)
+        self.write(self.paths.dropin_path, "[Service]\nIPAddressAllow=\nIPAddressAllow=203.0.113.5 not-an-ip 10.0.0.1/8 2001:db8::5\n")
+        self.assertEqual(render.hub_addresses(self.paths), ["203.0.113.5", "2001:db8::5"])
+        os.unlink(self.paths.dropin_path)
+        os.symlink("/etc/passwd", self.paths.dropin_path)
+        self.assertEqual(render.hub_addresses(self.paths), [])
 
     def test_notify_min_severity(self):
         files, _, _ = self.render(ONE + "[notify]\nmin_severity = CRITICAL\n")
@@ -354,15 +366,15 @@ class TestApplyConfig(RenderCase):
         os.makedirs(d)
         self.write(os.path.join(d, "hub.conf"), "[hub]\naddresses = 203.0.113.5\nport = 8443\nenroll_port = 8444\nhost_uuid = x\nca_sha256 = %s\n" % ("a" * 64))
         os.symlink("gen-1", os.path.join(self.paths.identity_dir, "current"))
+        self.write(self.paths.dropin_path, "[Service]\nIPAddressAllow=\nIPAddressAllow=198.51.100.9\n")     # root's record of the hub
         self.write(self.paths.local_conf, ONE)
         calls = []
         code, out = self.run_apply(runner=lambda *a, **k: calls.append(a))
         self.assertEqual(code, 0)
         self.assertEqual(calls, [])
-        self.assertIn("would run: systemctl daemon-reload", out)
-        self.assertIn("would run: systemctl restart edr-agent.service", out)
+        self.assertNotIn("daemon-reload", out)                         # the drop-in is root's own record: apply-config leaves it as it is
         self.assertIn("would run: tetra tracingpolicy list", out)
-        self.assertEqual(slurp(self.paths.dropin_path), "[Service]\nIPAddressAllow=\nIPAddressAllow=203.0.113.5\n")
+        self.assertEqual(slurp(self.paths.dropin_path), "[Service]\nIPAddressAllow=\nIPAddressAllow=198.51.100.9\n")
         # without a dev root the commands run (here with a fake runner, as root, and no sleeping)
         self.write(self.paths.local_conf, ONE.replace("php-fpm8.3\n", "php-fpm8.3, /usr/sbin/php-fpm8.5\n"))
         self.paths.dev = False

@@ -25,12 +25,12 @@ LEARNING_S = 14 * 86400
 SEEN_CAP = 20000
 
 _FP = r"(?:: (\S{1,32}) (SHA256:[A-Za-z0-9+/=_-]{20,64}))?"
-_FAILED = re.compile(r"^Failed (password|publickey|keyboard-interactive/pam|none|gssapi-with-mic|hostbased) for (invalid user )?(.+) from (\S+) port (\d+) ssh2" + _FP + r"$")
-_INVALID = re.compile(r"^Invalid user (.*) from (\S+)(?: port (\d+))?$")
-_CLOSED = re.compile(r"^Connection closed by (authenticating|invalid) user (.+) (\S+) port (\d+) \[preauth\]$")
+_FAILED = re.compile(r"^Failed (password|publickey|keyboard-interactive/pam|none|gssapi-with-mic|hostbased) for (invalid user )?(.+) from (\S+) port (\d+) ssh2" + _FP + r"\Z")
+_INVALID = re.compile(r"^Invalid user (.*) from (\S+)(?: port (\d+))?\Z")
+_CLOSED = re.compile(r"^Connection closed by (authenticating|invalid) user (.+) (\S+) port (\d+) \[preauth\]\Z")
 _NEGOTIATE = re.compile(r"^Unable to negotiate with (\S+) port (\d+): ")
-_ACCEPTED = re.compile(r"^Accepted (\S+) for (.+) from (\S+) port (\d+) ssh2" + _FP + r"$")
-_SUDO = re.compile(r"^\s*(\S{1,64}) : (.*)$", re.DOTALL)
+_ACCEPTED = re.compile(r"^Accepted (\S+) for (.+) from (\S+) port (\d+) ssh2" + _FP + r"\Z")
+_SUDO = re.compile(r"^\s*(\S{1,64}) : (.*)\Z", re.DOTALL)
 _SHELLS = {"sh", "bash", "dash", "zsh", "fish", "ksh", "tcsh", "csh", "su", "login"}
 _SENSITIVE = re.compile(r"/etc/sudoers|visudo|sudoedit|\.ssh/|authorized_keys|/etc/cron|/var/spool/cron|crontab")
 

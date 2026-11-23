@@ -17,6 +17,8 @@ DEDUP_WINDOW_MS = 30 * 60 * 1000          # per (host, kind)
 CRITICAL_WINDOW_MS = 5 * 60 * 1000        # CRITICAL: at most one per (host, kind) per 5 minutes
 STORM_WINDOW_MS = 10 * 60 * 1000
 STORM_MAX = 20
+CRIT_CAP = 10                              # CRITICAL pages per host per window; one host cannot page without limit
+CRIT_CAP_WINDOW_MS = 30 * 60 * 1000
 FIELD_MAX = 200
 FIELDS_MAX = 14
 COMMANDS_MAX = 4
@@ -184,14 +186,64 @@ def flush_storm(conn, hub, now=None):
     return len(ids)
 
 
+def _crit_state(conn, uuid, now):
+    row = state_get(conn, "crit|" + uuid)
+    data = _load(row["data"]) if row else {}
+    sent = [t for t in data.get("sent", []) if isinstance(t, int) and now - t < CRIT_CAP_WINDOW_MS]
+    return row, {"sent": sent, "suppressed": int(data.get("suppressed") or 0), "summary_at": int(data.get("summary_at") or 0),
+                 "name": str(data.get("name") or "")}
+
+
+def _crit_save(conn, uuid, row, d, now):
+    state_put(conn, "crit|" + uuid, severity="CRITICAL", first=row["first"] if row else now, last=now, count=len(d["sent"]),
+              suppressed=d["suppressed"], data={"sent": d["sent"], "suppressed": d["suppressed"], "summary_at": d["summary_at"],
+                                                "name": d["name"]})
+
+
+def _crit_allow(conn, host, now):
+    """Count one CRITICAL page of a host; False when the host has used its 10 pages in 30 minutes."""
+    uuid = _g(host, "uuid")
+    if not uuid:
+        return True
+    row, d = _crit_state(conn, uuid, now)
+    d["name"] = _safe(_g(host, "name", ""), 64)
+    if len(d["sent"]) >= CRIT_CAP:
+        d["suppressed"] += 1
+        _crit_save(conn, uuid, row, d, now)
+        return False
+    d["sent"].append(now)
+    _crit_save(conn, uuid, row, d, now)
+    return True
+
+
+def flush_host_caps(conn, hub, now=None):
+    """One '<N> more CRITICAL alerts from this host suppressed' summary per host and 30 minutes. Returns rows written."""
+    now = now_ms() if now is None else now
+    written = 0
+    for r in query(conn, "SELECT key FROM alert_state WHERE key LIKE 'crit|%' AND suppressed>0"):
+        uuid = r["key"][5:]
+        row, d = _crit_state(conn, uuid, now)
+        if not d["suppressed"] or now - d["summary_at"] < CRIT_CAP_WINDOW_MS:
+            continue
+        n = d["suppressed"]
+        payload = build_payload(conn, severity="HIGH", kind="hub.crit_cap", now=now, host={"name": d["name"], "uuid": uuid},
+                                summary="%d more CRITICAL alerts from this host suppressed" % n,
+                                fields={"suppressed": str(n), "cap": "%d per 30 minutes per host" % CRIT_CAP})
+        written += len(_write_outbox(conn, hub, payload, "HIGH", "critcap|" + uuid, now))
+        d["suppressed"], d["summary_at"] = 0, now
+        _crit_save(conn, uuid, row, d, now)
+    return written
+
+
 def notify(conn, hub, *, severity, kind, summary, host=None, fields=None, incident_id=None,
            always=False, dedup_key=None, now=None, meaning=None, next_step=None, lines=None):
     """Queue one alert. Returns the number of outbox rows written (0 when it was dropped).
 
     Order of the checks: the minimum severity (settings alert_min_severity), per (host, kind) dedup
     (30 minutes; CRITICAL 5 minutes; a higher severity always passes), storm control (20 per
-    10 minutes; CRITICAL and `always` are exempt). `always=True` is for admin actions: it skips the
-    minimum severity, dedup and storm control.
+    10 minutes; CRITICAL and `always` are exempt), and for CRITICAL a cap of 10 pages per host in 30 minutes (the rest
+    become one summary per host and 30 minutes). `always=True` is for admin actions: it skips the minimum severity,
+    dedup, the cap and storm control.
     """
     now = now_ms() if now is None else now
     if severity not in SEVERITIES:
@@ -200,9 +252,10 @@ def notify(conn, hub, *, severity, kind, summary, host=None, fields=None, incide
         return 0
     if not always and severity == "INFO":
         return 0
-    flushed = flush_storm(conn, hub, now)
+    flushed = flush_storm(conn, hub, now) + flush_host_caps(conn, hub, now)
 
-    key = dedup_key or "%s|%s" % (_g(host, "uuid", "-") if host is not None else "-", kind)
+    # A kind the rules table does not name exactly shares one dedup key (see hub_rules.dedup_kind): a client picks kinds
+    key = dedup_key or "%s|%s" % (_g(host, "uuid", "-") if host is not None else "-", hub_rules.dedup_kind(kind))
     row = state_get(conn, key)
     if not always and row is not None:
         window = CRITICAL_WINDOW_MS if severity == "CRITICAL" else DEDUP_WINDOW_MS
@@ -210,6 +263,8 @@ def notify(conn, hub, *, severity, kind, summary, host=None, fields=None, incide
             state_put(conn, key, severity=row["severity"], first=row["first"], last=row["last"],
                       count=row["count"] + 1, suppressed=row["suppressed"] + 1, data=_load(row["data"]))
             return flushed
+    if not always and severity == "CRITICAL" and host is not None and not _crit_allow(conn, host, now):
+        return flushed
     if not always and severity != "CRITICAL":
         storm = _storm_data(conn, now)
         if len(storm["sent"]) >= STORM_MAX:

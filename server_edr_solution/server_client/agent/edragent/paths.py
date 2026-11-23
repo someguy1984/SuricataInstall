@@ -1,4 +1,4 @@
-"""Every path the agent uses (contract 7.1).
+"""Every path the agent uses.
 
 Set EDR_AGENT_ROOT=<dir> and every installed path is prefixed with it, so the agent runs without root
 from a checkout and the tests stay inside a temporary directory. The code directory is never prefixed.
@@ -69,6 +69,7 @@ class Paths:
     policy_templates = property(lambda s: s._shipped_dir("tetragon", "policies"))
     tetragon_tp_dir = property(lambda s: s._p("/etc/tetragon/tetragon.tp.d"))
     dropin_path = property(lambda s: s._p("/etc/systemd/system/edr-agent.service.d/10-hub.conf"))
+    notify_allow_dropin = property(lambda s: s._p("/etc/systemd/system/edr-notify.service.d/10-allow.conf"))
     manifest_json = property(lambda s: os.path.join(s.state_dir, "manifest.json"))
     install_manifest = property(lambda s: s._p("/var/lib/edr-install/manifest.json"))
 

@@ -207,6 +207,21 @@ def fetch(addr, timeout):
     return text if re.fullmatch(r"[0-9]{1,20}", text) else None
 
 
+def write_id(path, text):
+    """Atomically when the directory is writable; in place when only the file itself is (the unit binds that one file)."""
+    try:
+        atomic_write(path, text, 0o640)
+        return
+    except OSError:
+        pass
+    fd = os.open(path, os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        os.write(fd, text.encode("ascii"))
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def main(argv):
     env, files_dir, rest = parse_common(argv)
     addr, timeout, i = "169.254.169.254:80", 2.0, 0
@@ -237,7 +252,7 @@ def main(argv):
         print(did)
         return 0
     try:
-        atomic_write(env.p(OUT), did + "\n", 0o640)
+        write_id(env.p(OUT), did + "\n")
     except OSError as e:
         env.log("cannot write %s: %s" % (OUT, clean(e, 80)))
         return 1

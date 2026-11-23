@@ -285,6 +285,17 @@ def host_dict(r):
     return d
 
 
+LATE_MS, SILENT_MS = 4 * 60 * 1000, 5 * 60 * 1000
+
+
+def is_late(row, maint):
+    """A host whose last heartbeat is 4 to 5 minutes old, not in an operator's window and not retired (PLAN section 4,
+    Timers: "late" at 4 minutes, agent-silent HIGH at 5)."""
+    if row["state"] not in ("active", "pending") or row["uuid"] in maint or not row["last_seen"]:
+        return False
+    return LATE_MS <= hub_common.now_ms() - int(row["last_seen"]) < SILENT_MS
+
+
 def cmd_host(argv):
     if not argv:
         raise CliError(hub_common.EXIT_USAGE, "host: missing arguments")
@@ -303,11 +314,12 @@ def cmd_host(argv):
         if a.json:
             for r in rows:
                 r["maintenance_until"] = maint.get(r["uuid"])
+                r["late"] = is_late(r, maint)
                 jprint(r)
             return 0
         table(["NAME", "STATE", "SEEN", "AGENT", "ADDRESS", "NOTE"],
-              [[c(r["name"], 63), r["state"], fmt_age(r["last_seen"]), c(r["agent_version"] or "-", 20),
-                c((r["peer_ips"] or ["-"])[0], 45),
+              [[c(r["name"], 63), c(r["state"], 20) + (" (late)" if is_late(r, maint) else ""), fmt_age(r["last_seen"]),
+                c(r["agent_version"] or "-", 20), c((r["peer_ips"] or ["-"])[0], 45),
                 "maintenance until " + fmt_ts(maint[r["uuid"]]) if r["uuid"] in maint else ""] for r in rows])
         return 0
     ref = argv[0]
@@ -322,7 +334,7 @@ def cmd_host(argv):
     if action in ("revoke", "retire", "mark-moved", "adopt"):
         Parser(prog="edr-hub host HOST " + action).parse_args(rest)
         res = call("host." + action, {"host": ref})
-        out("host %s (%s): now %s" % (c(res["host"], 63), res["uuid"], res["state"]))
+        out("host %s (%s): now %s" % (c(res["host"], 63), c(res["uuid"], 40), c(res["state"], 20)))
         return 0
     if action == "maintenance":
         p = Parser(prog="edr-hub host HOST maintenance")
@@ -353,8 +365,8 @@ def host_show(ref, as_json):
         jprint(d)
         return 0
     out("name:            %s" % c(d["name"], 63))
-    out("uuid:            %s" % d["uuid"])
-    out("state:           %s (since %s)" % (d["state"], fmt_ts(d["state_since"])))
+    out("uuid:            %s" % c(d["uuid"], 40))
+    out("state:           %s (since %s)" % (c(d["state"], 20), fmt_ts(d["state_since"])))
     out("reported (untrusted): %s" % c(d["reported_name"], 63))
     out("os (untrusted):  %s" % c(d["os"], 80))
     out("addresses seen:  %s" % c(", ".join(map(str, d["peer_ips"])), 120))
@@ -364,7 +376,7 @@ def host_show(ref, as_json):
     out("last seen:       %s (%s)" % (fmt_ts(d["last_seen"]), fmt_age(d["last_seen"])))
     out("enrolled:        %s from %s" % (fmt_ts(d["enrolled_at"]), c(d["enrolled_from"], 45)))
     out("certificate:     serial %s, expires %s" % (c(d["cert_serial"] or "-", 40), fmt_ts(d["cert_not_after"])))
-    out("policy rev:      issued %s, applied %s" % (d["policy_rev"] or "-", d["policy_rev_applied"] or "-"))
+    out("policy rev:      issued %s, applied %s" % (c(d["policy_rev"] or "-", 40), c(d["policy_rev_applied"] or "-", 40)))
     out("open incidents:  %d" % d["open_incidents"])
     for m in d["maintenance"]:
         out("maintenance:     until %s, set by %s" % (fmt_ts(m["until"]), c(m["set_by"], 80)))

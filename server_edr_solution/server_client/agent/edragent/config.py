@@ -26,12 +26,12 @@ import time
 
 CONF_MAX_BYTES = 256 * 1024
 
-_DUR_RE = re.compile(r"^(\d{1,9})([smhd])$")
-_SIZE_RE = re.compile(r"^(\d{1,12})\s*([KMGT]?)(?:i?B)?$", re.IGNORECASE)
-_RATE_RE = re.compile(r"^(\d{1,6})\s*(?:/|per)\s*(\d{1,9}[smhd])$")
-_USER_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}\$?$")
-_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
-_HOST_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$")
+_DUR_RE = re.compile(r"^(\d{1,9})([smhd])\Z")
+_SIZE_RE = re.compile(r"^(\d{1,12})\s*([KMGT]?)(?:i?B)?\Z", re.IGNORECASE)
+_RATE_RE = re.compile(r"^(\d{1,6})\s*(?:/|per)\s*(\d{1,9}[smhd])\Z")
+_USER_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}\$?\Z")
+_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
+_HOST_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?\Z")
 _BOOL = {"on": True, "true": True, "yes": True, "1": True, "off": False, "false": False, "no": False, "0": False}
 _UNIT = {"s": 1, "m": 60, "h": 3600, "d": 86400}
 _SIZE_UNIT = {"": 1, "K": 1 << 10, "M": 1 << 20, "G": 1 << 30, "T": 1 << 40}
@@ -583,6 +583,7 @@ def _target_roots(paths):
     """Where each staging subdirectory lands."""
     return {"tetragon.tp.d": paths.tetragon_tp_dir,
             "systemd/edr-agent.service.d": os.path.dirname(paths.dropin_path),
+            "systemd/edr-notify.service.d": os.path.dirname(paths.notify_allow_dropin),
             "edr-agent": paths.etc_dir}
 
 
@@ -610,6 +611,9 @@ def plan_swap(paths, files):
     for n in names:
         if n.startswith("edr-") and n.endswith(".yaml") and n not in wanted:
             plan.append(("tetragon.tp.d/" + n, os.path.join(tp, n), "remove", None, _read_text(os.path.join(tp, n))))
+    allow = paths.notify_allow_dropin
+    if os.path.exists(allow) and not any(t == allow for _, t, *_ in plan):
+        plan.append(("systemd/edr-notify.service.d/10-allow.conf", allow, "remove", None, _read_text(allow)))
     return plan
 
 
@@ -695,8 +699,9 @@ def apply_config(paths, check_only=False, out=print, kill=os.kill, runner=subpro
     if text is not None:
         _save_good(paths, text)
     policy_changed = [p for p in todo if p[0].startswith("tetragon.tp.d/")]
-    dropin_changed = any(p[0].startswith("systemd/") for p in todo)
-    code = _reload(paths, bool(policy_changed), dropin_changed, bool(changes), out, kill, runner, sleep)
+    dropin_changed = any(p[0].startswith("systemd/edr-agent.service.d/") for p in todo)
+    notify_changed = any(p[0].startswith("systemd/edr-notify.service.d/") for p in todo)
+    code = _reload(paths, bool(policy_changed), dropin_changed, bool(changes), out, kill, runner, sleep, notify_changed)
     if any(_follows_children(p[3]) or _follows_children(p[4]) for p in policy_changed):
         bins = cfg.get("sites", "phpfpm_bins")
         units = " ".join("php%s-fpm" % _fpm_version(b) for b in bins) if bins else "<your php-fpm units>"
@@ -706,12 +711,14 @@ def apply_config(paths, check_only=False, out=print, kill=os.kill, runner=subpro
     return code
 
 
-def _reload(paths, policies, dropin, conf, out, kill, runner, sleep):
+def _reload(paths, policies, dropin, conf, out, kill, runner, sleep, notify_dropin=False):
     """Reload what changed. Tetragon watches its policy directory, so a policy needs no command: it is
     checked with `tetra tracingpolicy list`. Under a dev root the commands are only printed."""
     commands = []
+    if dropin or notify_dropin:
+        commands.append(["systemctl", "daemon-reload"])         # edr-notify is a oneshot: its next start has the new allowlist
     if dropin:
-        commands += [["systemctl", "daemon-reload"], ["systemctl", "restart", "edr-agent.service"]]
+        commands.append(["systemctl", "restart", "edr-agent.service"])
     if policies:
         commands.append(["tetra", "tracingpolicy", "list"])
     code = 0

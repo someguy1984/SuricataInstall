@@ -22,6 +22,7 @@ import signal
 import socket
 import ssl
 import sys
+import threading
 import time
 import urllib.parse
 
@@ -36,6 +37,7 @@ REPLY_MAX = 64 * 1024
 IDLE_S = 2.0
 DEADMAN_EVERY_S = 60.0
 RETRY_AFTER_MAX = 3600
+CRITICAL_BACKOFF_MAX = 300         # a CRITICAL never waits behind a channel's back-off for longer than 5 minutes
 TAKE_MAX = 20
 USER_AGENT = "edr-hub-out/" + hub_common.VERSION
 
@@ -120,11 +122,21 @@ class _Pinned(http.client.HTTPSConnection):
 
     def connect(self):
         raw = socket.create_connection((self._ip, self.port), self.timeout)
+        self._raw = raw                                   # so the deadline can cut the connection while it handshakes
         try:
             self.sock = self._context.wrap_socket(raw, server_hostname=self.host)
         except BaseException:
             raw.close()
             raise
+
+    def cut(self):
+        """Close the connection from another thread: whatever is blocked on it returns at once."""
+        for s in (self.sock, getattr(self, "_raw", None)):
+            try:
+                if s is not None:
+                    socket.socket.shutdown(s, socket.SHUT_RDWR)       # the base method: it leaves the TLS object alone
+            except (OSError, ValueError):
+                pass
 
 
 def make_context(ca_pem):
@@ -144,35 +156,51 @@ def _retry_after(value):
 
 
 def http_send(method, url, headers, body, ctx, allow_private=False):
-    """One request. Returns (ok, error_text, retry_after_s). Never raises; texts are fixed."""
+    """One request. Returns (ok, error_text, retry_after_s). Never raises; texts are fixed.
+
+    TIMEOUT_S is a wall-clock limit for the whole exchange (connect, handshake, request, status line and headers), not a
+    per-read timeout: a server that drips one byte a second is cut at the deadline. Only the status line and the headers
+    are read; the reply body is never read, so it cannot hold the worker either.
+    """
+    fired = threading.Event()
+    conn = None
+    timer = None
     try:
         host, port, path = parse_https_url(url)
         ip = resolve(host, port, allow_private)
         conn = _Pinned(host, port, ip, ctx, TIMEOUT_S)
-        try:
-            h = {"User-Agent": USER_AGENT}
-            h.update(headers or {})
-            conn.request(method, path, body=body, headers=h)
-            resp = conn.getresponse()
-            resp.read(REPLY_MAX)
-            status = resp.status
-            ra = _retry_after(resp.getheader("Retry-After"))
-        finally:
-            conn.close()
+
+        def deadline():
+            fired.set()
+            conn.cut()
+        timer = threading.Timer(TIMEOUT_S, deadline)
+        timer.daemon = True
+        timer.start()
+        h = {"User-Agent": USER_AGENT}
+        h.update(headers or {})
+        conn.request(method, path, body=body, headers=h)
+        resp = conn.getresponse()
+        status = resp.status
+        ra = _retry_after(resp.getheader("Retry-After"))
     except SendError as exc:
         return False, str(exc), None
     except ssl.SSLCertVerificationError:
-        return False, "TLS certificate not trusted", None
+        return False, ("timeout" if fired.is_set() else "TLS certificate not trusted"), None
     except ssl.SSLError:
-        return False, "TLS error", None
+        return False, ("timeout" if fired.is_set() else "TLS error"), None
     except (socket.timeout, TimeoutError):
         return False, "timeout", None
     except ConnectionRefusedError:
         return False, "connection refused", None
     except (http.client.HTTPException, ValueError):
-        return False, "bad HTTP reply", None
+        return False, ("timeout" if fired.is_set() else "bad HTTP reply"), None
     except OSError:
-        return False, "network error", None
+        return False, ("timeout" if fired.is_set() else "network error"), None
+    finally:
+        if timer is not None:
+            timer.cancel()
+        if conn is not None:
+            conn.close()
     if 200 <= status < 300:
         return True, "", None
     if 300 <= status < 400:
@@ -182,7 +210,7 @@ def http_send(method, url, headers, body, ctx, allow_private=False):
 
 # ---- The out.sock client ---------------------------------------------------------------------
 def sock_call(path, cmd, args):
-    """One request line, one reply line (contract section 5.7). Returns the reply's result or raises SendError."""
+    """One request line, one reply line (the wire format hub_ctl.py serves). Returns the reply's result or raises SendError."""
     request = json.dumps({"cmd": cmd, "args": args, "actor": {}}, separators=(",", ":")).encode() + b"\n"
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
         s.settimeout(TIMEOUT_S)
@@ -212,7 +240,7 @@ class Worker:
         self.paths = paths
         self.allow_private = allow_private
         self.clock = clock
-        self.blocked = {}              # channel -> monotonic time until which Retry-After holds it
+        self.blocked = {}              # channel -> (monotonic time until which Retry-After holds it, when the hold began)
         self.status = {}               # channel -> {"last_ok", "last_fail", "last_error"}
         self._written = None
         self._last_ping = None
@@ -242,9 +270,14 @@ class Worker:
     def send_item(self, item, secrets, options, ctx):
         """(ok, error, retry_after) for one job."""
         channel = item.get("channel")
-        held = self.blocked.get(channel)
-        if held is not None and self.clock() < held:
-            return False, "held by Retry-After", max(1, int(held - self.clock()))
+        critical = item.get("severity") == "CRITICAL" or (isinstance(item.get("payload"), dict) and item["payload"].get("severity") == "CRITICAL")
+        hold = self.blocked.get(channel)
+        if hold is not None:
+            held, began = hold
+            if critical:
+                held = min(held, began + CRITICAL_BACKOFF_MAX)
+            if self.clock() < held:
+                return False, "held by Retry-After", max(1, int(held - self.clock()))
         payload = item.get("payload")
         if isinstance(payload, str):
             try:
@@ -259,7 +292,9 @@ class Worker:
             return False, "the channel is not supported", None
         ok, err, ra = http_send("POST", url, headers, body, ctx, self.allow_private)
         if ra:
-            self.blocked[channel] = self.clock() + ra
+            self.blocked[channel] = (self.clock() + ra, self.clock())
+            if critical:
+                ra = min(ra, CRITICAL_BACKOFF_MAX)          # what the hub is told to wait before the next try
         return ok, err, ra
 
     def record(self, channel, ok, error):

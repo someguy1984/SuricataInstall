@@ -32,7 +32,7 @@ CLIENT_DAYS = 365
 BACKDATE_DAYS = 1                   # every certificate starts one day in the past (clock skew on fresh droplets)
 SERVER_RENEW_DAYS = 30
 
-UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z")
 REVOKE_REASONS = ("revoked", "retired", "moved", "superseded")
 _PEM_BLOCK = re.compile(
     r"^-----BEGIN (?:NEW )?CERTIFICATE REQUEST-----\r?\n[A-Za-z0-9+/=\r\n]+-----END (?:NEW )?CERTIFICATE REQUEST-----\r?\n?$")
@@ -376,13 +376,21 @@ class Pki:
         hub_common.atomic_write(self.paths.server_cert, pem, 0o644)
 
     def server_cert_state(self, want_ips):
-        """'ok', 'missing', 'expiring' (under 30 days) or 'addresses' (SAN list differs)."""
+        """'ok', 'missing', 'mismatch' (key and certificate differ), 'expiring' (under 30 days) or 'addresses'."""
         if not (os.path.exists(self.paths.server_cert) and os.path.exists(self.paths.server_key)):
             return "missing"
         try:
             info = self.cert_info(self.paths.server_cert)
         except (PkiError, OSError):
             return "missing"
+        try:
+            # key and certificate are two files: a crash between the two writes leaves a pair that does not match
+            same = _must(["x509", "-noout", "-pubkey", "-in", self.paths.server_cert], what="read certificate key") == \
+                _must(["pkey", "-pubout", "-in", self.paths.server_key], what="read server key")
+        except PkiError:
+            same = False
+        if not same:
+            return "mismatch"
         if info["not_after"] < hub_common.now_ms() + SERVER_RENEW_DAYS * 86400 * 1000:
             return "expiring"
         want = sorted(set(hub_common.norm_ip(str(i)) for i in want_ips))

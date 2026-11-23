@@ -35,7 +35,7 @@ _PRIORITY = {"CRITICAL": 2, "ERROR": 3, "WARN": 4, "INFO": 6, "DEBUG": 7}
 
 
 class Hub:
-    """The one instance every component gets (contract section 5.2)."""
+    """The one instance every component gets."""
 
     def __init__(self, paths, settings, bind="0.0.0.0"):
         self.paths = paths
@@ -177,6 +177,8 @@ def parse_args(argv):
     p.add_argument("--admin-ip", action="append")
     p.add_argument("--retention-days", type=int)
     p.add_argument("--max-db-size")
+    p.add_argument("--ui-host", action="append", help="HOST:PORT the dashboard accepts in its Host header (repeatable)")
+    p.add_argument("--webhook-ca-path", help="path stored in the webhook_ca setting (the installer copies the file there)")
     p.add_argument("--init-only", action="store_true", help="create the CA, certificate and database, then exit 0")
     p.add_argument("--version", action="version", version=hub_common.VERSION)
     return p.parse_args(argv)
@@ -196,6 +198,16 @@ def seed_settings(paths, args):
         if settings.get("max_db_size") != args.max_db_size.upper():
             settings["max_db_size"] = args.max_db_size.upper()
             changed = True
+    if args.ui_host:
+        hosts = hub_common.validate_setting("ui_host", args.ui_host)
+        if settings.get("ui_host") != hosts:
+            settings["ui_host"] = hosts
+            changed = True
+    if args.webhook_ca_path is not None:
+        path = hub_common.validate_setting("webhook_ca", args.webhook_ca_path)
+        if settings.get("webhook_ca") != path:
+            settings["webhook_ca"] = path
+            changed = True
     for key, value in (("public_ip", args.public_ip), ("admin_ip", args.admin_ip)):
         if value:
             norm = [hub_common.norm_ip(v) for v in value] if key == "public_ip" else [hub_common.norm_cidr(v) for v in value]
@@ -210,17 +222,19 @@ def seed_settings(paths, args):
     return settings
 
 
-def make_dirs(paths):
+def make_dirs(paths, init_only=False):
+    """The state directory always; the run directory only for a real start (--init-only runs as the unprivileged
+    service user at install time, and /run/edr-hub is made by systemd, not by the process)."""
     os.makedirs(paths.state_dir, mode=0o750, exist_ok=True)
-    for d in (paths.run_dir,):
-        os.makedirs(d, mode=0o755, exist_ok=True)
+    if not init_only:
+        os.makedirs(paths.run_dir, mode=0o755, exist_ok=True)
 
 
 def main(argv=None):
     args = parse_args(sys.argv[1:] if argv is None else argv)
     paths = hub_common.Paths(state_dir=args.state_dir, run_dir=args.run_dir, etc_dir=args.etc_dir)
     try:
-        make_dirs(paths)
+        make_dirs(paths, init_only=args.init_only)
         settings = seed_settings(paths, args)
     except (OSError, ValueError) as e:
         sys.stderr.write("edr_hub.py: cannot prepare the state directory: %s\n" % e)

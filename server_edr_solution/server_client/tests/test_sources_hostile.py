@@ -89,9 +89,59 @@ class TestForgedNginxError(Hostile):
 
     def test_the_address_waits_for_the_next_line_and_is_released_after_2_seconds(self):
         ok = "2026/11/19 10:15:02 [info] 1000#1000: " + self.WU + ", client: %s, server: real.test" % REAL
+        self.ctx.ring.add(int(self.clock()), REAL, "GET", "/", "", 200, 1, "ua")           # the access log vouches for REAL
         self.assertEqual(self.esrc.process_lines([ok], 100.0), [])
         self.assertEqual([e["src_ip"] for e in self.esrc.process_lines([], 101.0)], [])
-        self.assertEqual([e["src_ip"] for e in self.esrc.process_lines([], 103.0)], [REAL])
+        self.assertEqual([(e["src_ip"], e["src_trust"]) for e in self.esrc.process_lines([], 103.0)], [(REAL, "tcp")])
+
+    def test_an_error_log_address_is_ban_evidence_only_when_the_access_log_shows_a_request_from_it(self):
+        mk = lambda ip: "2026/11/19 10:15:02 [info] 1000#1000: " + self.WU + ", client: %s, server: real.test" % ip
+        now = self.clock()
+        self.ctx.ring.add(int(now), REAL, "GET", "/", "", 200, 1, "ua")
+        events = self.lines(mk(REAL), mk(FORGED))
+        got = {e["src_ip"]: e for e in events}
+        self.assertEqual((got[REAL]["src_trust"], got[REAL]["details"]["addr_corroborated"]), ("tcp", True))
+        self.assertEqual((got[FORGED]["src_trust"], got[FORGED]["details"]["addr_corroborated"]), ("claimed", False))
+        self.assertEqual(got[FORGED]["kind"], "nginx.marker.window_update")                # still raised
+        # a request that fell out of the ring's window does not count
+        self.ctx.ring.q.clear()
+        self.ctx.ring.add(int(now) - 10 * 60, REAL, "GET", "/", "", 200, 1, "ua")
+        self.assertEqual([e["src_trust"] for e in self.lines(mk(REAL))], ["claimed"])
+
+    def test_an_error_log_address_waits_a_few_seconds_for_the_access_log_then_is_claimed(self):
+        ok = "2026/11/19 10:15:02 [info] 1000#1000: " + self.WU + ", client: %s, server: real.test" % REAL
+        self.assertEqual(self.esrc.process_lines([ok, "2026/11/19 10:15:03 [info] 1000#1000: *9 x"], 100.0), [])
+        self.assertEqual(self.esrc.settle(102.0), [])                                    # the access line has not been read yet
+        self.ctx.ring.add(100, REAL, "GET", "/", "", 200, 1, "ua")                      # now it has
+        self.assertEqual([(e["src_ip"], e["src_trust"]) for e in self.esrc.settle(102.5)], [(REAL, "tcp")])
+        self.ctx.ring.q.clear()
+        self.assertEqual(self.esrc.process_lines([ok, "2026/11/19 10:15:03 [info] 1000#1000: *9 x"], 200.0), [])
+        self.assertEqual([e["src_trust"] for e in self.esrc.settle(206.0)], ["claimed"])
+
+    def test_without_a_usable_access_log_error_log_addresses_are_always_claimed(self):
+        ok = "2026/11/19 10:15:02 [info] 1000#1000: " + self.WU + ", client: %s, server: real.test" % REAL
+        self.ctx.ring.add(int(self.clock()), REAL, "GET", "/", "", 200, 1, "ua")
+        for usable in (False,):
+            self.ctx.access_usable = usable
+            self.assertEqual([e["src_trust"] for e in self.lines(ok)], ["claimed"])
+        # the access source says so when its log is unreadable or its log_format does not start with $remote_addr
+        self.ctx.inventory_checks = {"nginx_logs": {"access_logs": [{"format": "vhost"}], "log_formats": {"vhost": {"starts_remote_addr": False}}}}
+        self.asrc._after_batch(self.clock())
+        self.assertIs(self.ctx.access_usable, False)
+        self.assertEqual([e["src_trust"] for e in self.lines(ok)], ["claimed"])
+        self.ctx.inventory_checks = {}
+        self.asrc._after_batch(self.clock())
+        self.assertIs(self.ctx.access_usable, True)
+        self.assertEqual([e["src_trust"] for e in self.lines(ok)], ["tcp"])
+
+    def test_the_forged_two_newline_record_with_a_fake_timestamped_line_is_never_ban_evidence(self):
+        forged = "2026/11/19 10:15:02 [info] 1000#1000: " + self.WU + FAKE_TRAILER
+        lines = ["2026/11/19 10:15:02 [error] 1000#1000: *5 open() \"/var/www/x", forged,
+                 "2026/11/19 10:15:02 [info] 1#1: *1 y\" failed (2: No such file), client: %s, server: real.test" % REAL]
+        events = self.lines(*lines)
+        forged_events = [e for e in events if e["kind"] == "nginx.marker.window_update"]
+        self.assertEqual(len(forged_events), 1)
+        self.assertEqual((forged_events[0]["src_ip"], forged_events[0]["src_trust"]), (FORGED, "claimed"))
 
     def test_a_fake_client_trailer_in_a_message_has_two_occurrences(self):
         real_trailer = ", client: %s, server: real.test, request: \"GET / HTTP/1.1\", host: \"real.test\"" % REAL
@@ -211,6 +261,7 @@ class TestSeededMutations(Hostile):
         tet, eve = self.seeds()
         kern = src.KernelSource(self.ctx, self.seen, os.path.join(self.root, "kern.log"), "begin")
         self.addCleanup(kern.close)
+        self.ctx.ring.add(int(self.clock()), REAL, "GET", "/", "", 200, 1, "ua")           # REAL really asked for something
         started = time.monotonic()
         worst = 0.0
         stats = {"ssh": 0, "err": 0, "acc": 0, "other": 0, "events": 0}
@@ -246,7 +297,9 @@ class TestSeededMutations(Hostile):
                 parts = line.replace("\r", "\n").split("\n")                      # the file is read a physical line at a time
                 for e in self.esrc.process_lines(parts, self.clock()) + self.esrc.finish():
                     stats["err"] += 1
-                    self.assertNotEqual(e["src_ip"], FORGED, repr(line))
+                    # the forged address may be seen (claimed) but is never ban evidence; REAL is vouched for by the ring below
+                    self.assertNotEqual((e["src_ip"], e["src_trust"]), (FORGED, "tcp"), repr(line))
+                    self.assertNotIn(e["src_ip"], (FORGED,) if e["src_trust"] == "tcp" else ())
                     self.assertIn(e["src_trust"], ("tcp", "none", "claimed"))
             elif kind in (5, 6):                                              # nginx access.log: attacker text in request and user agent
                 req = attacker_text(rng, 300).replace('"', rng.choice(['\\x22', '"']))

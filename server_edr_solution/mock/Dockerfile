@@ -4,8 +4,8 @@
 #
 #   docker compose build          (from server_edr_solution/mock, or use ./mock.sh up)
 #
-# Targets:  base -> hub   (the hub box; a TLS placeholder on :8443 until server_hub exists)
-#           base -> web   (nginx + PHP 8.5 serving web.dev.local on :80 and :443)
+# Targets:  base -> hub   (the hub box; a TLS placeholder on :8443 until `mock.sh install-hub` replaces it)
+#           base -> web   (nginx + PHP 8.5 serving web.dev.local on :80 and :443, and sshd on :22)
 
 ARG UBUNTU_TAG=26.04
 
@@ -44,8 +44,10 @@ RUN systemctl enable mock-tls.service mock-hub-placeholder.service
 
 # --------------------------------------------------------------------------- web
 FROM base AS web
+# openssh-server: the client installer's `--yes` confirms itself only when sshd listens on port 22 (client install.sh,
+# wait_confirm). Nothing connects to it; it only has to be there, as on a droplet.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends nginx php8.5-fpm php8.5-cli \
+ && apt-get install -y --no-install-recommends nginx php8.5-fpm php8.5-cli openssh-server \
  && apt-get clean && rm -rf /var/lib/apt/lists/* \
  && rm -f /etc/nginx/sites-enabled/default
 COPY web/web.dev.local.conf /etc/nginx/sites-available/web.dev.local
@@ -54,4 +56,5 @@ COPY web/public/ /var/www/web.dev.local/public/
 COPY web/mock-tls.service /etc/systemd/system/
 RUN ln -s /etc/nginx/sites-available/web.dev.local /etc/nginx/sites-enabled/web.dev.local \
  && chown -R root:root /var/www/web.dev.local && chmod -R a+rX /var/www/web.dev.local \
- && systemctl enable mock-tls.service nginx.service php8.5-fpm.service
+ && systemctl enable mock-tls.service nginx.service php8.5-fpm.service \
+ && { systemctl enable ssh.socket 2>/dev/null || systemctl enable ssh.service; }

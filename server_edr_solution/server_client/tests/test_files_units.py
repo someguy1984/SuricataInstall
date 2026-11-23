@@ -3,6 +3,7 @@ systemd-analyze, carries the sandbox the plan gives it, and the other files (nft
 needrestart, logrotate, MOTD, apt hooks, journald) have the shape the plan fixes."""
 
 import glob
+import json
 import os
 import re
 import shutil
@@ -86,6 +87,14 @@ class TestUnitFiles(unittest.TestCase):
                      "edr-droplet-id", "edr-dnslock", "edr-agent"):
             self.assertEqual(directives(read(name + ".service"))[("Unit", "StartLimitIntervalSec")], ["0"], name)
 
+    def test_helper_units_start_exactly_as_the_agent_expects(self):
+        """The agent drops tetragon.env-read events from the root helpers only for `python3 -I /usr/local/lib/edr-agent/edr-NAME`."""
+        for name in ("edr-bans", "edr-inventory", "edr-diskguard", "edr-dns-watch", "edr-home-net", "edr-policy-check", "edr-droplet-id", "edr-notify"):
+            exec_start = directives(read(name + ".service"))[("Service", "ExecStart")]
+            self.assertEqual(len(exec_start), 1, name)
+            self.assertRegex(exec_start[0], r"^/usr/bin/python3 -I /usr/local/lib/edr-agent/%s( [a-z-]+)?$" % name)
+        self.assertEqual(directives(read("edr-dnslock.service"))[("Service", "ExecStart")], ["/usr/bin/python3 -I /usr/local/lib/edr-agent/edr-dns-watch boot"])
+
     def test_bans_units_follow_the_plan(self):
         s = directives(read("edr-bans.service"))
         self.assertEqual(s[("Service", "TimeoutStartSec")], ["10"])
@@ -143,6 +152,9 @@ class TestUnitFiles(unittest.TestCase):
         self.assertEqual(s[("Service", "IPAddressAllow")], ["169.254.169.254"])
         self.assertEqual(s[("Unit", "Before")], ["edr-agent.service"])
         self.assertNotIn(("Service", "RemainAfterExit"), s)
+        self.assertEqual(s[("Service", "ReadWritePaths")], ["/run/edr-droplet-id"])           # one file, not all of /run
+        self.assertEqual(len(s[("Service", "ExecStartPre")]), 1)
+        self.assertTrue(s[("Service", "ExecStartPre")][0].startswith("+"))
 
     def test_notify_unit_follows_the_plan(self):
         s = directives(read("edr-notify.service"))
@@ -422,6 +434,38 @@ class TestOtherFiles(unittest.TestCase):
             self.assertIn('grep -oP "^drop .*sid:\\K[0-9]+"', fh.read())
         r = subprocess.run([path, "bogus"], capture_output=True, text=True)
         self.assertEqual(r.returncode, 64)
+
+    @unittest.skipUnless(os.geteuid() == 0, "needs root for install -g")
+    def test_rules_update_run_writes_the_ban_sid_list_the_agent_reads(self):
+        """edr-rules-update run, with stubs for suricata-update and the systemd-run test: edr-ban-sids.txt appears (PLAN 4.1.1)."""
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        rules, state, stubs = d + "/rules", d + "/state", d + "/stubs"
+        for p in (rules, state, stubs):
+            os.makedirs(p)
+        with open(d + "/suricata.yaml", "w") as fh:
+            fh.write("%YAML 1.1\n---\n")
+        with open(stubs + "/suricata-update", "w") as fh:
+            fh.write('#!/bin/sh\nwhile [ $# -gt 0 ]; do [ "$1" = --output ] && out=$2; shift; done\n'
+                     'printf \'drop tcp any any -> any 80 (msg:"a"; sid:2000001; rev:1;)\\nalert tcp any any -> any 80 (msg:"b"; sid:2000002; rev:1;)\\n'
+                     'drop http any any -> any any (msg:"c"; sid:2000003; rev:4;)\\n\' > "$out/suricata.rules"\n')
+        for name in ("systemd-run", "logger"):
+            with open(stubs + "/" + name, "w") as fh:
+                fh.write("#!/bin/sh\nexit 0\n")
+        for name in os.listdir(stubs):
+            os.chmod(stubs + "/" + name, 0o755)
+        env = {"PATH": stubs + ":/usr/bin:/bin", "EDR_RULES_DIR": rules, "EDR_STATE_DIR": state, "EDR_SURICATA_CONF": d + "/suricata.yaml"}
+        r = subprocess.run([os.path.join(FILES, "edr-rules-update"), "run"], capture_output=True, text=True, env=env, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        with open(rules + "/edr-ban-sids.txt") as fh:
+            self.assertEqual(fh.read().split(), ["2000001", "2000003"])
+        self.assertEqual(os.stat(rules + "/edr-ban-sids.txt").st_mode & 0o777, 0o640)
+        self.assertTrue(os.path.isfile(rules + "/suricata.rules"))
+        with open(rules + "/edr-rules-status.json") as fh:
+            st = json.load(fh)
+        self.assertIs(st["ok"], True)
+        self.assertEqual(st["skipped_days"], 0)
+        self.assertEqual([n for n in os.listdir(state) if n.startswith("rules.candidate")], [])      # the candidate directory is gone
 
     def test_motd_script_is_sanitised_and_bounded(self):
         import json

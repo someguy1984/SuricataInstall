@@ -1,7 +1,7 @@
 # Reads the DigitalOcean droplet id and writes /run/edr-droplet-id for the agent (client PLAN
 # section 4.6). It may reach the metadata address and nothing else, so the sandboxed agent never
 # gets metadata access. Started before edr-agent.service at every boot and every start of the agent
-# (no RemainAfterExit). A write to /run is needed for the one file; the unit has no capability.
+# (no RemainAfterExit). The unit has no capability and may write one file.
 [Unit]
 Description=Write the droplet id for the agent
 Before=edr-agent.service
@@ -19,7 +19,10 @@ IPAddressDeny=any
 IPAddressAllow=169.254.169.254
 ProtectHome=yes
 SystemCallFilter=@system-service
-ReadWritePaths=/run
+# Only the one file is writable: the unit creates it if it is missing (root, outside the sandbox) and the helper writes
+# into it in place, because a bind-mounted file cannot be replaced by a rename.
+ExecStartPre=+/bin/sh -c '[ -e /run/edr-droplet-id ] || install -m 0640 -o root -g edr-agent /dev/null /run/edr-droplet-id'
+ReadWritePaths=/run/edr-droplet-id
 MemoryMax=64M
 Nice=19
 TimeoutStartSec=10

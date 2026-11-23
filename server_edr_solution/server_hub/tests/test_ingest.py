@@ -91,7 +91,7 @@ class TransportTest(IngestCase):
 
     def test_certificate_from_another_ca_fails_the_handshake(self):
         import tempfile
-        d = tempfile.mkdtemp(dir=F.SCRATCH)
+        d = F.make_tmp("hubfx-ca-")
         p = hub_common.Paths(state_dir=d, run_dir=d, etc_dir=d)
         hub_pki.init_ca(p)
         other = hub_pki.Pki(p)
@@ -281,23 +281,31 @@ class TransportTest(IngestCase):
             self.assertEqual(self.c.request("GET", "/v1/policy")[0], 200)
 
     def test_parse_semaphore_of_four_gives_503_with_retry_after(self):
+        """The slot is held from the end of the body until the writer replies: with the writer blocked, four complete
+        requests hold all four, and the fifth is refused. (A body still arriving holds no slot: see test_review_core.)"""
         with mock.patch.object(hub_common, "SLOTS_PER_SOURCE", 100):
             clients = [self.extra_client("w%d" % i) for i in range(2)]
-            held = []
+            w = self.fx.writer
+            gate, started = threading.Event(), threading.Event()
+            threading.Thread(target=lambda: w.call(lambda conn: (started.set(), gate.wait(30))), daemon=True).start()
+            started.wait(5)
+            results = []
+            threads = []
+            for i in range(hub_common.PARSE_SLOTS):
+                th = threading.Thread(target=lambda c=clients[i % 2]: results.append(c.heartbeat()[0]))
+                th.start()
+                threads.append(th)
             try:
-                for i in range(hub_common.PARSE_SLOTS):
-                    s = clients[i % 2].connect()
-                    s.sendall(b"POST /v1/heartbeat HTTP/1.0\r\nX-EDR-Proto: 1\r\nContent-Length: 500\r\n\r\n")
-                    held.append(s)
-                time.sleep(0.5)
+                time.sleep(1.0)
                 status, headers, body = self.c.heartbeat()
                 self.assertEqual(status, 503)
                 self.assertEqual(code_of(body), "busy")
                 self.assertRegex(headers["retry-after"], r"^\d+$")
             finally:
-                for s in held:
-                    s.close()
-            time.sleep(0.5)
+                gate.set()
+                for th in threads:
+                    th.join(20)
+            self.assertEqual(results, [200] * hub_common.PARSE_SLOTS)
             self.assertEqual(self.c.heartbeat()[0], 200)
 
 
@@ -858,9 +866,14 @@ class IdentityTest(IngestCase):
         status, _h, body = self.c.request("GET", "/v1/policy")
         self.assertEqual((status, code_of(body)), (403, "host_revoked"))
 
+    def mark_restored(self):
+        """What `edr-hub restore` leaves in the database (hub_backup._prepare_db)."""
+        self.fx.writer.call(lambda c: hub_db.meta_set(c, "restored_at", hub_common.now_ms()))
+
     def test_unknown_certificate_of_an_unknown_cn_makes_an_orphan(self):
         """After a restore: a certificate our CA signed that the hosts table does not hold (section 7, step 5)."""
         import hub_alerts
+        self.mark_restored()
         self.c.heartbeat()
         self.fx.writer.call(lambda c: c.execute("DELETE FROM hosts WHERE uuid=?", (self.c.uuid,)))
         notices = []
@@ -884,13 +897,49 @@ class IdentityTest(IngestCase):
 
     def test_known_cn_with_a_certificate_the_table_does_not_hold_becomes_orphan(self):
         """A host renewed after the backup: the row is there, with an older certificate."""
+        self.mark_restored()
         self.c.heartbeat()
-        self.fx.writer.call(lambda c: c.execute("UPDATE hosts SET cert_sha256=?, cert_serial='1' WHERE uuid=?", ("e" * 64, self.c.uuid)))
+        self.fx.writer.call(lambda c: c.execute("UPDATE hosts SET cert_sha256=?, cert_serial='1', cert_not_after=cert_not_after-86400000 "
+                                                "WHERE uuid=?", ("e" * 64, self.c.uuid)))       # the older certificate the backup held
         status, _h, body = self.c.send_events([ev()])
         self.assertEqual(status, 200)
         h = self.host()
         self.assertEqual(h["state"], "orphan")
         self.assertNotEqual(h["cert_sha256"], "e" * 64)
+
+    def test_without_a_restore_an_unknown_certificate_is_refused_and_makes_no_orphan(self):
+        self.c.heartbeat()
+        self.fx.writer.call(lambda c: c.execute("DELETE FROM hosts WHERE uuid=?", (self.c.uuid,)))
+        status, _h, body = self.c.send_events([ev()])
+        self.assertEqual((status, code_of(body)), (403, "host_unknown"))
+        self.assertEqual(self.fx.sql("SELECT 1 FROM hosts"), [])
+
+    def test_an_older_certificate_never_replaces_the_current_one_of_an_orphan(self):
+        self.mark_restored()
+        self.c.heartbeat()
+        h = self.host()
+        self.fx.writer.call(lambda c: c.execute("UPDATE hosts SET cert_sha256=?, cert_serial='1', cert_not_after=cert_not_after+86400000 "
+                                                "WHERE uuid=?", ("e" * 64, self.c.uuid)))       # the row holds a NEWER certificate
+        status, _h, body = self.c.send_events([ev()])
+        self.assertEqual((status, code_of(body)), (403, "host_unknown"))
+        self.assertEqual(self.host()["cert_sha256"], "e" * 64)
+        self.assertEqual(self.host()["state"], "active")
+
+    def test_orphans_are_capped_and_alerted_once_per_host(self):
+        import hub_alerts
+        self.mark_restored()
+        notices = []
+        clients = [self.extra_client("o%d" % i) for i in range(3)]
+        with mock.patch.object(hub_enroll, "ORPHANS_MAX", 2), \
+                mock.patch.object(hub_alerts, "notify", lambda conn, hub, **kw: notices.append(kw["host"]["uuid"]) or 1):
+            for c in clients:
+                self.fx.writer.call(lambda conn, u=c.uuid: conn.execute("DELETE FROM hosts WHERE uuid=?", (u,)))
+            codes = [c.send_events([ev()])[0] for c in clients]
+            again = clients[0].send_events([ev()])[0]
+        self.assertEqual(codes, [200, 200, 403])                                     # the third is over the cap
+        self.assertEqual(again, 200)
+        self.assertEqual(sorted(notices), sorted(c.uuid for c in clients[:2]))      # one notice per host, not per request
+        self.assertEqual(len(self.fx.sql("SELECT 1 FROM hosts WHERE state='orphan'")), 2)
 
     def test_moved_row_with_an_unknown_certificate_stays_refused(self):
         self.c.heartbeat()

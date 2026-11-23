@@ -3,7 +3,7 @@
 #
 #   sudo ./uninstall.sh            asks first; keeps the database, the CA, the backups and the users
 #   sudo ./uninstall.sh --yes      does not ask the first question
-#   sudo ./uninstall.sh --purge    also deletes the data, the backups and the four users (two more questions)
+#   sudo ./uninstall.sh --purge    also deletes the data, the backups and the four users (two typed questions, on a terminal)
 #   ./uninstall.sh --plan          prints every step it would take and exits 0; changes nothing, needs no root
 #
 # Exit codes (PLAN section 17): 0 done and the final check passed, 2 the final check failed,
@@ -32,7 +32,7 @@ ASSUME_YES=0 PURGE=0 PLAN=0
 usage() {
     cat >&2 <<'EOF'
 usage: uninstall.sh [--yes] [--purge] [--plan]
-  --yes     do not ask the first question (--purge still asks twice unless --yes is given too)
+  --yes     do not ask the first question. It never answers the two --purge questions: --purge needs a terminal
   --purge   also delete /var/lib/edr-hub, /var/lib/edr-hub-out, /var/lib/edr-hub-ca, /etc/edr-hub,
             /var/backups/edr-hub and the four edr-hub users and groups
   --plan    print every step and exit 0 without changing anything
@@ -123,10 +123,25 @@ def owned(path):
     if "" in parts or "." in parts or ".." in parts:
         return False
     if path in EXACT:
-        return True
-    if any(path == t or path.startswith(t + "/") for t in TREES):
-        return True
-    return len(parts) >= 4 and parts[:3] == ["etc", "systemd", "system"] and parts[3].startswith("edr-hub")
+        return real_parent_ok(path, os.path.dirname(path))
+    for tree in TREES:
+        if path == tree:
+            return real_parent_ok(path, os.path.dirname(tree))
+        if path.startswith(tree + "/"):
+            return os.path.realpath(tree) == tree and real_parent_ok(path, tree)
+    if len(parts) >= 4 and parts[:3] == ["etc", "systemd", "system"] and parts[3].startswith("edr-hub"):
+        return real_parent_ok(path, "/etc/systemd/system")
+    return False
+
+
+def real_parent_ok(path, root):
+    """No link on the way from the owned root to the file: the resolved parent directory must be the parent as spelled.
+    The last component may be a link (it is then treated as the link, never followed); a link above it could lead
+    `rm` outside the directories the kit owns."""
+    parent = os.path.dirname(path)
+    rel = os.path.relpath(parent, root)
+    real_root = os.path.realpath(root)
+    return os.path.realpath(parent) == (real_root if rel == "." else os.path.join(real_root, rel))
 
 
 def sha256(path):
@@ -345,7 +360,7 @@ plan() {
         echo "warn: the CA key is deleted and a backup holds none (offer: edr-hub ca-export first)"
         echo "warn: every enrolled client then needs a new token from a new hub (rehome); old pins will not match"
         echo "warn: the backups are deleted too; copy off anything you want"
-        echo "ask twice, then delete $STATE, $OUTSTATE, $CASTATE, $ETC, $BACKUPS, then the users and groups $HUB_IDS"
+        echo "ask twice (typed, on a terminal: --yes does not answer these, and without a terminal this exits 3 first), then delete $STATE, $OUTSTATE, $CASTATE, $ETC, $BACKUPS, then the users and groups $HUB_IDS"
     fi
     say "Final checks"
     echo "no 'edr_hub' table; nothing listening on ports ${ports[0]}, ${ports[1]} and ${ports[2]}; no edr-hub* unit or process"
@@ -366,16 +381,27 @@ fi
 
 [[ $EUID -eq 0 ]] || { echo "ERROR: run as root (sudo $0)" >&2; exit 3; }
 
+# --yes answers the first question only (its expected answer is "y"). The two --purge questions expect a typed phrase,
+# and nothing but a person at a terminal answers them: PLAN section 9, "It asks twice".
 confirm() {   # prompt, expected answer
     local answer
-    if [[ $ASSUME_YES -eq 1 ]]; then
+    if [[ $ASSUME_YES -eq 1 && $2 == y ]]; then
         echo "$1 $2 (--yes)"
         return 0
     fi
-    [[ -t 0 ]] || { echo "No terminal to ask on; use --yes to go ahead." >&2; return 1; }
+    if [[ ! -t 0 ]]; then
+        if [[ $2 == y ]]; then echo "No terminal to ask on; use --yes to go ahead." >&2
+        else echo "No terminal to ask on: --purge needs a person to type the two confirmations (--yes does not answer them)." >&2; fi
+        return 1
+    fi
     read -rp "$1 " answer
     [[ $answer == "$2" ]]
 }
+
+if [[ $PURGE -eq 1 && ! -t 0 ]]; then
+    echo "--purge deletes the database, the CA, the backups and the users, and asks twice on a terminal. There is none: nothing was changed." >&2
+    exit 3
+fi
 
 if nothing_installed; then
     echo "Nothing to remove: no hub files, units or data found."

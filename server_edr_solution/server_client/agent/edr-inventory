@@ -257,7 +257,7 @@ def origin_of(env, names):
         s = line.strip()
         if s.startswith("Installed:"):
             installed = s.split(":", 1)[1].strip()
-        m = re.match(r"(\*\*\*\s+)?(\S+)\s+\d+\s*$", s)
+        m = re.match(r"(\*\*\*\s+)?(\S+)\s+\d+\s*\Z", s)
         if m and cur:
             in_inst = bool(m.group(1)) and m.group(2) == installed
             continue
@@ -1252,13 +1252,13 @@ class Inventory:
             cur = None
             for line in data.decode("utf-8", "replace").splitlines():
                 s = line.split(";", 1)[0].strip()
-                m = re.match(r"\[([^\]]+)\]$", s)
+                m = re.match(r"\[([^\]]+)\]\Z", s)
                 if m:
                     cur = {"name": clean(m.group(1), 48), "user": "", "listen": "", "limit_extensions": None,
                            "open_basedir": False, "disable_functions": False, "file": clean(path[len(env.root):], 120)}
                     pools.append(cur)
                     continue
-                kv = re.match(r"([A-Za-z_.\[\]]+)\s*=\s*(.*)$", s)
+                kv = re.match(r"([A-Za-z_.\[\]]+)\s*=\s*(.*)\Z", s)
                 if cur is None or not kv:
                     continue
                 k, v = kv.group(1), kv.group(2).strip().strip('"')
@@ -1368,12 +1368,12 @@ class Inventory:
                 self.finding("auth_state", "HIGH", "a new uid-0 account appeared", new_uid0=len(new0), uid0_count=len(uid0))
             if sud_ok and cur["sudoers"] != base.get("sudoers"):
                 out["status"] = True
-                self.finding("auth_state", "MEDIUM", "sudoers changed", sudoers_hash=cur["sudoers"])
+                self.finding("auth_state", "HIGH", "sudoers changed", sudoers_hash=cur["sudoers"])
             ch = sorted(p for p in keys if keys[p] != base.get("keys", {}).get(p))
             gone = sorted(p for p in base.get("keys", {}) if p not in keys)
             if ch or gone:
                 out["status"] = True
-                self.finding("auth_state", "MEDIUM", "authorized_keys changed in %d file(s)" % len(ch + gone),
+                self.finding("auth_state", "HIGH", "authorized_keys changed in %d file(s)" % len(ch + gone),
                              files=[clean(p, 120) for p in (ch + gone)[:10]])
         return out
 

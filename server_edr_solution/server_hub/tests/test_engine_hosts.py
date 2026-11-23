@@ -664,5 +664,86 @@ class EnrollAndRejectedTests(HostCase):
         self.assertEqual(self.note_texts("rejected")[0][0], "MEDIUM")
 
 
+class ClientNumberTests(HostCase):
+    def test_a_far_pause_is_counted_as_24_hours_and_still_noted(self):
+        self.beat(T0 + MIN, paused_until=10 ** 18)
+        (sev, text), = self.note_texts("paused")
+        self.assertEqual(sev, "MEDIUM")
+        self.assertIn("counted as 24 hours", text)
+        self.assertIn(hub_common.ms_to_rfc3339(T0 + MIN + DAY), text)
+
+    def test_odd_numbers_never_stop_a_rule_from_firing(self):
+        self.beat(T0 + MIN, conntrack={"count": 1e308, "max": 1})
+        (a,) = self.alerts("hub.conntrack")
+        self.assertEqual(a["severity"], "HIGH")
+        for hb in ({"disk": {"free_pct": 10 ** 400}}, {"suricata_drops": {"packets": 10 ** 400, "drops": 10 ** 399}},
+                   {"cert_not_after": float("inf")}, {"cert_not_after": float("nan")}, {"cert_not_after": -5}, {"cert_not_after": "9" * 60},
+                   {"paused_until": float("inf")}, {"paused_until": "9" * 50}, {"conntrack": {"count": -1, "max": float("nan")}},
+                   {"spool": {"dropped": {"hi": 10 ** 30}}}):
+            self.beat(T0 + 2 * MIN, **hb)
+        self.assertEqual([m for lvl, m in self.hub.logs if "failed" in m], [])
+
+    def test_ms_is_bounded_and_never_raises(self):
+        for v in (10 ** 18, float("inf"), 10 ** 400, "9" * 40, 1e308, 5):
+            self.assertLessEqual(hub_engine._ms(v), hub_engine.MAX_MS)
+        for v in (float("nan"), -1, "x", None, True, [], {}, "9" * 60):
+            self.assertIsNone(hub_engine._ms(v))
+
+
+class ExposureClockTests(HostCase):
+    VULN = {"os_release": "Ubuntu 24.04", "checks": {
+        "nginx_pkg": {"status": True, "packages": [{"name": "nginx", "version": "1.24.0-2ubuntu7.1", "origin": "ubuntu"}]},
+        "nginx_exposure": {"tls": True}}}
+
+    def eval(self, inv, when):
+        self.hub.writer.call(lambda c: hub_engine._advisory_eval(c, self.hub, self.hub.host(self.host["uuid"]), inv, when, daily=False))
+
+    def first_seen(self):
+        row = self.hub.q("SELECT data FROM alert_state WHERE key=?", ("adv|" + self.host["uuid"],))[0][0]
+        return json.loads(row)["first"]
+
+    def test_unknown_and_missing_checks_keep_the_clock_and_a_definite_fix_clears_it(self):
+        self.eval(self.VULN, T0)
+        started = self.first_seen()
+        self.assertEqual(list(started.values()), [T0])
+        self.eval({"os_release": "Ubuntu 24.04", "checks": {"nginx_pkg": {"status": "unknown"}}}, T0 + HOUR)
+        self.eval({"os_release": "Ubuntu 24.04", "checks": {}}, T0 + 2 * HOUR)
+        self.eval({"checks": "garbage"}, T0 + 3 * HOUR)
+        self.assertEqual(self.first_seen(), started)
+        fixed = json.loads(json.dumps(self.VULN))
+        fixed["checks"]["nginx_pkg"]["packages"][0]["version"] = "1.24.0-2ubuntu7.20"
+        self.eval(fixed, T0 + 4 * HOUR)
+        self.assertEqual(self.first_seen(), {})
+        self.eval(self.VULN, T0 + 5 * HOUR)
+        self.assertEqual(list(self.first_seen().values()), [T0 + 5 * HOUR])      # a new exposure starts a new clock
+
+    def test_not_installed_is_a_definite_answer(self):
+        self.eval(self.VULN, T0)
+        self.eval({"os_release": "Ubuntu 24.04", "checks": {"nginx_pkg": {"status": False}}}, T0 + HOUR)
+        self.assertEqual(self.first_seen(), {})
+
+
+class AlertStateBoundTests(HostCase):
+    def test_claimed_droplet_ids_use_one_row(self):
+        for i in range(30):
+            self.beat(T0 + i * MIN, droplet_id="evil-%d" % i)
+        rows = self.hub.q("SELECT key, data FROM alert_state WHERE key LIKE 'dup|droplet|%'")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(len(json.loads(rows[0][1])["ids"]), 3)
+
+    def test_the_daily_job_prunes_rows_untouched_for_seven_days_but_not_live_conditions(self):
+        def put(conn, key, last, data):
+            conn.execute("INSERT INTO alert_state (key, severity, first, last, count, suppressed, data) VALUES (?,?,?,?,?,?,?)",
+                         (key, "", last, last, 1, 0, json.dumps(data)))
+        old = T0 - 8 * DAY
+        self.hub.writer.call(lambda c: [put(c, "old|x", old, {}), put(c, "note|u|r|v", old, {"summary": "x"}),
+                                        put(c, "silent|u", old, {"level": 1, "since": old}), put(c, "cleared|u", old, {"level": 0}),
+                                        put(c, "task|survived|u", old, {}), put(c, "fresh|x", T0 - DAY, {}), put(c, "storm", old, {})])
+        n = self.hub.writer.call(lambda c: hub_engine.prune_alert_state(c, T0))
+        keys = {r[0] for r in self.hub.q("SELECT key FROM alert_state")}
+        self.assertEqual(n, 3)
+        self.assertEqual(keys, {"silent|u", "task|survived|u", "fresh|x", "storm"})
+
+
 if __name__ == "__main__":
     unittest.main()

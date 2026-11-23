@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import secrets
+import stat
 import time
 
 import hub_common
@@ -25,7 +26,10 @@ PRUNE_FAIL_MS = 30 * 86400 * 1000             # unauthenticated failures: 30 day
 FOLD_SOURCES_PER_MINUTE = 1000
 FOLD_ROWS_PER_DAY = 10_000
 SCHEDULED_GAP_MS = 20 * 3600 * 1000           # a second scheduled backup inside this window notifies
-PENDING_LINE_MAX = 16 * 1024
+PENDING_LINE_MAX = 4 * 1024
+PENDING_LINES_PER_TICK = 200
+PENDING_NOTICES_PER_TICK = 10
+HUB_INSTALLED_STATE = "/var/lib/edr-hub"
 PENDING_READ_MAX = 1024 * 1024
 PRUNE_RUNS_PER_ROW = 500
 BACKUP_UNIT = "edr-hub-backup.service"
@@ -81,17 +85,19 @@ def _insert(conn, ts, actor_kind, actor_detail, action, target, outcome, details
     return cur.lastrowid
 
 
-def append(conn, *, actor_kind, actor_detail="", action, target="", outcome="ok", details=None):
+def append(conn, *, actor_kind, actor_detail="", action, target="", outcome="ok", details=None, fold=False):
     """Add one row to the chain and return its id. Text fields pass through clean().
 
     A failure of an unauthenticated peer (actor_kind client, outcome denied or invalid) is folded:
-    one row per source per minute with a count (see flush_folds). Such a call returns 0.
+    one row per source per minute with a count (see flush_folds). So is a refusal or an invalid request
+    on ui.sock or out.sock, when the caller passes fold=True (one row per socket, verb and minute).
+    A folded call returns 0.
     """
     actor_detail = clean(actor_detail, 200)
     action = clean(action, 100)
     target = clean(target, 200)
-    if actor_kind == "client" and outcome in _FAIL_OUTCOMES:
-        _fold_add(conn, actor_detail, action, target, outcome)
+    if (actor_kind == "client" or fold) and outcome in _FAIL_OUTCOMES:
+        _fold_add(conn, actor_kind, actor_detail, action, target, outcome)
         return 0
     flush_folds(conn)
     text = canonical_json(_clean_value(details if details is not None else {})).decode("utf-8")
@@ -152,7 +158,13 @@ def _load_json(conn, key, default):
         return default
 
 
-def _fold_add(conn, actor_detail, action, target, outcome):
+def _unkey(key):
+    """(actor_kind, actor_detail, action, outcome) of a fold key; an older key had no actor kind (it was a client)."""
+    parts = json.loads(key)
+    return tuple(parts) if len(parts) == 4 else ("client",) + tuple(parts)
+
+
+def _fold_add(conn, actor_kind, actor_detail, action, target, outcome):
     """Count one failure. The counts live in meta, so a restart loses nothing."""
     now = now_ms()
     state = _load_json(conn, "audit_fold", {})
@@ -162,10 +174,10 @@ def _fold_add(conn, actor_detail, action, target, outcome):
             _fold_write(conn, state)
         state = {"minute": minute, "items": {}}
     items = state["items"]
-    sources = {json.loads(k)[0] for k in items}
+    sources = {_unkey(k)[1] for k in items}
     if actor_detail not in sources and len(sources) >= FOLD_SOURCES_PER_MINUTE:
         actor_detail = "other"
-    key = json.dumps([actor_detail, action, outcome])
+    key = json.dumps([actor_kind, actor_detail, action, outcome])
     if key in items:
         items[key][0] += 1
     else:
@@ -183,13 +195,13 @@ def _fold_write(conn, state):
     ts = minute * 60000 + 59999
     for key in sorted(state.get("items", {})):
         count, target = state["items"][key]
-        detail, action, outcome = json.loads(key)
+        kind, detail, action, outcome = _unkey(key)
         if cap["rows"] >= FOLD_ROWS_PER_DAY:
             cap["dropped"] += count
             continue
         cap["rows"] += 1
         text = canonical_json({"count": count, "minute": _minute_text(minute)}).decode("utf-8")
-        _insert(conn, ts, "client", detail, action, target, outcome, text)
+        _insert(conn, ts, kind, detail, action, target, outcome, text)
     _meta_set(conn, "audit_fold_day", json.dumps(cap, separators=(",", ":")))
 
 
@@ -223,9 +235,10 @@ def prune(conn, now=None):
     cut_fail = now - PRUNE_FAIL_MS
     runs = []
     cur_run = None
-    for rid, row_hash, ts, kind, outcome in conn.execute(
-            "SELECT id, hash, ts, actor_kind, outcome FROM audit ORDER BY id").fetchall():
-        expired = ts < cut_main or (kind == "client" and outcome in _FAIL_OUTCOMES and ts < cut_fail)
+    for rid, row_hash, ts, kind, outcome, details in conn.execute(
+            "SELECT id, hash, ts, actor_kind, outcome, details FROM audit ORDER BY id").fetchall():
+        folded = outcome in _FAIL_OUTCOMES and (kind == "client" or ('"count":' in details and '"minute":' in details))
+        expired = ts < cut_main or (folded and ts < cut_fail)
         if expired:
             if cur_run is None:
                 cur_run = [rid, rid, row_hash, 1]
@@ -329,7 +342,23 @@ def _notice(conn, hub, action, detail, actor):
             pass
 
 
-def _ingest_line(conn, hub, raw):
+class _Tick:
+    """What one ingest has spent: bad lines are counted, not written one by one; notices have a budget."""
+
+    def __init__(self):
+        self.bad = 0
+        self.notices = 0
+        self.suppressed = 0
+
+    def may_notify(self):
+        if self.notices < PENDING_NOTICES_PER_TICK:
+            self.notices += 1
+            return True
+        self.suppressed += 1
+        return False
+
+
+def _ingest_line(conn, hub, raw, tick):
     try:
         item = json.loads(raw.decode("utf-8"))
         if not isinstance(item, dict):
@@ -338,8 +367,8 @@ def _ingest_line(conn, hub, raw):
         op = clean(str(item["op"]), 40)
         phase = clean(str(item.get("outcome", "")), 16)
         ts = int(item.get("ts") or now_ms())
-    except (ValueError, KeyError, TypeError, UnicodeDecodeError):
-        _insert(conn, now_ms(), "system", "audit", "pending-audit.bad-line", "", "invalid", "{}")
+    except (ValueError, KeyError, TypeError, UnicodeDecodeError, RecursionError):
+        tick.bad += 1
         return 0
     if conn.execute("SELECT 1 FROM pending_audit_seen WHERE line_id=?", (line_id,)).fetchone():
         return 0
@@ -364,10 +393,50 @@ def _ingest_line(conn, hub, raw):
             _meta_set(conn, "last_scheduled_backup_ts", ts)
     elif phase != "ok" and not scheduled:
         notify = True                              # a failed or refused file operation is worth a second page
-    if notify:
+    if notify and tick.may_notify():
         verb = {"started": "started", "ok": "done", "error": "failed", "refused": "refused"}.get(phase, phase)
         _notice(conn, hub, op, "%s %s: %s" % (op, verb, target), actor)
     return 1
+
+
+def _open_trusted(path, installed):
+    """The pending-audit file as a descriptor, or None with the reason. PLAN 5: root:edr-hub 0640, only root appends.
+
+    The directory belongs to the edr-hub user, who could unlink the file and make its own, so the file itself is
+    checked: a regular file (opened without following a link), owned by root, with no group or other write bit.
+    A dev run (the state directory is not the installed one) also accepts the hub's own uid as owner.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return None, None
+    except OSError:
+        return None, "it is a link or cannot be opened"
+    try:
+        st = os.fstat(fd)
+        owners = (0,) if installed else (0, os.getuid())
+        if not stat.S_ISREG(st.st_mode):
+            reason = "it is not a regular file"
+        elif st.st_uid not in owners:
+            reason = "it is not owned by root"
+        elif st.st_mode & 0o022:
+            reason = "it is writable by group or others"
+        else:
+            return fd, None
+    except OSError:
+        reason = "it cannot be checked"
+    os.close(fd)
+    return None, reason
+
+
+def _untrusted_once_a_day(conn, hub, reason):
+    today = _day_of(now_ms())
+    if _meta_get(conn, "pending_audit_untrusted_day") == today:
+        return
+    _meta_set(conn, "pending_audit_untrusted_day", today)
+    _insert(conn, now_ms(), "system", "audit", "pending-audit.untrusted", "", "denied",
+            canonical_json({"reason": reason}).decode("utf-8"))
+    _notice(conn, hub, "pending-audit", "pending-audit.jsonl is not trustworthy and was not read: %s" % reason, "system")
 
 
 def ingest_pending(conn, hub):
@@ -375,42 +444,56 @@ def ingest_pending(conn, hub):
 
     Called at start and at every writer tick. Only complete lines are read; the offset is kept in
     meta; a line id seen before is ignored, so an older restored database ingests nothing twice.
+    One call takes at most 200 lines, writes one summary row for the bad ones (over 4 KiB, or not a
+    JSON object with an id and an op) and sends at most 10 notices, then one summary notice.
     """
     flush_folds(conn)
     _daily_prune(conn)
     path = hub.paths.pending_audit
-    try:
-        size = os.stat(path).st_size
-    except OSError:
-        return 0
-    offset = int(_meta_get(conn, "pending_audit_offset", "0") or 0)
-    if size < offset:
-        offset = 0                                 # the file was replaced; the seen table stops repeats
-    if size == offset:
+    fd, reason = _open_trusted(path, hub.paths.state_dir == HUB_INSTALLED_STATE)
+    if fd is None:
+        if reason:
+            _untrusted_once_a_day(conn, hub, reason)
         return 0
     try:
-        with open(path, "rb") as f:
-            f.seek(offset)
-            chunk = f.read(PENDING_READ_MAX)
+        size = os.fstat(fd).st_size
+        offset = int(_meta_get(conn, "pending_audit_offset", "0") or 0)
+        if size < offset:
+            offset = 0                             # the file was replaced; the seen table stops repeats
+        if size == offset:
+            return 0
+        chunk = os.pread(fd, PENDING_READ_MAX, offset)
     except OSError:
         return 0
+    finally:
+        os.close(fd)
     end = chunk.rfind(b"\n")
     if end < 0:
         if len(chunk) >= PENDING_LINE_MAX:         # a runaway line with no newline: skip it
             _meta_set(conn, "pending_audit_offset", offset + len(chunk))
+            _insert(conn, now_ms(), "system", "audit", "pending-audit.bad-line", "", "invalid", '{"count":1}')
         return 0
-    count = 0
-    pos = 0
+    tick = _Tick()
+    count = lines = used = 0
     for raw in chunk[:end + 1].split(b"\n")[:-1]:
-        pos += len(raw) + 1
+        if lines >= PENDING_LINES_PER_TICK:
+            break                                  # the rest waits for the next tick
+        used += len(raw) + 1
         raw = raw.strip()
         if not raw:
             continue
+        lines += 1
         if len(raw) > PENDING_LINE_MAX:
-            _insert(conn, now_ms(), "system", "audit", "pending-audit.bad-line", "", "invalid", "{}")
+            tick.bad += 1
             continue
-        count += _ingest_line(conn, hub, raw)
-    _meta_set(conn, "pending_audit_offset", offset + end + 1)
+        count += _ingest_line(conn, hub, raw, tick)
+    _meta_set(conn, "pending_audit_offset", offset + used)
+    if tick.bad:
+        _insert(conn, now_ms(), "system", "audit", "pending-audit.bad-line", "", "invalid",
+                canonical_json({"count": tick.bad}).decode("utf-8"))
+    if tick.suppressed:
+        _notice(conn, hub, "pending-audit", "%d more root-only file operations were ingested without their own notice: "
+                "see `edr-hub audit`" % tick.suppressed, "system")
     return count
 
 

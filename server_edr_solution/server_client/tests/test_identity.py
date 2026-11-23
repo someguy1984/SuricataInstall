@@ -700,6 +700,102 @@ class TestRehome(RehomeCase):
         self.assertEqual(idn.read_host_id(self.p), self.hubs.uuid)
 
 
+class TestRootsAddressRecord(RehomeCase):
+    """The unit's IPAddressAllow= comes from root's own record, never from hub.conf in the agent's tree."""
+
+    def record(self):
+        return idn.read_trusted(self.p)
+
+    def test_enroll_writes_the_record_root_only(self):
+        shutil.rmtree(str(self.p.identity_dir))
+        self.do_enroll()
+        self.assertEqual(self.record(), {"addresses": ["127.0.0.1"]})
+        path = idn.trusted_path(self.p)
+        self.assertTrue(path.startswith(self.env.root))
+        self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(os.stat(os.path.dirname(path)).st_mode), 0o700)
+        self.assertFalse(path.startswith(str(self.p.state_dir)))                  # outside the agent's tree
+
+    def test_a_hub_conf_edited_by_the_agent_does_not_reach_the_drop_in_during_a_rehome(self):
+        idn.write_trusted(self.p, ["127.0.0.1"])
+        old = os.path.join(idn.gen_path(self.p, 1), "hub.conf")
+        idn.write_hub_conf(old, ["127.0.0.1", "198.51.100.66"], self.old.fleet_port, 8444, self.old.uuid, "0" * 64)
+        seen = []
+        rc = self.rehome(confirm=lambda *a: seen.append(self.dropin()) or "")
+        self.assertEqual(rc, 0, self.logs)
+        self.assertNotIn("198.51.100.66", seen[0])
+        self.assertNotIn("198.51.100.66", self.dropin())
+        self.assertEqual(self.record(), {"addresses": ["127.0.0.1"]})              # the committed set, no rehome section left
+
+    def test_old_addresses_come_from_the_drop_in_root_wrote_when_there_is_no_record(self):
+        old = os.path.join(idn.gen_path(self.p, 1), "hub.conf")
+        idn.write_hub_conf(old, ["198.51.100.66"], self.old.fleet_port, 8444, self.old.uuid, "0" * 64)
+        seen = []
+        self.rehome(confirm=lambda *a: seen.append(self.dropin()) or "")
+        self.assertNotIn("198.51.100.66", seen[0])
+        self.assertIn("IPAddressAllow=127.0.0.1", seen[0])
+
+    def test_the_record_holds_old_and_new_while_the_move_is_unconfirmed(self):
+        seen = []
+        self.rehome(confirm=lambda *a: seen.append(json.loads(slurp(idn.trusted_path(self.p)))) or "")
+        self.assertEqual(seen[0]["rehome"], {"old": ["127.0.0.1"], "new": ["127.0.0.1"]})
+
+    def test_rollback_restores_the_recorded_old_addresses_not_hub_conf_or_the_saved_copy(self):
+        idn.write_trusted(self.p, ["127.0.0.1"], {"old": ["127.0.0.1"], "new": ["192.0.2.9"]})
+        stage = TestRollbackAtEveryStep.stage
+        stage(self, 5)
+        sp.atomic_write(os.path.join(str(self.p.identity_dir), "rehome-dropin.saved"),
+                        "[Service]\nIPAddressAllow=\nIPAddressAllow=198.51.100.66\n", 0o600)     # the agent rewrote the saved copy
+        idn.write_hub_conf(os.path.join(idn.gen_path(self.p, 1), "hub.conf"), ["198.51.100.66"], 1, 8444, self.old.uuid, "0" * 64)
+        st = idn.load_rehome_state(self.p)
+        st["old_addresses"] = ["198.51.100.66"]                                    # and the state file
+        sp.atomic_write(os.path.join(str(self.p.identity_dir), "rehome.json"), json.dumps(st), 0o600)
+        self.assertEqual(idn.rollback(self.p, self.ops), 4)
+        self.assertEqual(self.dropin(), "[Service]\nIPAddressAllow=\nIPAddressAllow=127.0.0.1\n")
+        self.assertEqual(self.record(), {"addresses": ["127.0.0.1"]})
+
+    def test_finish_commit_dials_the_recorded_old_address_for_the_deregister(self):
+        idn.write_trusted(self.p, ["127.0.0.1"], {"old": ["127.0.0.1"], "new": ["127.0.0.1"]})
+        d = idn.gen_path(self.p, 2)
+        os.makedirs(d)
+        for f in ("ca.pem", "client.pem", "client.key"):
+            shutil.copyfile(os.path.join(idn.gen_path(self.p, 1), f), os.path.join(d, f))
+        idn.write_hub_conf(os.path.join(d, "hub.conf"), ["127.0.0.1"], 9, 8444, "22222222-2222-4222-8222-222222222222", "0" * 64)
+        idn.write_hub_conf(os.path.join(idn.gen_path(self.p, 1), "hub.conf"), ["198.51.100.66"], self.old.fleet_port, 8444, self.old.uuid, "0" * 64)
+        dialled = []
+        real = idn.deregister
+
+        def spy(paths, reason, ident=None, **kw):
+            dialled.append(list(ident.addresses))
+            return None
+        idn.deregister = spy
+        try:
+            st = {"new": "gen-2", "prev": "gen-1", "step": 6, "new_host_uuid": None, "droplet_id": None}
+            self.assertEqual(idn.finish_commit(self.p, self.ops, st), 0)
+        finally:
+            idn.deregister = real
+        self.assertEqual(dialled, [["127.0.0.1"]])
+
+    def test_without_any_validated_list_finish_commit_leaves_the_drop_in_alone(self):
+        d = idn.gen_path(self.p, 2)
+        os.makedirs(d)
+        for f in ("ca.pem", "client.pem", "client.key"):
+            shutil.copyfile(os.path.join(idn.gen_path(self.p, 1), f), os.path.join(d, f))
+        idn.write_hub_conf(os.path.join(d, "hub.conf"), ["198.51.100.66"], 9, 8444, "22222222-2222-4222-8222-222222222222", "0" * 64)
+        before = self.dropin()
+        st = {"new": "gen-2", "prev": "gen-1", "step": 6, "new_host_uuid": None, "droplet_id": None, "deregistered": True}
+        self.assertEqual(idn.finish_commit(self.p, self.ops, st), 2)
+        self.assertEqual(self.dropin(), before)
+
+    def test_a_garbage_record_reads_as_none(self):
+        os.makedirs(os.path.dirname(idn.trusted_path(self.p)), exist_ok=True)
+        for junk in ("not json", "[]", '{"v": 2}', '{"v": 1, "addresses": "1.2.3.4"}'):
+            with open(idn.trusted_path(self.p), "w") as f:
+                f.write(junk)
+            r = self.record()
+            self.assertIn(r, (None, {"addresses": []}), junk)
+
+
 class TestRollbackAtEveryStep(RehomeCase):
     """Kill the move at each step (state left on disk), then run `rehome --rollback`."""
 
@@ -756,6 +852,84 @@ class TestRollbackAtEveryStep(RehomeCase):
         sp.atomic_write(os.path.join(str(self.p.identity_dir), "rehome.json"), json.dumps(st), 0o600)
         self.assertEqual(idn.rollback(self.p, self.ops), 4)
         self.assertEqual(self.dropin(), saved)
+
+
+class TestChownIsByDescriptors(unittest.TestCase):
+    """Root hands files to edr-agent inside a tree the agent owns; it must not be steerable by symlinks."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp(prefix="a5chown-")
+        self.addCleanup(shutil.rmtree, self.d, ignore_errors=True)
+        self.tree = os.path.join(self.d, "tree")
+        self.outside = os.path.join(self.d, "outside")
+        os.makedirs(os.path.join(self.tree, "sub"))
+        os.makedirs(self.outside)
+        for p in (os.path.join(self.tree, "f1"), os.path.join(self.tree, "sub", "f2"), os.path.join(self.outside, "secret")):
+            with open(p, "w") as f:
+                f.write("x")
+        os.symlink(self.outside, os.path.join(self.tree, "swap"))
+        os.symlink(os.path.join(self.outside, "secret"), os.path.join(self.tree, "flink"))
+        os.link(os.path.join(self.outside, "secret"), os.path.join(self.tree, "hard"))
+        self.fd_hits, self.path_hits = [], []
+
+    def run_chown(self, target, ops_dev=False, stat_lie=None):
+        from unittest import mock
+        env = support.Env()
+        self.addCleanup(env.cleanup)
+        ops = idn.SystemOps(env.paths, dev=ops_dev)
+        real_stat = os.stat
+
+        def fchown(fd, uid, gid):
+            st = os.fstat(fd)
+            self.fd_hits.append((st.st_dev, st.st_ino))
+
+        def chown(path, uid, gid, **kw):
+            self.path_hits.append((path, kw))
+
+        def lying_stat(path, *a, **kw):
+            if stat_lie and path == stat_lie[0] and "dir_fd" in kw:
+                return real_stat(stat_lie[1])
+            return real_stat(path, *a, **kw)
+        pw, gr = mock.Mock(pw_uid=4242), mock.Mock(gr_gid=4242)
+        with mock.patch("os.geteuid", return_value=0), mock.patch("pwd.getpwnam", return_value=pw), \
+                mock.patch("grp.getgrnam", return_value=gr), mock.patch("os.fchown", side_effect=fchown), \
+                mock.patch("os.chown", side_effect=chown), mock.patch("os.stat", side_effect=lying_stat):
+            ops.chown_agent(target)
+
+    def ino(self, *parts):
+        st = os.stat(os.path.join(*parts))
+        return (st.st_dev, st.st_ino)
+
+    def test_a_tree_is_walked_without_following_links(self):
+        self.run_chown(self.tree)
+        self.assertIn(self.ino(self.tree), self.fd_hits)
+        self.assertIn(self.ino(self.tree, "sub"), self.fd_hits)
+        self.assertIn(self.ino(self.tree, "f1"), self.fd_hits)
+        self.assertIn(self.ino(self.tree, "sub", "f2"), self.fd_hits)
+        self.assertNotIn(self.ino(self.outside), self.fd_hits)                 # the symlinked directory was not entered
+        self.assertNotIn(self.ino(self.outside, "secret"), self.fd_hits)       # nor the file a link or a hard link reaches
+        links = [(p, kw) for p, kw in self.path_hits if p in ("swap", "flink")]
+        self.assertEqual(sorted(p for p, _ in links), ["flink", "swap"])       # the links themselves, never their targets
+        for _, kw in links:
+            self.assertIs(kw.get("follow_symlinks"), False)
+            self.assertIn("dir_fd", kw)
+
+    def test_a_directory_swapped_for_a_symlink_after_the_check_is_not_entered(self):
+        self.run_chown(self.tree, stat_lie=("swap", self.outside))             # lstat said "directory", the open finds a link
+        self.assertNotIn(self.ino(self.outside), self.fd_hits)
+        self.assertNotIn(self.ino(self.outside, "secret"), self.fd_hits)
+
+    def test_a_single_file_is_chowned_without_following_a_link(self):
+        f = os.path.join(self.tree, "f1")
+        self.run_chown(f)
+        self.assertEqual(self.path_hits, [(f, {"follow_symlinks": False})])
+        self.path_hits.clear()
+        self.run_chown(os.path.join(self.tree, "flink"))                       # a symlink given as the top is refused
+        self.assertEqual(self.path_hits, [])
+
+    def test_a_dev_run_changes_nothing(self):
+        self.run_chown(self.tree, ops_dev=True)
+        self.assertEqual((self.fd_hits, self.path_hits), ([], []))
 
 
 class TestSystemOps(unittest.TestCase):

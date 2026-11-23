@@ -41,8 +41,8 @@ BATCH_RAW = 3 * MB
 HI_SEVS = ("HIGH", "CRITICAL")
 KINDS_KEPT = 8
 
-_SEG_RE = re.compile(r"^seg-([0-9]{8})\.jsonl$")
-_REJ_RE = re.compile(r"^rej-([0-9]{8})\.jsonl$")
+_SEG_RE = re.compile(r"^seg-([0-9]{8})\.jsonl\Z")
+_REJ_RE = re.compile(r"^rej-([0-9]{8})\.jsonl\Z")
 
 
 # ---- Small file helpers shared by the other modules ---------------------------------------
@@ -55,7 +55,7 @@ def rfc3339(t=None):
     return dt.strftime("%Y-%m-%dT%H:%M:%S.") + "%03dZ" % (dt.microsecond // 1000)
 
 
-_RFC_RE = re.compile(r"^(\d{4})-(\d\d)-(\d\d)[Tt ](\d\d):(\d\d):(\d\d)(?:\.(\d{1,9}))?([Zz]|[+-]\d\d:\d\d)$")
+_RFC_RE = re.compile(r"^(\d{4})-(\d\d)-(\d\d)[Tt ](\d\d):(\d\d):(\d\d)(?:\.(\d{1,9}))?([Zz]|[+-]\d\d:\d\d)\Z")
 
 
 def parse_rfc3339(text):
@@ -231,6 +231,7 @@ class Spool:
         self.dropped_src = {}
         self.rejected = 0
         self.corrupt = 0
+        self.damaged = 0                # segments found over the size limit at open and discarded
         self.last_error = ""
         self._pending_drops = []
         self._rej_n = 0
@@ -297,10 +298,16 @@ class Spool:
         ack_seg = ack_t[0] if ack_t else 0
         for n in names:
             p = lane.seg_path(n)
+            limit = self.seg_size + LINE_MAX + 4096          # a segment never grows past this: a bigger file is damaged
             try:
                 with open(p, "rb") as f:
-                    data = f.read()
+                    data = f.read(limit + 1)
             except OSError:
+                continue
+            if len(data) > limit:
+                self.last_error = "spool: segment %s/%s is over %d bytes: discarded as damaged" % (lane.name, os.path.basename(p), limit)
+                self.damaged += 1
+                self._unlink(p)
                 continue
             if ack_t and n < ack_t[0]:
                 # older than the head the ack file names: it was acked, the delete was lost

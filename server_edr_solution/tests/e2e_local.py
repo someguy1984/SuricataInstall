@@ -465,12 +465,14 @@ def step2():
 def step3():
     h, a = CTX["hub1"], CTX["agent"]
     a.start()
+    t_start = time.time()
 
     def active():
         x = h.host()
         return x if x and x["state"] == "active" and x.get("last_seen") else None
     row = wait_until(active, 90, 1)
     check(row, "the host did not become active in 90 s (agent log: %s)" % tail(open(os.path.join(BASE, "agent.log")).read()))
+    print("     note: active %.0f s after the agent started" % (time.time() - t_start), flush=True)
     show = h.cli_json("host", "web1", "show")
     show = show[0] if isinstance(show, list) else show
     check(show.get("agent_version") == "0.1.0", "no heartbeat on record: agent_version=%r" % show.get("agent_version"))
@@ -481,6 +483,9 @@ def step3():
 def step10a():
     h = CTX["hub1"]
     rc = CTX["receiver"] = Receiver()
+    # The installer copies the private CA to <state>/webhook-ca.pem (the hub sends its text inside each job);
+    # the webhook_ca setting records where it came from.
+    shutil.copyfile(rc.ca_pem, os.path.join(h.state, "webhook-ca.pem"))
     rcode, out, err = h.cli("settings", "set", "webhook_ca", rc.ca_pem)
     check(rcode == 0, "settings set webhook_ca: %s" % tail(err or out))
     url = "https://127.0.0.1:%d/hook" % rc.port
@@ -534,7 +539,7 @@ def step5():
         return None
     ev = wait_until(at_hub, 40, 1)
     check(ev, "no ban.local for 198.51.100.50 at the hub")
-    d = ev["details"]
+    d = {k: v for k, v in ev["details"].items() if k != "boot_id"}      # the hub adds boot_id itself
     check(set(d) == {"cidr", "trigger", "evidence", "ttl_s", "rung"} and d["trigger"] == "ssh_fail" and d["ttl_s"] == 3600,
           "ban.local details are %r" % d)
     time.sleep(3)
@@ -694,11 +699,16 @@ def step9():
 def step10():
     h, rc = CTX["hub1"], CTX["receiver"]
 
+    last = {}
+
     def delivered():
-        run([PY, "-I", os.path.join(HUB_DIR, "edr_hub_out.py"), "--once", "--allow-private"], env=h.env, timeout=120)
+        r = run([PY, "-I", os.path.join(HUB_DIR, "edr_hub_out.py"), "--once", "--allow-private"], env=h.env, timeout=120)
+        last["run"] = r
         return [t for t in rc.texts() if MARK in t]
     got = wait_until(delivered, 90, 3)
-    check(got, "no alert with the hostile marker reached the receiver (%d bodies seen: %s)" % (len(rc.texts()), [t[:60] for t in rc.texts()]))
+    r = last.get("run", (None, "", ""))
+    check(got, "no alert with the hostile marker reached the receiver (%d bodies seen: %s; edr_hub_out.py exit %s: %s; status: %s)" % (
+        len(rc.texts()), [t[:60] for t in rc.texts()], r[0], tail(r[1] + r[2], 400), tail(h.cli("status")[1], 500)))
     text = got[0]
     outside = re.sub(r"`[^`]*`", "", text)                   # what is outside code spans
     check("<" not in text and ">" not in text, "a raw < or > in the alert text: %r" % text[:300])
@@ -715,6 +725,11 @@ def step11():
     h1, a = CTX["hub1"], CTX["agent"]
     h2 = CTX["hub2"]
     bkp = os.path.join(BASE, "hub1.backup")
+    for hub in (h1, h2):                        # the backup passphrase file of each hub (hub PLAN 7): root-only, never in the backup
+        os.makedirs(hub.etc, mode=0o750, exist_ok=True)
+        fd = os.open(os.path.join(hub.etc, "backup.pass"), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write("e2e-backup-passphrase-abcdefghij\n")
     rc, out, err = h1.cli("backup", "--out", bkp)
     check(rc == 0, "backup: %s" % tail(err or out))
     passfile = os.path.join(BASE, "pass")

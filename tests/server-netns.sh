@@ -425,7 +425,9 @@ for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
     bans_run >/dev/null
 done
 kill "$POLLER" 2>/dev/null; wait "$POLLER" 2>/dev/null
-polls=$(wc -l < "$WORK/poll.n" 2>/dev/null || echo 0); misses=$(wc -l < "$WORK/poll.m" 2>/dev/null || echo 0)
+polls=0 misses=0
+[[ ! -f $WORK/poll.n ]] || polls=$(wc -l < "$WORK/poll.n")
+[[ ! -f $WORK/poll.m ]] || misses=$(wc -l < "$WORK/poll.m")
 if [[ $misses -eq 0 && $polls -ge 50 ]]; then pass "atomic replace: the table was present in all $polls polls across 12 replacements"; else fail "atomic replace: $misses misses in $polls polls"; fi
 rm -f "$WORK"/poll.*
 
@@ -460,17 +462,17 @@ case_ "an expired pause is ignored: the new ban applies"; blocked c2 tcp 198.51.
 printf 'not json' > "$CL/etc/edr-agent/pause.json"; bans_write "$(doc '[]' "$(ban $C2/32)" "$(ban 203.0.113.9/32)")"; apply
 expect "a pause.json that is not JSON is ignored" "$(set_elems edr edr_ban4 | wc -l)" 2
 
-# The breaker on new hub bans
+# The breaker on new hub bans: more than 20 new hub bans in one update refuse the whole hub part of that update
+# (PLAN 4.2: "refused (hub part only; local bans stay)"). edr-bans must apply none of them and keep the local ban.
 client_reset
 args=("$(ban $C1/32 local)")
 for i in $(seq 1 50); do args+=("$(ban 203.0.113.$i/32 fleet)"); done
 bans_write "$(doc '[]' "${args[@]}")"; apply
 n=$(set_elems edr edr_ban4 | wc -l)
 hub=$((n - 1))
-if [[ $hub -le 20 ]]; then pass "50 new hub bans in one update: at most 20 applied ($hub)"; else fail "50 new hub bans in one update: $hub applied (the limit is 20)"; fi
-grep -q 'more than 20 new hub bans' "$CL/run/edr-bans/counters.json" && pass "the breaker's refusals are reported in counters.json" || fail "no breaker refusal in counters.json"
+if [[ $hub -eq 0 ]]; then pass "50 new hub bans in one update: none of them is applied"; else fail "50 new hub bans in one update: $hub applied, the whole hub part should be refused (edr-bans applies the first 20)"; fi
+grep -q 'the hub part is refused' "$CL/run/edr-bans/counters.json" && pass "the breaker's refusal is reported in counters.json" || fail "no breaker refusal in counters.json"
 case_ "the local ban in the same update stays in force"; blocked c1 tcp 198.51.100.1 18080
-note "the code applies the first 20 hub bans and refuses the rest; PLAN 4.2 says 'more than 20 new hub bans in one update ... is refused (hub part only)'"
 
 # A burst of 20 bans.json writes in one second ends with the final state
 client_reset; apply

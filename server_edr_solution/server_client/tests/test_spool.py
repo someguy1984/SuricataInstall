@@ -284,6 +284,33 @@ class TestInFlightBatches(SpoolBase):
         self.assertEqual([e["seq"] for e in self.drain(s3)], [60])
 
 
+class TestDamagedSegments(SpoolBase):
+    def test_a_segment_over_the_size_limit_is_discarded_at_open_not_read_whole(self):
+        s = self.open(seg_size=2000)
+        s.append(ev(1))
+        s.close()
+        lo = os.path.join(self.dir, "spool", "lo")
+        big = os.path.join(lo, "seg-00000009.jsonl")
+        with open(big, "wb") as f:
+            f.write((b"x" * 1000 + b"\n") * 40)                       # 40 KB where 2000 bytes (plus a line) is the limit
+        s2 = self.open(seg_size=2000)
+        self.assertEqual(s2.damaged, 1)
+        self.assertIn("damaged", s2.last_error)
+        self.assertFalse(os.path.exists(big))
+        self.assertEqual([e["seq"] for e in self.drain(s2)], [1])        # the good segment is untouched
+        s2.append(ev(2))
+        self.assertEqual(s2.lanes["lo"].next, 11)                         # numbers above the damaged file are never reused
+
+    def test_a_segment_at_the_limit_is_read(self):
+        s = self.open(seg_size=3000)
+        for i in range(10):
+            s.append(ev(i))
+        s.close()
+        s2 = self.open(seg_size=3000)
+        self.assertEqual(s2.damaged, 0)
+        self.assertEqual(s2.depth(), 10)
+
+
 class TestRejected(SpoolBase):
     def test_rejected_is_capped_and_counted(self):
         with mock.patch.object(sp, "REJECT_SEG", 600):

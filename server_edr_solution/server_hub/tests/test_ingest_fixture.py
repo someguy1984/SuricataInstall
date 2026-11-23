@@ -28,7 +28,15 @@ if HUB_DIR not in sys.path:
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
-SCRATCH = os.environ.get("EDR_TEST_TMP") or None
+# A scratch directory from the environment is used only when it is short: unix socket paths are limited to 107
+# bytes, and a long EDR_TEST_TMP made other suites fail. Otherwise the system temporary directory is used.
+_SCRATCH = os.environ.get("EDR_TEST_TMP") or None
+SCRATCH = _SCRATCH if _SCRATCH and len(_SCRATCH) <= 24 else None
+
+
+def make_tmp(prefix):
+    """A new private directory, unique per call (mkdtemp), never shared between tests."""
+    return tempfile.mkdtemp(prefix=prefix, dir=SCRATCH)
 
 
 def _fake(name, **attrs):
@@ -165,7 +173,7 @@ class HubFixture:
     """A hub without the control sockets and the engine thread: writer, CA, certificates, both listeners."""
 
     def __init__(self, settings=None, bind="127.0.0.1", start=True):
-        self.tmp = tempfile.mkdtemp(prefix="edr-hub-test-", dir=SCRATCH)
+        self.tmp = make_tmp("hubfx-")
         self.fleet_port, self.enroll_port = free_ports(2)
         self.paths = hub_common.Paths(state_dir=os.path.join(self.tmp, "state"), run_dir=os.path.join(self.tmp, "run"),
                                       etc_dir=os.path.join(self.tmp, "etc"))

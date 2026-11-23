@@ -28,8 +28,8 @@ BURN_AFTER = 5                          # wrong secrets that burn a token id
 FAIL_PER_SOURCE_PER_MIN = 5
 FAIL_GLOBAL_PER_MIN = 60
 LIMITER_TABLE_MAX = 4096
-TOKEN_ID_RE = re.compile(r"^[0-9a-f]{12}$")
-TOKEN_SECRET_RE = re.compile(r"^[A-Za-z0-9_-]{16,64}$")
+TOKEN_ID_RE = re.compile(r"^[0-9a-f]{12}\Z")
+TOKEN_SECRET_RE = re.compile(r"^[A-Za-z0-9_-]{16,64}\Z")
 _DUMMY_HASH = hashlib.sha256(b"edr-hub dummy secret, compared when the id is unknown").hexdigest()
 
 # Host state transitions (section 2, Host states). target -> states it may be reached from.
@@ -214,10 +214,18 @@ def host_adopt(conn, hub, uuid):
     conn.execute("UPDATE hosts SET state='active', state_since=? WHERE uuid=?", (hub_common.now_ms(), uuid))
 
 
+ORPHANS_MAX = 64
+
+
 def orphan_from_certificate(conn, hub, der_hash, cn, serial, not_after_ms, peer_ip):
     """A certificate signed by our CA that the hosts table does not hold and revoked.txt does not list: a host enrolled
     or renewed after the backup that was restored (section 7, step 5). Makes or converts the host row to `orphan` and
-    raises a HIGH notice. Returns the hosts row, or None when it must be refused."""
+    raises one HIGH notice per host. Returns the hosts row, or None when it must be refused.
+
+    Only on a hub that was restored (meta.restored_at, set by `edr-hub restore`); never with an older certificate than
+    the one the row holds; at most 64 orphan rows."""
+    if not hub_db.meta_get(conn, "restored_at"):
+        return None
     if hub.pki.revoked_lookup(der_hash) or not hub_pki.UUID_RE.match(cn or ""):
         return None
     if conn.execute("SELECT 1 FROM hosts WHERE cert_sha256=? OR pending_cert_sha256=? OR cert_serial=? OR pending_cert_serial=?",
@@ -225,6 +233,9 @@ def orphan_from_certificate(conn, hub, der_hash, cn, serial, not_after_ms, peer_
         return None
     now = hub_common.now_ms()
     row = conn.execute("SELECT * FROM hosts WHERE uuid=?", (cn,)).fetchone()
+    if row is None or row["state"] != "orphan":
+        if conn.execute("SELECT COUNT(*) FROM hosts WHERE state='orphan'").fetchone()[0] >= ORPHANS_MAX:
+            return None
     if row is None:
         name = "orphan-" + cn[:8]
         n = 1
@@ -235,15 +246,20 @@ def orphan_from_certificate(conn, hub, der_hash, cn, serial, not_after_ms, peer_
             "INSERT INTO hosts(uuid, name, droplet_id, cert_sha256, cert_serial, cert_not_after, state, state_since, "
             "enrolled_at, enrolled_from, peer_ips) VALUES(?,?,?,?,?,?, 'orphan', ?, ?, ?, ?)",
             (cn, name, "", der_hash, serial, not_after_ms, now, now, peer_ip or "", add_peer("[]", peer_ip)))
+        newly = True
     elif row["state"] in ("pending", "active", "orphan"):
+        if not_after_ms <= (row["cert_not_after"] or 0):
+            return None                              # an older certificate never replaces the row's current one
         conn.execute("UPDATE hosts SET cert_sha256=?, cert_serial=?, cert_not_after=?, pending_cert_sha256=NULL, "
                      "pending_cert_serial=NULL, pending_cert_not_after=NULL, state='orphan', "
                      "state_since=CASE WHEN state='orphan' THEN state_since ELSE ? END WHERE uuid=?",
                      (der_hash, serial, not_after_ms, now, cn))
+        newly = row["state"] != "orphan"
     else:
         return None
     host = conn.execute("SELECT * FROM hosts WHERE uuid=?", (cn,)).fetchone()
-    _notify_orphan(conn, hub, host, peer_ip)
+    if newly:
+        _notify_orphan(conn, hub, host, peer_ip)         # once per host, not once per attempt
     return host
 
 

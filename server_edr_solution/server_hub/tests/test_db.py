@@ -64,7 +64,7 @@ class DbCase(unittest.TestCase):
     settings = None
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="edr-db-test-", dir=F.SCRATCH)
+        self.tmp = F.make_tmp("hubdb-")
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.hub = FakeHub(self.tmp, self.settings)
         self.writer = None
@@ -338,7 +338,7 @@ class WriterQueueTest(DbCase):
         self.assertGreater(third, before)
 
     def test_idle_tick_feeds_the_watchdog_and_ingests_pending_audit(self):
-        short = tempfile.mkdtemp(prefix="edr-n-")          # a unix socket path must be short
+        short = tempfile.mkdtemp(prefix="hubnotify-")          # a unix socket path must be short
         self.addCleanup(shutil.rmtree, short, True)
         sock_path = os.path.join(short, "n.sock")
         srv = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)

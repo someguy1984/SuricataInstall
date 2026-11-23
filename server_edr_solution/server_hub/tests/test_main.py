@@ -54,7 +54,7 @@ def jload(path):
 
 
 def short_tmp():
-    d = tempfile.mkdtemp(prefix="edr-m-")           # short: unix socket paths are limited to 107 bytes
+    d = tempfile.mkdtemp(prefix="hubmain-")           # short: unix socket paths are limited to 107 bytes
     os.chmod(d, 0o755)
     return d
 
@@ -101,9 +101,12 @@ class Proc:
 
     def run_to_end(self, timeout=60):
         os.makedirs(self.state, exist_ok=True)
-        os.makedirs(self.run, exist_ok=True)
+        dirs = [self.state]
+        if "--init-only" not in self.args:                 # init-only must not need the run directory
+            os.makedirs(self.run, exist_ok=True)
+            dirs.append(self.run)
         if self.unprivileged:
-            for d in (self.state, self.run):
+            for d in dirs:
                 os.chmod(d, 0o777)
         done = subprocess.run([sys.executable, "-I", os.path.join(self.lib, "edr_hub.py")] + self.args, capture_output=True,
                               text=True, timeout=timeout, env=self.env, cwd="/", preexec_fn=self._preexec)
@@ -253,6 +256,18 @@ class InitOnlyTest(MainCase):
         self.assertEqual(p.run_to_end().returncode, 0)
         self.assertEqual(jload(os.path.join(p.state, "settings.json"))["public_ip"], ["127.0.0.1"])
 
+    def test_ui_host_and_webhook_ca_flags_and_no_run_directory(self):
+        p = self.proc(extra=["--init-only", "--ui-host", "hub.example:8450", "--ui-host", "127.0.0.1:8450",
+                             "--webhook-ca-path", "/var/lib/edr-hub/webhook-ca.pem"])
+        done = p.run_to_end()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        settings = jload(os.path.join(p.state, "settings.json"))
+        self.assertEqual(settings["ui_host"], ["hub.example:8450", "127.0.0.1:8450"])
+        self.assertEqual(settings["webhook_ca"], "/var/lib/edr-hub/webhook-ca.pem")
+        self.assertFalse(os.path.exists(p.run), "--init-only made the run directory")
+        bad = Proc(self.root, self.ports, extra=["--init-only", "--ui-host", "no port here"]).run_to_end()
+        self.assertEqual(bad.returncode, 2)
+
     def test_usage_error_exits_64(self):
         p = self.proc(extra=["--bogus-flag"])
         done = p.run_to_end()
@@ -291,7 +306,7 @@ class RunningHubTest(MainCase):
         return F.Client(fx, key_path=None)
 
     def test_start_serve_enroll_events_sigterm(self):
-        notify_dir = tempfile.mkdtemp(prefix="edr-n-")
+        notify_dir = tempfile.mkdtemp(prefix="hubnotify-")
         self.addCleanup(shutil.rmtree, notify_dir, True)
         notify = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
         notify.bind(os.path.join(notify_dir, "n"))

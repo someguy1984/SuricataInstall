@@ -18,6 +18,7 @@ import json
 import queue
 import re
 import socket
+import socketserver
 import ssl
 import threading
 import time
@@ -42,7 +43,7 @@ REJECT_NOTE_EVERY_S = 30
 RO_POOL_MAX = 8
 ENROLL_REFRESH_S = 2
 
-_HEADER_NAME = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
+_HEADER_NAME = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+\Z")
 _SINGLE_HEADERS = ("content-length", "x-edr-proto", "if-none-match", "content-encoding", "host", "content-type")
 _STATE_CODE = {"revoked": "host_revoked", "moved": "host_moved", "retired": "host_retired"}
 _REVOKE_REASON_CODE = {"revoked": "host_revoked", "retired": "host_retired", "moved": "host_moved",
@@ -516,6 +517,14 @@ class _AcceptServer(http.server.ThreadingHTTPServer):
             self.address_family = socket.AF_INET6
         super().__init__(address, None)
 
+    def server_bind(self):
+        # HTTPServer.server_bind asks socket.getfqdn(), a DNS lookup the hub's user cannot make and that would stall
+        # the listener (and the lock around it). The name is never used: set it literally.
+        socketserver.TCPServer.server_bind(self)
+        host, port = self.server_address[:2]
+        self.server_name = host
+        self.server_port = port
+
     def process_request(self, request, client_address):
         self.listener.accept(request, client_address)
 
@@ -832,8 +841,8 @@ class Ingest:
             self._check_proto(path, headers)
             if fleet:
                 c.host, c.der_sha256 = self._authenticate(c, path)
-                cert_key = c.der_sha256
-                self._cert_enter(cert_key)
+                self._cert_enter(c.der_sha256)       # raises when the certificate already has 4 requests...
+                cert_key = c.der_sha256              # ...and only a counted request may give its place back
             clen = self._content_length(c, path)
             c.clen = clen
             deadline = t0 + (self.enroll_total() if not fleet else (
@@ -851,7 +860,8 @@ class Ingest:
         except OSError:
             raise
         except Exception as e:      # noqa: BLE001 - an unexpected bug answers 503, never leaks text
-            self.hub.log("ERROR", "route failed: %s: %s" % (type(e).__name__, e))
+            self.hub.log("ERROR", "route failed: %s (the answer was 503; details stay out of the log, they may hold client input)"
+                         % type(e).__name__)
             response = self._error_response(HttpError("busy", 30))
         finally:
             if cert_key is not None:
@@ -1076,9 +1086,9 @@ class Ingest:
     def r_events(self, c):
         if c.headers.get("content-encoding", "").lower() != "gzip":
             raise HttpError("bad_request")
+        body = read_body(c.rfile, c.clen)       # bounded by Content-Length and the reaper; no slot is held while it arrives
         self._parse_slot()
         try:
-            body = read_body(c.rfile, c.clen)
             batch = parse_json_object(inflate_limited(body))
             items, sent_ms = validate_batch(batch)
             return self._events_reply(c, items, sent_ms)
@@ -1151,9 +1161,10 @@ class Ingest:
                 insert_events(conn, self.hub, row, items, received, skew)
 
     def r_heartbeat(self, c):
+        body = read_body(c.rfile, c.clen)
         self._parse_slot()
         try:
-            hb, sent_ms = validate_heartbeat(parse_json_object(read_body(c.rfile, c.clen)))
+            hb, sent_ms = validate_heartbeat(parse_json_object(body))
         except BaseException:
             self.parse_sem.release()
             raise
@@ -1234,9 +1245,10 @@ class Ingest:
             if now - self._renew_last.get(uuid, -1e9) < RENEW_MIN_INTERVAL_S:
                 raise HttpError("rate_limited", RENEW_MIN_INTERVAL_S)
             self._renew_last[uuid] = now
+        body = read_body(c.rfile, c.clen)
         self._parse_slot()
         try:
-            obj = parse_json_object(read_body(c.rfile, c.clen))
+            obj = parse_json_object(body)
             csr = obj.get("csr")
             if not isinstance(csr, str):
                 raise HttpError("bad_schema")
@@ -1260,9 +1272,10 @@ class Ingest:
         return _json_response({"certificate": signed["pem"], "not_after": hub_common.ms_to_rfc3339(signed["not_after"])})
 
     def r_deregister(self, c):
+        body = read_body(c.rfile, c.clen)
         self._parse_slot()
         try:
-            obj = parse_json_object(read_body(c.rfile, c.clen))
+            obj = parse_json_object(body)
             reason = obj.get("reason")
             if reason not in ("uninstall", "rehome"):
                 raise HttpError("bad_schema")

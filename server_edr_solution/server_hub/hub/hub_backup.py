@@ -11,13 +11,16 @@ MANIFEST.json (SHA-256 of every member) and holds hub.db, settings.json, secrets
 hub-addresses.json, ca/ca.pem and ca/revoked.txt. It never holds a CA key or the server key.
 """
 
+import errno
 import hashlib
 import io
 import json
 import os
+import secrets
 import shutil
 import sqlite3
 import ssl
+import stat
 import subprocess
 import tarfile
 import tempfile
@@ -104,12 +107,42 @@ def _ca_sha256(pem_text):
     return hashlib.sha256(ssl.PEM_cert_to_DER_cert(pem_text)).hexdigest()
 
 
-def _read_text(path, default=None):
+UNSAFE_SOURCES = []     # sources this run left out because they were links or not regular files (reported by backup)
+
+
+def _open_regular(path):
+    """A read-only descriptor for a regular file, never following a link. Raises FileNotFoundError, or OSError
+    (ELOOP) for a link, or NotADirectoryError-like OSError for anything that is not a regular file."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
     try:
-        with open(path, encoding="utf-8") as f:
-            return f.read()
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(errno.EINVAL, "not a regular file", path)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _read_bytes(path, default=None, strict=False):
+    """The contents of a regular file. A link or a special file is never read: with strict it is a refusal, otherwise
+    the source counts as absent and is named in UNSAFE_SOURCES. This is root reading inside directories the edr-hub
+    user owns (PLAN section 7), so a planted link must not make root copy another file into a backup."""
+    try:
+        fd = _open_regular(path)
     except FileNotFoundError:
         return default
+    except OSError:
+        if strict:
+            raise Refuse("%s is a link or not a regular file" % path)
+        UNSAFE_SOURCES.append(path)
+        return default
+    with os.fdopen(fd, "rb") as f:
+        return f.read()
+
+
+def _read_text(path, default=None, strict=False):
+    data = _read_bytes(path, None, strict)
+    return default if data is None else data.decode("utf-8")
 
 
 def _fsync_dir(path):
@@ -124,11 +157,20 @@ def _fsync_dir(path):
 
 
 def _chown_like(path, ref):
-    """Give `path` the owner of the stat result `ref`. Only root can; anyone else keeps what they have."""
+    """Give a directory the owner of the stat result `ref`, without following a link. Only root can."""
     if os.geteuid() != 0 or ref is None:
         return
     try:
-        os.chown(path, ref.st_uid, ref.st_gid)
+        os.chown(path, ref.st_uid, ref.st_gid, follow_symlinks=False)
+    except OSError:
+        pass
+
+
+def _fchown_like(fd, ref):
+    if os.geteuid() != 0 or ref is None:
+        return
+    try:
+        os.fchown(fd, ref.st_uid, ref.st_gid)
     except OSError:
         pass
 
@@ -343,9 +385,12 @@ def backup(paths, out=None, scheduled=None, log=print):
 
 def _backup(paths, final, rotate, log):
     passfile = _passfile(paths)
+    del UNSAFE_SOURCES[:]
     if not os.path.exists(paths.db):
         raise Refuse("no database at " + paths.db)
-    ca_pem = _read_text(paths.ca_cert)
+    if os.path.islink(paths.db) or not os.path.isfile(paths.db):
+        raise Refuse("%s is a link or not a regular file" % paths.db)
+    ca_pem = _read_text(paths.ca_cert, strict=True)
     if ca_pem is None:
         raise Refuse("no CA certificate at " + paths.ca_cert)
     outdir = os.path.dirname(final)
@@ -378,9 +423,15 @@ def _backup(paths, final, rotate, log):
                 "SELECT cidr, reason, added_by, ts FROM never_ban ORDER BY cidr")]
         finally:
             copy.close()
-        settings = hub_common.load_settings(paths)
+        settings = hub_common.default_settings()
+        settings_text = _read_text(paths.settings)
+        try:
+            stored = json.loads(settings_text) if settings_text else {}
+            settings.update(stored if isinstance(stored, dict) else {})
+        except ValueError:
+            pass
         blobs = {
-            "settings.json": (_read_text(paths.settings) or json.dumps(settings)).encode("utf-8"),
+            "settings.json": (settings_text or json.dumps(settings)).encode("utf-8"),
             "never-ban.json": json.dumps(never, indent=1).encode("utf-8"),
             "hub-addresses.json": json.dumps({"public_ip": settings.get("public_ip", []), "port": settings.get("port"),
                                               "enroll_port": settings.get("enroll_port")}).encode("utf-8"),
@@ -409,6 +460,8 @@ def _backup(paths, final, rotate, log):
     hub_common.atomic_write(paths.last_backup, str(now_ms()) + "\n", 0o644)
     if rotate:
         _rotate(outdir, int(settings.get("backup_keep", 14)))
+    for path in UNSAFE_SOURCES:
+        _say(log, "WARNING: %s is a link or not a regular file: it was left out of the backup" % path)
     _say(log, "backup written: %s (%.1f MiB)" % (final, os.path.getsize(final) / (1 << 20)))
     return 0
 
@@ -431,8 +484,9 @@ def ca_export(paths, passphrase, out=None, log=print):
 
 
 def _ca_export(paths, passphrase, final, log):
-    if not os.path.exists(paths.ca_key):
+    if not os.path.lexists(paths.ca_key):
         raise Refuse("no CA key at " + paths.ca_key)
+    key_pem = _read_bytes(paths.ca_key, strict=True)
     if len(passphrase) < MIN_CA_PASSPHRASE:
         raise Refuse("the passphrase must be at least %d characters" % MIN_CA_PASSPHRASE)
     backup_pass = _read_text(paths.backup_pass)
@@ -442,10 +496,10 @@ def _ca_export(paths, passphrase, final, log):
         raise Refuse("the output file exists: " + final)
     os.makedirs(os.path.dirname(final), mode=0o700, exist_ok=True)
     res = _openssl(["pkcs8", "-topk8", "-v2", "aes-256-cbc", "-v2prf", "hmacWithSHA256", "-iter", PBKDF2_ITER,
-                    "-in", paths.ca_key, "-passout", "fd:FD"], passphrase=passphrase)
+                    "-passout", "fd:FD"], input_bytes=key_pem, passphrase=passphrase)
     if res.returncode != 0 or b"ENCRYPTED PRIVATE KEY" not in res.stdout:
         raise BackupError("openssl could not export the key: " + clean(res.stderr.decode("utf-8", "replace"), 120))
-    fd = os.open(final, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    fd = os.open(final, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     with os.fdopen(fd, "wb") as f:
         f.write(res.stdout)
         f.flush()
@@ -507,6 +561,8 @@ def _find_ca_key(paths, staged_ca_pem, ca_key_file, passphrase):
         if res.returncode != 0:
             raise Refuse("cannot read the CA key file")
         return res.stdout
+    if os.path.islink(paths.ca_key):
+        raise Refuse("%s is a link: root does not use a key it reaches through one" % paths.ca_key)
     if os.path.exists(paths.ca_key) and _pubkey_of_key(paths.ca_key) == want:
         return None
     raise Refuse("no usable CA key: pass --ca-key FILE (the ca-export file); "
@@ -531,6 +587,12 @@ def _restore(paths, file, ca_key_file, ca_passphrase, drill, extra_ips, log):
             hub_common.norm_ip(ip)
         except ValueError:
             raise Refuse("--public-ip is not an IP address: " + clean(ip, 45))
+    # Root writes into directories the edr-hub user owns: nothing it will replace or enter may be a link.
+    targets = [paths.state_dir, paths.ca_dir, paths.tls_dir, paths.db, paths.db + "-wal", paths.db + "-shm", paths.settings,
+               paths.ca_cert, paths.revoked, paths.ca_key, paths.server_cert, paths.server_key, paths.secrets]
+    for path in targets:
+        if os.path.islink(path):
+            raise Refuse("%s is a link: refusing to write through it" % path)
     os.makedirs(paths.state_dir, exist_ok=True)
     state_stat = _stat(paths.state_dir)
     stage = tempfile.mkdtemp(prefix=".restore-", dir=paths.state_dir)
@@ -602,33 +664,47 @@ def _merge_revoked(backup_text, current_text):
 
 
 def _swap_in(paths, stage, manifest, merged, new_key, drill, ips, state_stat, log):
-    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-    aside = os.path.join(paths.state_dir, "restore-aside-" + stamp)
+    aside = None        # made with a random name when the first file is moved aside: a planted name or link is never used
     ca_stat = _stat(paths.ca_dir) or state_stat
     moved = []          # (original, aside copy)
     installed = []      # paths created by this restore
 
     def put_aside(path, name):
+        nonlocal aside
         if os.path.lexists(path):
-            os.makedirs(aside, mode=0o700, exist_ok=True)
+            if aside is None:
+                aside = tempfile.mkdtemp(prefix="restore-aside-", dir=paths.state_dir)
             dest = os.path.join(aside, name)
             os.makedirs(os.path.dirname(dest), mode=0o700, exist_ok=True)
             os.replace(path, dest)
             moved.append((path, dest))
 
     def install(src_bytes_or_path, dest, mode, ref):
-        tmp = dest + ".restore-new"
-        if isinstance(src_bytes_or_path, bytes):
-            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+        """Write dest through a new file with a random name (O_EXCL, O_NOFOLLOW), set mode and owner on the
+        descriptor, then rename it over dest. Nothing here follows a link an attacker left behind."""
+        if os.path.islink(dest):
+            raise BackupError("%s is a link: refusing to write through it" % dest)
+        tmp = "%s.restore-%s" % (dest, secrets.token_hex(6))
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        try:
             with os.fdopen(fd, "wb") as f:
-                f.write(src_bytes_or_path)
+                if isinstance(src_bytes_or_path, bytes):
+                    f.write(src_bytes_or_path)
+                else:
+                    src_fd = _open_regular(src_bytes_or_path)
+                    with os.fdopen(src_fd, "rb") as src:
+                        shutil.copyfileobj(src, f, 1 << 20)
                 f.flush()
+                os.fchmod(f.fileno(), mode)
+                _fchown_like(f.fileno(), ref)
                 os.fsync(f.fileno())
-        else:
-            shutil.copyfile(src_bytes_or_path, tmp)
-            os.chmod(tmp, mode)
-        _chown_like(tmp, ref)
-        os.replace(tmp, dest)
+            os.replace(tmp, dest)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
         installed.append(dest)
 
     try:
@@ -683,7 +759,7 @@ def _swap_in(paths, stage, manifest, merged, new_key, drill, ips, state_stat, lo
     _say(log, "server certificate reissued for: " + ", ".join(ips))
     if drill:
         _say(log, "drill: secrets.json was not restored and no alert channel is switched on")
-    if os.path.isdir(aside):
+    if aside is not None:
         _say(log, "the replaced files are kept in " + aside)
     _say(log, "all tokens were marked invalid: make new ones with `edr-hub token create --for HOST`")
     _print_serials(paths, log)

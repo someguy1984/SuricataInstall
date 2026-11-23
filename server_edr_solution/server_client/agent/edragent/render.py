@@ -17,9 +17,12 @@ followChildren paths shared by all policies. A policy that would break a limit i
 never written, because Tetragon would reject it (and a rejected enforcing policy is lost enforcement).
 """
 import glob
+import ipaddress
 import json
 import os
 import re
+import socket
+import urllib.parse
 
 PLACEHOLDER_RE = re.compile(r"@([A-Z_]+)@")
 WEB_PLACEHOLDERS = {"NGINX_BIN", "PHPFPM_BIN", "PHP_CLI_BIN", "WEB_EXEC_ALLOW"}
@@ -97,7 +100,7 @@ def placeholders_used(text):
 # ---- a small parser for the YAML subset the policy templates use -------------------------------------
 # Block maps and lists, "double quoted" and plain scalars, numbers, booleans, [flow, lists] and # comments. Not YAML in
 # general: a template that needs more is refused ("does not parse") rather than guessed at.
-_KEY_RE = re.compile(r"^([A-Za-z0-9_.-]+):(?:\s+(.*))?$")
+_KEY_RE = re.compile(r"^([A-Za-z0-9_.-]+):(?:\s+(.*))?\Z")
 
 
 def _strip_comment(line):
@@ -339,16 +342,34 @@ def render_policies(template_dir, cfg):
 
 # ---- the drop-in and the notify credential ----------------------------------------------------------
 def hub_addresses(paths):
-    """The enrolled hub addresses from identity/current/hub.conf, or [] in local mode."""
-    cur = os.path.join(paths.identity_dir, "current")
-    if not os.path.exists(cur):
+    """The hub addresses the agent may reach, or [] in local mode.
+
+    They come from the IPAddressAllow= drop-in that root wrote at enrollment, never from identity/*/hub.conf: that file
+    sits in the agent's own directory, so a compromised agent could edit it, and root would then widen the agent's
+    network allowlist for it the next time apply-config ran."""
+    import ipaddress
+    try:
+        fd = os.open(paths.dropin_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError:
         return []
     try:
-        from .identity import read_hub_conf
-        hc = read_hub_conf(os.path.join(os.path.realpath(cur), "hub.conf"))
-    except ImportError:
-        hc = None
-    return list(hc["addresses"]) if hc else []
+        text = os.read(fd, 65536).decode("utf-8", "replace")
+    except OSError:
+        return []
+    finally:
+        os.close(fd)
+    addrs = []
+    for line in text.splitlines():
+        if line.startswith("IPAddressAllow="):
+            addrs = []                                  # an empty assignment resets the list, as in systemd
+            for a in line.split("=", 1)[1].split():
+                try:
+                    ip = str(ipaddress.ip_address(a))
+                except ValueError:
+                    continue
+                if ip not in addrs:
+                    addrs.append(ip)
+    return addrs[:4]
 
 
 def render_dropin(addresses):
@@ -362,13 +383,104 @@ def render_notify_severity(cfg):
     return cfg.get("notify", "min_severity", "HIGH") + "\n"
 
 
+NOTIFY_ADDRESSES_MAX = 8
+
+
+def notify_target(paths):
+    """(host, port) of /etc/edr-agent/notify.url, or (None, reason). The file is root's (0600); https only."""
+    try:
+        fd = os.open(paths.notify_url, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return None, ""
+    except OSError:
+        return None, "notify.url cannot be read"
+    try:
+        raw = os.read(fd, 4097)
+    except OSError:
+        return None, "notify.url cannot be read"
+    finally:
+        os.close(fd)
+    if len(raw) > 4096:
+        return None, "notify.url is over 4 KiB"
+    line = raw.decode("utf-8", "replace").strip()
+    for pre in ("ntfy+", "slack+"):
+        if line.startswith(pre):
+            line = line[len(pre):]
+    try:
+        u = urllib.parse.urlsplit(line)
+        host, port = u.hostname, u.port or 443
+    except ValueError:
+        return None, "notify.url is not a URL"
+    if u.scheme != "https" or not host:
+        return None, "notify.url must be an https URL (plain http is refused)"
+    return (host, port), ""
+
+
+def resolve_host(host, port):
+    """Addresses of a host name, resolved here (root, once per apply-config). A resolver failure is no address."""
+    try:
+        return [i[4][0] for i in socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)]
+    except (OSError, UnicodeError):
+        return []
+
+
+def render_notify_allow(paths, resolver=None):
+    """(drop-in text or None, note). IPAddressAllow= for the addresses of notify.url's host, as IP literals only.
+
+    The unit edr-notify has IPAddressDeny=any and `localhost`; it cannot resolve and cannot be told where to go, so
+    root does: a name is resolved here and each answer is parsed with ipaddress and written as a literal. Loopback is
+    left out (localhost covers it), and so are link-local, multicast, unspecified and reserved answers: a hostile DNS
+    answer must not let the sandbox reach the metadata service or an internal service by way of the webhook's name."""
+    target, why = notify_target(paths)
+    if target is None:
+        return None, why
+    host, port = target
+    try:
+        answers = [str(ipaddress.ip_address(host))]
+    except ValueError:
+        answers = (resolver or resolve_host)(host, port)
+    out, dropped = [], 0
+    for a in answers:
+        try:
+            ip = ipaddress.ip_address(str(a).split("%")[0])
+        except ValueError:
+            dropped += 1
+            continue
+        if ip.version == 6 and ip.ipv4_mapped is not None:
+            ip = ip.ipv4_mapped
+        if ip.is_loopback:
+            continue
+        if ip.is_link_local or ip.is_multicast or ip.is_unspecified or ip.is_reserved:
+            dropped += 1
+            continue
+        if str(ip) not in out:
+            out.append(str(ip))
+    out = out[:NOTIFY_ADDRESSES_MAX]
+    if not out:
+        if ipaddress_is_loopback_host(host):
+            return None, ""
+        return None, "no usable address for the host of notify.url (%d answers refused or none)" % dropped if dropped else \
+            "the host of notify.url did not resolve: edr-notify cannot reach it until it does"
+    return "[Service]\nIPAddressAllow=\nIPAddressAllow=localhost %s\n" % " ".join(out), ""
+
+
+def ipaddress_is_loopback_host(host):
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return host == "localhost"
+
+
 # ---- everything --------------------------------------------------------------------------------------
 # relative path in the staging directory -> (mode)
 MODES = {"tetragon.tp.d": 0o600, "systemd": 0o644, "edr-agent": 0o600}
 
 
-def render_all(paths, cfg, template_dir=None):
-    """({relative path: text}, skipped, notes). Raises RenderError."""
+def render_all(paths, cfg, template_dir=None, resolver=None):
+    """({relative path: text}, skipped, notes). Raises RenderError.
+
+    resolver(host, port) -> [address] resolves the host of notify.url; None means the real resolver outside a dev run
+    (EDR_AGENT_ROOT set: names are not resolved at all, only IP literals count)."""
     template_dir = template_dir or paths.policy_templates
     policies, skipped, notes = render_policies(template_dir, cfg)
     files = {"tetragon.tp.d/" + n: t for n, t in policies.items()}
@@ -376,6 +488,13 @@ def render_all(paths, cfg, template_dir=None):
     if drop is not None:
         files["systemd/edr-agent.service.d/10-hub.conf"] = drop
     files["edr-agent/notify.min_severity"] = render_notify_severity(cfg)
+    if resolver is None and paths.dev:
+        resolver = lambda host, port: []                      # noqa: E731
+    allow, why = render_notify_allow(paths, resolver)
+    if allow is not None:
+        files["systemd/edr-notify.service.d/10-allow.conf"] = allow
+    elif why:
+        notes.append(why)
     return files, skipped, notes
 
 

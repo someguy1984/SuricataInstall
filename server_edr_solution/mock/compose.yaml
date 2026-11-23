@@ -3,6 +3,7 @@
 #   ./mock.sh up       build and start, then wait until both are healthy
 #   ./mock.sh test     smoke test (page on :80 and :443, PHP 8.5, hub reachable over the private network)
 #   ./mock.sh down     stop and remove (add --volumes to forget certificates)
+#   dist, install-hub, install-web, enroll, e2e, uninstall: the real installers (see README.md)
 #
 # Networks
 #   edr_vpc     10.77.0.0/24, internal: the "DigitalOcean VPC". No route out; only hub <-> web.
@@ -48,7 +49,7 @@ services:
       - ../..:/opt/SuricataInstall:ro
       - hub_tls:/etc/ssl/mock
     healthcheck:
-      test: ["CMD-SHELL", "systemctl is-active --quiet mock-hub-placeholder"]
+      test: ["CMD-SHELL", "systemctl is-active --quiet mock-hub-placeholder || systemctl is-active --quiet edr-hub"]
       interval: 5s
       timeout: 5s
       retries: 24

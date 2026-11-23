@@ -1,4 +1,4 @@
-"""Shared bits for the root-helper tests (agent 6): load an extension-less helper as a module,
+"""Shared bits for the root-helper tests: load an extension-less helper as a module,
 run it as `python3 -I`, and make temporary roots. Standard library only, no root needed."""
 
 import importlib.machinery

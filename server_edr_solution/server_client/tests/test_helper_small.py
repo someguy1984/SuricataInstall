@@ -3,6 +3,7 @@ A fake metadata service and a fake webhook run on 127.0.0.1 at ports of 18000 an
 
 import http.server
 import json
+import subprocess
 import os
 import socket
 import sys
@@ -167,6 +168,26 @@ class TestDropletId(TmpCase):
         self.run_id()
         self.assertEqual(self.out(), "12345678\n")
 
+    def test_it_writes_in_place_when_only_the_file_is_writable(self):
+        # the unit binds the one file read-write: the .tmp and the rename are impossible there
+        import test_helper_common as c
+        d = c.load_helper("edr-droplet-id")
+        self.put("/run/edr-droplet-id", "999\n", mode=0o640)
+        target = self.root + "/run/edr-droplet-id"
+        ino = os.stat(target).st_ino
+        orig = d.atomic_write
+        def refuse(*a, **k):
+            raise OSError(30, "Read-only file system")
+        d.atomic_write = refuse
+        try:
+            d.write_id(target, "12345678\n")
+        finally:
+            d.atomic_write = orig
+        with open(target) as fh:
+            self.assertEqual(fh.read(), "12345678\n")
+        self.assertEqual(os.stat(target).st_ino, ino)
+        self.assertEqual(os.stat(target).st_mode & 0o777, 0o640)
+
     def test_a_bad_stored_value_is_ignored(self):
         s = socket.socket()
         s.bind(("127.0.0.1", 0))
@@ -206,7 +227,16 @@ class TestNotify(TmpCase):
     def setUp(self):
         super().setUp()
         Hook.posts, Hook.status, Hook.redirect = [], 200, False
+        # edr-notify speaks https only: a throwaway certificate for 127.0.0.1, trusted through SSL_CERT_FILE
+        import ssl
+        self.cert = self.root + "/cert.pem"
+        subprocess.run(["openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes", "-days", "2",
+                        "-keyout", self.root + "/key.pem", "-out", self.cert, "-subj", "/CN=127.0.0.1",
+                        "-addext", "subjectAltName=IP:127.0.0.1"], check=True, capture_output=True)
         self.srv = http.server.HTTPServer(("127.0.0.1", 0), Hook)
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(self.cert, self.root + "/key.pem")
+        self.srv.socket = ctx.wrap_socket(self.srv.socket, server_side=True)
         self.port = self.srv.server_address[1]
         threading.Thread(target=self.srv.serve_forever, daemon=True).start()
         self.addCleanup(self.srv.server_close)
@@ -215,7 +245,7 @@ class TestNotify(TmpCase):
         self.state = self.root + "/state"
         os.makedirs(self.cred)
         os.makedirs(self.state)
-        self.url("http://127.0.0.1:%d/hook" % self.port)
+        self.url("https://127.0.0.1:%d/hook" % self.port)
         self.min("HIGH")
 
     def url(self, text):
@@ -231,7 +261,7 @@ class TestNotify(TmpCase):
             fh.write("\n".join(lines) + "\n")
 
     def notify(self, *extra):
-        return run_helper("edr-notify", ["--cred-dir", self.cred, "--state-dir", self.state] + list(extra))
+        return run_helper("edr-notify", ["--cred-dir", self.cred, "--state-dir", self.state] + list(extra), env={"SSL_CERT_FILE": self.cert})
 
     def sent(self):
         return [json.loads(b) for _, b in Hook.posts]
@@ -289,7 +319,7 @@ class TestNotify(TmpCase):
         self.assertFalse(self.sent()[0]["unfurl_links"])
 
     def test_ntfy_publishes_json_to_the_root_with_a_fixed_title(self):
-        self.url("ntfy+http://127.0.0.1:%d/mytopic" % self.port)
+        self.url("ntfy+https://127.0.0.1:%d/mytopic" % self.port)
         self.alerts(alert(1, "CRITICAL", "danger `x`"))
         self.notify()
         path, body = Hook.posts[0]

@@ -53,7 +53,7 @@ def is_private_or_cgnat(ip):
 
 def parse_clf_time(text):
     """Epoch milliseconds from an nginx $time_local such as 10/Oct/2000:13:55:36 +0000, or None."""
-    m = re.match(r"^(\d{1,2})/([A-Z][a-z]{2})/(\d{4}):(\d\d):(\d\d):(\d\d) ([+-])(\d\d)(\d\d)$", text)
+    m = re.match(r"^(\d{1,2})/([A-Z][a-z]{2})/(\d{4}):(\d\d):(\d\d):(\d\d) ([+-])(\d\d)(\d\d)\Z", text)
     if not m:
         return None
     d, mon, y, h, mi, s, sign, zh, zm = m.groups()
@@ -89,6 +89,16 @@ class AccessRing:
         q = self.q
         while q and q[0][0] < limit:
             q.popleft()
+
+    def has(self, ip, now):
+        """True when a request from this address is in the ring and inside its window."""
+        limit = now - self.minutes * 60
+        for row in reversed(self.q):
+            if row[0] < limit:
+                continue                    # the ring is only roughly ordered by time: look at all of it
+            if row[1] == ip:
+                return True
+        return False
 
     def entries_for(self, ip, limit=20):
         """Up to `limit` newest entries for one address, oldest first, as plain dicts."""
@@ -163,6 +173,7 @@ class Context:
         self.counters = collections.Counter()
         self.proxy_reasons = []
         self.log_format_ok = None            # True/False once the access log has been seen
+        self.access_usable = None            # False when the access log cannot vouch for an address (unreadable, wrong format)
         self._uids = (0.0, set())
         self._pid = (0.0, None)
         self.eve_flow_context = collections.OrderedDict()   # community_id -> {sni, ja4, hassh}

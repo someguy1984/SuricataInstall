@@ -27,7 +27,7 @@ def text_of(pem):
 class PkiBase(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.tmp = tempfile.mkdtemp(prefix="edr-pki-test-", dir=F.SCRATCH)
+        cls.tmp = F.make_tmp("hubpki-")
         cls.paths = hub_common.Paths(state_dir=os.path.join(cls.tmp, "state"), run_dir=os.path.join(cls.tmp, "run"),
                                      etc_dir=os.path.join(cls.tmp, "etc"))
         os.makedirs(cls.paths.state_dir)

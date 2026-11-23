@@ -3,6 +3,10 @@
 # credential copy, whose inode is new at every start; the sender keeps the id of the last alert
 # it sent in its StateDirectory. It cannot read local.conf, so apply-config renders min_severity
 # into /etc/edr-agent/notify.min_severity (root 0600), loaded as a second credential.
+# The sandbox keeps IPAddressDeny=any. The only addresses it may reach besides localhost (the resolver stub) are
+# the ones `edr-agent apply-config` resolved, as root, for the host of notify.url and wrote into the drop-in
+# /etc/systemd/system/edr-notify.service.d/10-allow.conf (IP literals only, none for a link-local, multicast or
+# unspecified address). It is rendered again on every apply-config: run it after the webhook's addresses change.
 [Unit]
 Description=Send local alerts to ntfy or a webhook
 ConditionPathExists=/etc/edr-agent/notify.url
@@ -20,7 +24,7 @@ StateDirectoryMode=0700
 CapabilityBoundingSet=
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 IPAddressDeny=any
-# apply-config writes the webhook addresses into a drop-in; localhost is the resolver stub
+# 10-allow.conf (apply-config) adds the webhook addresses; localhost is the resolver stub
 IPAddressAllow=localhost
 ProtectHome=yes
 SystemCallFilter=@system-service

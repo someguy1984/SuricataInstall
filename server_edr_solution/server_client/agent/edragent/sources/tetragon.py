@@ -39,10 +39,10 @@ BUILTIN_IGNORE = [
 ]
 APT_PARENTS = ("/usr/bin/dpkg", "/usr/bin/apt", "/usr/bin/apt-get", "/usr/bin/unattended-upgrade",
                "/usr/sbin/needrestart", "/usr/bin/needrestart", "/usr/lib/apt/", "/usr/bin/aptitude")
-_HELPER_ARGS = re.compile(r"^-I /usr/local/lib/edr-agent/edr-[a-z-]+( .*)?$")
-_HELPER_PYTHON = re.compile(r"^/usr/bin/python3(\.\d+)?$")
+_HELPER_ARGS = re.compile(r"^-I /usr/local/lib/edr-agent/edr-[a-z-]+( .*)?\Z")
+_HELPER_PYTHON = re.compile(r"^/usr/bin/python3(\.\d+)?\Z")
 _SYSTEMD = ("/usr/lib/systemd/systemd", "/lib/systemd/systemd", "/sbin/init", "/usr/sbin/init")
-_COMPILED_VIEW = re.compile(r"^([0-9a-f]{32}|[0-9a-f]{40})\.php$")
+_COMPILED_VIEW = re.compile(r"^([0-9a-f]{32}|[0-9a-f]{40})\.php\Z")
 _KPROBE_LIKE = ("process_kprobe", "process_tracepoint", "process_uprobe", "process_lsm")
 
 
@@ -329,7 +329,7 @@ class TetragonSource(Source):
 
     def _policy_specific(self, policy, sev, binary, path):
         if policy == "web-write-code" and path:
-            m = re.search(r"/(?:storage/framework/views|bootstrap/cache)/([^/]+)$", path)
+            m = re.search(r"/(?:storage/framework/views|bootstrap/cache)/([^/]+)\Z", path)
             if m and _COMPILED_VIEW.match(m.group(1)) and "php-fpm" in str(binary):
                 return "LOW"                 # Laravel's compiled views are written by php-fpm itself
         if policy == "env-read":
