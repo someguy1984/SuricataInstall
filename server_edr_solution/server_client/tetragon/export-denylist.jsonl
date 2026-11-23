@@ -1,0 +1,24 @@
+# Server export denylist (client PLAN section 4.3, Volume control). Events matching any line below
+# are NOT written to tetragon.log. Within a line, all fields must match (AND); separate lines are
+# alternatives (OR). Lines starting with # are ignored by the installer.
+#
+# Rules for adding a line, so that this list cannot be used to hide from the log:
+#   - always include "event_set": ["PROCESS_EXEC"] (or another event type), unless the line names
+#     one policy. A line without it also drops that process's policy hits.
+#   - anchor every regex at both ends (^...$). Arguments are whatever the process was started
+#     with, so never match on arguments alone: tie them to a root-owned parent (parent_binary_regex).
+#   - a path is the path the process sees. These lines can at worst hide that a program STARTED;
+#     they never hide what it then does, because every policy hit is still logged.
+#
+# Process exits: every exec already logs the process; exits double the volume.
+{"event_set": ["PROCESS_EXIT"]}
+#
+# The kit's own timers: systemd starts "python3 -I /usr/local/lib/edr-agent/edr-<helper>" every
+# 15 seconds to every few minutes. Each helper is matched by its whole command line and only
+# when systemd (root-owned) started it.
+{"event_set": ["PROCESS_EXEC"], "binary_regex": ["^/usr/bin/python3(\\.[0-9]+)?$"], "arguments_regex": ["^-I /usr/local/lib/edr-agent/edr-(dns-watch|bans|diskguard|policy-check|home-net|inventory|droplet-id|notify)( [a-z-]+)?$"], "parent_binary_regex": ["^/usr/lib/systemd/systemd$"]}
+#
+# The firewall load edr-bans and edr-dns-watch run: "nft -c -f -" then "nft -f -", started by
+# the helper's own interpreter. Nothing else is matched: the arguments are whole and the
+# parent is the python3 binary the unit started.
+{"event_set": ["PROCESS_EXEC"], "binary_regex": ["^/usr/sbin/nft$"], "arguments_regex": ["^(-c )?-f -$", "^-t -j list counters table inet edr$"], "parent_binary_regex": ["^/usr/bin/python3(\\.[0-9]+)?$"]}

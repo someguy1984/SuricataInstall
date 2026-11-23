@@ -1,0 +1,12 @@
+# PathModified= fires on plain writes to alerts.jsonl. TriggerLimitIntervalSec=0 so a burst of alerts
+# does not trip the path unit's own rate limit; the sender sends each alert once by its id.
+[Unit]
+Description=Send local alerts when alerts.jsonl changes
+
+[Path]
+PathModified=/var/lib/edr-agent/alerts.jsonl
+TriggerLimitIntervalSec=0
+Unit=edr-notify.service
+
+[Install]
+WantedBy=multi-user.target

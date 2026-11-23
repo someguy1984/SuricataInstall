@@ -1,0 +1,8 @@
+# Hub server certificate profile. EC P-256, 397 days.
+# The hub appends one subjectAltName line (every hub IP as IP:) to a private copy of this file
+# before it signs. A server certificate without IP SANs is never issued.
+basicConstraints = critical,CA:FALSE
+keyUsage = critical,digitalSignature
+extendedKeyUsage = serverAuth
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid:always

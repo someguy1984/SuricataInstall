@@ -1,0 +1,39 @@
+# Keeps Suricata's HOME_NET equal to this machine's addresses (client PLAN section 4.1). Also run
+# by the Suricata unit drop-in before each Suricata start, with --no-reload.
+[Unit]
+Description=Set Suricata's HOME_NET to this machine's own addresses
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I /usr/local/lib/edr-agent/edr-home-net
+User=root
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+IPAddressDeny=any
+ProtectHome=yes
+SystemCallFilter=@system-service
+ReadWritePaths=/etc/suricata
+MemoryMax=64M
+Nice=19
+IOSchedulingClass=idle
+TimeoutStartSec=60
+TasksMax=32
+NoNewPrivileges=yes
+ProtectSystem=strict
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+LimitCORE=0
+LogNamespace=edr

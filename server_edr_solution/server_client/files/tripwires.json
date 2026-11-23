@@ -1,0 +1,20 @@
+{
+  "v": 1,
+  "note": "Request paths that only a scanner asks for (client PLAN section 4.5). A hit answered 404, 403 or 444 is ban evidence; a 2xx answer means the site serves the path: a HIGH alert and no ban. A path ending in / is a prefix, one with * is a glob, anything else matches the path and what is below it. ban false: alert only until the owner confirms the path is unused. unless_file: the entry is skipped when a discovered web root holds that file. Edit this file freely: an upgrade writes the shipped copy beside it as tripwires.json.new.",
+  "tripwires": [
+    {"path": "/_ignition/execute-solution"},
+    {"path": "/_ignition/health-check"},
+    {"path": "/vendor/phpunit/*/eval-stdin.php"},
+    {"path": "/.env"},
+    {"path": "/.env.bak"},
+    {"path": "/.git/"},
+    {"path": "/storage/logs/"},
+    {"path": "/xmlrpc.php"},
+    {"path": "/phpmyadmin"},
+    {"path": "/cgi-bin/"},
+    {"path": "/wp-login.php", "unless_file": "wp-config.php"},
+    {"path": "/telescope", "ban": false},
+    {"path": "/horizon", "ban": false},
+    {"path": "/_debugbar", "ban": false}
+  ]
+}

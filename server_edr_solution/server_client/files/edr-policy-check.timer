@@ -1,0 +1,11 @@
+[Unit]
+Description=Check the Tetragon policy set every 2 minutes
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=2min
+AccuracySec=10s
+Unit=edr-policy-check.service
+
+[Install]
+WantedBy=timers.target

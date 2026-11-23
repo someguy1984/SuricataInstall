@@ -1,0 +1,12 @@
+# A stale HOME_NET silently disables every "-> $HOME_NET" and outbound C2 rule, so it is re-checked
+# every 15 minutes; the rules are reloaded (through the memory guard) only when the value changed.
+[Unit]
+Description=Re-check Suricata's HOME_NET every 15 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=15min
+Unit=edr-home-net.service
+
+[Install]
+WantedBy=timers.target

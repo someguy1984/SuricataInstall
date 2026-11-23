@@ -1,0 +1,46 @@
+# Are the Tetragon policies loaded and in the right mode, and does enforcement work? (client PLAN
+# section 4.3). Root oneshot. setpriv (for the canary, run as the web user) needs CAP_SETUID and
+# CAP_SETGID; tetra talks to Tetragon over its unix socket. It never touches the site.
+[Unit]
+Description=Check the Tetragon policy set, promote gated policies, run the canary
+After=tetragon.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I /usr/local/lib/edr-agent/edr-policy-check
+User=root
+Group=edr-agent
+UMask=0027
+CapabilityBoundingSet=CAP_SETUID CAP_SETGID
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+IPAddressDeny=any
+ProtectHome=yes
+SystemCallFilter=@system-service
+RuntimeDirectory=edr-policy-check
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+StateDirectory=edr-policy-check
+StateDirectoryMode=0700
+Nice=19
+IOSchedulingClass=idle
+TimeoutStartSec=60
+MemoryMax=64M
+TasksMax=64
+NoNewPrivileges=yes
+ProtectSystem=strict
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+LimitCORE=0
+LogNamespace=edr

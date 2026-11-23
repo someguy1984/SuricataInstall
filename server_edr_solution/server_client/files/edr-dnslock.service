@@ -1,0 +1,51 @@
+# Loads the DNS lock (table inet edr_dns) at boot (client PLAN section 4.4). It loads nothing while
+# /etc/edr-agent/pause.json is valid; a failed or timed-out load leaves the box unlocked and
+# writes the state "open". No unit Requires= this one, and the website never waits for it.
+[Unit]
+Description=Load the DNS lock (table inet edr_dns)
+After=nftables.service dnscrypt-proxy.socket
+Before=network-pre.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/python3 -I /usr/local/lib/edr-agent/edr-dns-watch boot
+# The lock is removed by the pause, by edr-dns-watch and by break-glass, not by stopping this unit
+TimeoutStartSec=10
+User=root
+Group=edr-agent
+UMask=0027
+LogNamespace=edr
+Nice=10
+CapabilityBoundingSet=CAP_NET_ADMIN
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+RestrictAddressFamilies=AF_NETLINK AF_UNIX
+IPAddressDeny=any
+RuntimeDirectory=edr-dns-watch
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+StateDirectory=edr-dns-watch
+StateDirectoryMode=0700
+MemoryMax=64M
+TasksMax=32
+LimitCORE=0
+
+[Install]
+WantedBy=multi-user.target

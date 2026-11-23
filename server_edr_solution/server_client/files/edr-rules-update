@@ -1,0 +1,110 @@
+#!/bin/bash
+# The server's daily Suricata rule update (client PLAN section 4.1, Rule update). Run by
+# edr-rules-update.service:
+#   guard   ExecCondition: skip the run (exit 1) when memory is short; a live reload builds a second
+#           engine (about 800 MB at 41k rules, an estimate), so MemAvailable must be at least the
+#           larger of 700 MB and 1.5 times Suricata's RSS. Three skipped days in a row are logged
+#           as rules_stale and written to edr-rules-status.json (the agent raises
+#           health.rules_stale, MEDIUM).
+#   run     suricata-update into a candidate directory, `suricata -T` on the candidate under
+#           systemd-run -p MemoryMax=900M (if that is killed, the candidate is rejected and the
+#           old rules stay), then the candidate replaces the live rules and edr-ban-sids.txt is
+#           written (the sids of rules that drop.conf turned into drop, root:suricata 0640)
+#   apply   ExecStartPost (outside the sandbox): reload Suricata's rules, or restart it on a host
+#           under 4 GB (a reload would need a second engine), blind for one cold load
+# The test uses a private copy of the config and its own log directory: a second Suricata on the
+# live config can remove the running one's control socket.
+# EDR_RULES_DIR and EDR_STATE_DIR move the two directories (tests).
+set -euo pipefail
+
+RULES=${EDR_RULES_DIR:-/var/lib/suricata/rules}
+STATE=${EDR_STATE_DIR:-/var/lib/suricata}
+CONF=${EDR_SURICATA_CONF:-/etc/suricata/suricata.yaml}
+MIN_AVAIL_KB=$((700 * 1024))
+SMALL_HOST_KB=$((4 * 1024 * 1024))
+
+log() { echo "edr-rules-update: $*"; logger -t edr-rules-update -- "$*" 2>/dev/null || true; }
+
+meminfo() { awk -v k="$1:" '$1 == k { print $2 }' /proc/meminfo; }
+
+suricata_rss_kb() {
+    local pid
+    pid=$(cat /run/suricata.pid 2>/dev/null || true)
+    [[ $pid =~ ^[0-9]+$ ]] || { echo 0; return; }
+    awk '$1 == "VmRSS:" { print $2 }' "/proc/$pid/status" 2>/dev/null || echo 0
+}
+
+status() { # ok message skipped
+    local tmp="$RULES/edr-rules-status.json.new"
+    printf '{"written_at": %d, "ok": %s, "skipped_days": %d, "message": "%s"}\n' "$(date +%s)" "$1" "$3" "$2" >"$tmp"
+    chmod 0640 "$tmp"
+    chgrp suricata "$tmp" 2>/dev/null || true
+    mv -f "$tmp" "$RULES/edr-rules-status.json"
+}
+
+skipped_days() { cat "$STATE/edr-rules-skipped" 2>/dev/null || echo 0; }
+
+guard() {
+    local avail rss need n
+    avail=$(meminfo MemAvailable)
+    rss=$(suricata_rss_kb)
+    need=$((rss * 3 / 2))
+    [[ $need -ge $MIN_AVAIL_KB ]] || need=$MIN_AVAIL_KB
+    if [[ ${avail:-0} -ge $need ]]; then
+        echo 0 >"$STATE/edr-rules-skipped"
+        exit 0
+    fi
+    n=$(($(skipped_days) + 1))
+    echo "$n" >"$STATE/edr-rules-skipped"
+    log "skipped: MemAvailable ${avail:-0} kB is below $need kB (skipped day $n)"
+    if [[ $n -ge 3 ]]; then
+        log "rules_stale: the rules were not updated for $n days"
+        status false "rules_stale: memory too short for $n days" "$n"
+    fi
+    exit 1
+}
+
+run() {
+    local cand
+    cand=$(mktemp -d "$STATE/rules.candidate.XXXXXX")
+    # shellcheck disable=SC2064
+    trap "rm -rf '$cand'" EXIT
+    mkdir -p "$cand/log"
+    suricata-update --no-reload --no-test --output "$cand"
+    [[ -s $cand/suricata.rules ]] || { log "suricata-update produced no rules: the old rules stay"; status false "no rules produced" "$(skipped_days)"; exit 1; }
+    cp "$CONF" "$cand/suricata.yaml"
+    if ! systemd-run --quiet --wait --pipe --collect -p MemoryMax=900M -p Nice=19 -p IOSchedulingClass=idle \
+        /usr/bin/suricata -T -c "$cand/suricata.yaml" -S "$cand/suricata.rules" -l "$cand/log"; then
+        log "the candidate rules failed the test (or were killed at 900 MB): the old rules stay"
+        status false "candidate rejected" "$(skipped_days)"
+        exit 1
+    fi
+    install -m 0640 -g suricata "$cand/suricata.rules" "$RULES/suricata.rules.new"
+    mv -f "$RULES/suricata.rules.new" "$RULES/suricata.rules"
+    # the sids of rules that were converted to drop: the agent bans on these (alert.action is "allowed" in IDS mode)
+    grep -oP "^drop .*sid:\K[0-9]+" "$RULES/suricata.rules" | sort -un >"$RULES/edr-ban-sids.txt.new" || true
+    chmod 0640 "$RULES/edr-ban-sids.txt.new"
+    chgrp suricata "$RULES/edr-ban-sids.txt.new" 2>/dev/null || true
+    mv -f "$RULES/edr-ban-sids.txt.new" "$RULES/edr-ban-sids.txt"
+    status true "rules updated" 0
+    log "rules updated"
+}
+
+apply() {
+    local total
+    systemctl is-active --quiet suricata.service || { log "suricata is not running: nothing to reload"; return 0; }
+    total=$(meminfo MemTotal)
+    if [[ ${total:-0} -lt $SMALL_HOST_KB ]]; then
+        log "under 4 GB: restarting suricata (a reload needs a second engine)"
+        systemctl restart suricata.service
+    else
+        systemctl reload suricata.service
+    fi
+}
+
+case ${1:-} in
+    guard) guard ;;
+    run) run ;;
+    apply) apply ;;
+    *) echo "Usage: $0 guard|run|apply" >&2; exit 64 ;;
+esac

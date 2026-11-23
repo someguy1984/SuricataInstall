@@ -1,0 +1,43 @@
+# Server policy, log only: a .env file opened by anything but php-fpm and the php CLI
+# (client PLAN section 4.3). nginx opening one is the first selector, so the agent can rate it
+# HIGH by its binary. No rateLimit.
+#
+# Placeholders: @NGINX_BIN@, @PHPFPM_BIN@, @PHP_CLI_BIN@ (both spellings of each).
+# The root helpers read .env as text (edr-inventory); they run as "python3 -I <helper>", so the
+# agent drops those events by their arguments: this policy cannot exclude a script by path.
+# The path is matched as a suffix, so a copy of .env under any name ending "/.env" is seen.
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "env-read"
+spec:
+  kprobes:
+  - call: "security_file_open"
+    syscall: false
+    message: "A .env file was opened"
+    args:
+    - index: 0
+      type: "file"
+    selectors:
+    - matchBinaries:
+      - operator: "In"
+        values:
+        - "@NGINX_BIN@"
+        - "@NGINX_BIN@ (deleted)"
+      matchArgs:
+      - index: 0
+        operator: "Postfix"
+        values:
+        - "/.env"
+    - matchBinaries:
+      - operator: "NotIn"
+        values:
+        - "@PHPFPM_BIN@"
+        - "@PHPFPM_BIN@ (deleted)"
+        - "@PHP_CLI_BIN@"
+        - "@PHP_CLI_BIN@ (deleted)"
+      matchArgs:
+      - index: 0
+        operator: "Postfix"
+        values:
+        - "/.env"

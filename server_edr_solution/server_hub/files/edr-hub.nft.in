@@ -1,0 +1,53 @@
+# edr-hub firewall table: template. Render it with files/render-nft.sh; the installer writes the result to
+# /etc/edr-hub/edr-hub.nft and loads it with `nft -c -f` then `nft -f` (hub PLAN section 8, steps 5 and 10).
+#
+# Placeholders (render-nft.sh fills every one; nothing else in this file changes):
+#   @PORT@              fleet port (settings.json "port", default 8443)
+#   @ENROLL_PORT@       enrollment port (settings.json "enroll_port", default 8444)
+#   @SSH_PORT@          the sshd port, from `sshd -T` (default 22)
+#   @ADMIN4_ELEMENTS@   the whole `elements = { a, b }` clause of set admin4, or nothing when there is no IPv4 admin address
+#   @ADMIN6_ELEMENTS@   the same for set admin6
+#   @HUB_USER@          the ingest user whose new outbound connections are dropped (default edr-hub)
+# The block between "BEGIN ssh-admin" and "END ssh-admin" lines is replaced by the single line
+# `tcp dport @SSH_PORT@ accept` when there is no admin address at all (SSH is then open to everyone, and the installer
+# warned about it).
+#
+# The file begins with `table` and `delete table` so that loading it again (a re-run, an upgrade, the boot unit)
+# replaces the table instead of adding every rule a second time. The input chain has policy drop: every accept the
+# hub needs is below. A drop in UFW or a cloud firewall still wins over an accept here.
+# nd-router-advert is not accepted: DigitalOcean configures the interface statically. Add it if your host uses SLAAC.
+table inet edr_hub
+delete table inet edr_hub
+
+table inet edr_hub {
+    set admin4 { type ipv4_addr; flags interval; auto-merge; @ADMIN4_ELEMENTS@ }
+    set admin6 { type ipv6_addr; flags interval; auto-merge; @ADMIN6_ELEMENTS@ }
+    # Per-source new-connection meters (IPv6 per /64): about 5 SYN a second, burst 10, before any slot is used
+    set synmeter4 { type ipv4_addr; flags dynamic,timeout; timeout 1m; size 65536; }
+    set synmeter6 { type ipv6_addr; flags dynamic,timeout; timeout 1m; size 65536; }
+
+    chain input {
+        type filter hook input priority -10; policy drop;
+        iif lo accept
+        ct state invalid drop
+        ct state established,related accept
+        icmp type { destination-unreachable, time-exceeded, parameter-problem } accept
+        icmpv6 type { destination-unreachable, packet-too-big, time-exceeded, parameter-problem, nd-neighbor-solicit, nd-neighbor-advert } accept
+        icmp type echo-request limit rate 5/second accept
+        icmpv6 type echo-request limit rate 5/second accept
+        udp sport 67 udp dport 68 accept
+        # BEGIN ssh-admin
+        ip saddr @admin4 tcp dport @SSH_PORT@ accept
+        ip6 saddr @admin6 tcp dport @SSH_PORT@ accept
+        # END ssh-admin
+        tcp dport { @PORT@, @ENROLL_PORT@ } tcp flags & (syn | ack) == syn meta nfproto ipv4 add @synmeter4 { ip saddr limit rate over 5/second burst 10 packets } counter drop
+        tcp dport { @PORT@, @ENROLL_PORT@ } tcp flags & (syn | ack) == syn meta nfproto ipv6 add @synmeter6 { ip6 saddr & ffff:ffff:ffff:ffff:: limit rate over 5/second burst 10 packets } counter drop
+        tcp dport { @PORT@, @ENROLL_PORT@ } accept
+    }
+
+    chain output {
+        type filter hook output priority 0; policy accept;
+        # The ingest user parses internet input: it must not start outbound connections. Replies to clients pass.
+        meta skuid "@HUB_USER@" ct state new drop
+    }
+}

@@ -1,0 +1,163 @@
+# Server policy, log only: code written, renamed or linked by the web tree, and a .php file
+# created anywhere in /tmp, /var/tmp or /dev/shm (client PLAN section 4.3). Not a syscall hook, so
+# io_uring is covered. .htaccess is not watched (nginx ignores it).
+#
+# Placeholders: @NGINX_BIN@, @PHPFPM_BIN@ (both spellings; the processes are followed with
+# followChildren, so php-fpm must be restarted after the policy loads).
+#
+# The web roots are not a filter here: a PHP process writing a code file anywhere is the signal.
+# Laravel's compiled views are code written by php-fpm under storage/framework/views and
+# bootstrap/cache: the agent downgrades a name that matches ^([0-9a-f]{32}|[0-9a-f]{40})\.php$
+# and alerts on any other .php there. That keeps the policy within Tetragon's 8 prefix and
+# postfix lists. No rateLimit: this policy never drops a hit.
+#
+# security_file_open: argument 0 is the file, argument 1 its f_mode (FMODE_WRITE is 2).
+# The rename, link and symlink hooks see a directory and a name: the name is matched.
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "web-write-code"
+spec:
+  kprobes:
+  - call: "security_file_open"
+    syscall: false
+    message: "A code file was opened for writing"
+    args:
+    - index: 0
+      type: "file"
+    - index: 0
+      type: "uint32"
+      resolve: "f_mode"
+    selectors:
+    - matchBinaries:
+      - operator: "In"
+        followChildren: true
+        values:
+        - "@PHPFPM_BIN@"
+        - "@PHPFPM_BIN@ (deleted)"
+        - "@NGINX_BIN@"
+        - "@NGINX_BIN@ (deleted)"
+      matchArgs:
+      - args: [0]
+        operator: "Postfix"
+        values:
+        - ".php"
+        - ".phtml"
+        - ".pht"
+        - ".php5"
+        - ".phar"
+        - ".user.ini"
+      - args: [1]
+        operator: "Mask"
+        values:
+        - "2"
+    - matchArgs:
+      - args: [0]
+        operator: "Prefix"
+        values:
+        - "/tmp/"
+        - "/var/tmp/"
+        - "/dev/shm/"
+      - args: [1]
+        operator: "Mask"
+        values:
+        - "2"
+      - args: [0]
+        operator: "Postfix"
+        values:
+        - ".php"
+  - call: "security_path_rename"
+    syscall: false
+    message: "A file was renamed to a code file name"
+    args:
+    - index: 0
+      type: "path"
+    - index: 1
+      type: "string"
+      resolve: "d_name.name"
+    - index: 2
+      type: "path"
+    - index: 3
+      type: "string"
+      resolve: "d_name.name"
+      label: "to"
+    selectors:
+    - matchBinaries:
+      - operator: "In"
+        followChildren: true
+        values:
+        - "@PHPFPM_BIN@"
+        - "@PHPFPM_BIN@ (deleted)"
+        - "@NGINX_BIN@"
+        - "@NGINX_BIN@ (deleted)"
+      matchArgs:
+      - args: [3]
+        operator: "Postfix"
+        values:
+        - ".php"
+        - ".phtml"
+        - ".pht"
+        - ".php5"
+        - ".phar"
+        - ".user.ini"
+  - call: "security_path_link"
+    syscall: false
+    message: "A hard link was made with a code file name"
+    args:
+    - index: 1
+      type: "path"
+    - index: 2
+      type: "string"
+      resolve: "d_name.name"
+      label: "link"
+    selectors:
+    - matchBinaries:
+      - operator: "In"
+        followChildren: true
+        values:
+        - "@PHPFPM_BIN@"
+        - "@PHPFPM_BIN@ (deleted)"
+        - "@NGINX_BIN@"
+        - "@NGINX_BIN@ (deleted)"
+      matchArgs:
+      - args: [1]
+        operator: "Postfix"
+        values:
+        - ".php"
+        - ".phtml"
+        - ".pht"
+        - ".php5"
+        - ".phar"
+        - ".user.ini"
+  - call: "security_path_symlink"
+    syscall: false
+    message: "A symlink was made with a code file name"
+    args:
+    - index: 0
+      type: "path"
+    - index: 1
+      type: "string"
+      resolve: "d_name.name"
+      label: "link"
+    - index: 2
+      type: "string"
+      label: "target"
+    selectors:
+    - matchBinaries:
+      - operator: "In"
+        followChildren: true
+        values:
+        - "@PHPFPM_BIN@"
+        - "@PHPFPM_BIN@ (deleted)"
+        - "@NGINX_BIN@"
+        - "@NGINX_BIN@ (deleted)"
+      matchArgs:
+      - args: [1]
+        operator: "Postfix"
+        values:
+        - ".php"
+        - ".phtml"
+        - ".pht"
+        - ".php5"
+        - ".phar"
+        - ".user.ini"

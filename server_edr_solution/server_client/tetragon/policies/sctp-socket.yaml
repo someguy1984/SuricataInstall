@@ -1,0 +1,97 @@
+# Server policy: any SCTP socket by anything but host root is killed once this policy is in
+# enforce mode (client PLAN section 4.3). NGINX2Root's last step is an SCTP socket opened by a
+# worker. Host root (host user namespace AND CAP_SYS_ADMIN) is only logged; a root process in a
+# new user namespace is killed too (matchCapabilities ignores the user namespace, so the
+# namespace test is part of the first two selectors).
+#
+# security_socket_create(int family, int type, int protocol, int kern): arguments 0 to 2 are int.
+# The hook sees the type with SOCK_NONBLOCK and SOCK_CLOEXEC masked and fires before the module
+# autoload. SEQPACKET (type 5) with protocol 0 is SCTP only where the module is registered, so
+# where it is blocked (modprobe.d) protocol 132 is the form that matters.
+#
+# Mode: installed in "monitor"; edr-policy-check promotes it after its gate (PLAN section 4.3).
+# No rateLimit: the killing policies must never drop a hit.
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "sctp-socket"
+spec:
+  options:
+  - name: "policy-mode"
+    value: "monitor"
+  kprobes:
+  - call: "security_socket_create"
+    syscall: false
+    message: "An SCTP socket was created"
+    args:
+    - index: 0
+      type: "int"
+    - index: 1
+      type: "int"
+    - index: 2
+      type: "int"
+    selectors:
+    # 1, 2: host root, logged only
+    - matchNamespaces:
+      - namespace: User
+        operator: In
+        values:
+        - "host_ns"
+      matchCapabilities:
+      - type: Effective
+        operator: In
+        values:
+        - "CAP_SYS_ADMIN"
+      matchArgs:
+      - index: 2
+        operator: "Equal"
+        values:
+        - "132"
+    - matchNamespaces:
+      - namespace: User
+        operator: In
+        values:
+        - "host_ns"
+      matchCapabilities:
+      - type: Effective
+        operator: In
+        values:
+        - "CAP_SYS_ADMIN"
+      matchArgs:
+      - index: 0
+        operator: "Equal"
+        values:
+        - "2"
+        - "10"
+      - index: 1
+        operator: "Equal"
+        values:
+        - "5"
+      - index: 2
+        operator: "Equal"
+        values:
+        - "0"
+    # 3, 4: the same two forms with no namespace or capability filter: everyone else
+    - matchArgs:
+      - index: 2
+        operator: "Equal"
+        values:
+        - "132"
+      matchActions:
+      - action: Sigkill
+    - matchArgs:
+      - index: 0
+        operator: "Equal"
+        values:
+        - "2"
+        - "10"
+      - index: 1
+        operator: "Equal"
+        values:
+        - "5"
+      - index: 2
+        operator: "Equal"
+        values:
+        - "0"
+      matchActions:
+      - action: Sigkill

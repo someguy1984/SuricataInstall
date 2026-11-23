@@ -1,0 +1,28 @@
+# Server policy, always enforcing: the enforcement canary (client PLAN section 4.3). /usr/libexec/edr/canary
+# is a copy of /bin/dash. When it runs "exec /bin/true", the kernel hook sees an exec by the
+# canary binary and Sigkill ends it, which proves that enforcement works on this kernel.
+# It matches only the canary, so it cannot touch the site, and a pause does not switch it to
+# monitor mode. check.sh --live and edr-policy-check run it as the web user (nobody without a web
+# user) and require death by SIGKILL plus an event; the kill of the canary is rated INFO.
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "edr-canary"
+spec:
+  options:
+  - name: "policy-mode"
+    value: "enforce"
+  kprobes:
+  - call: "security_bprm_check"
+    syscall: false
+    message: "The enforcement canary ran an exec and was killed"
+    args:
+    - index: 0
+      type: "linux_binprm"
+    selectors:
+    - matchBinaries:
+      - operator: "In"
+        values:
+        - "/usr/libexec/edr/canary"
+      matchActions:
+      - action: Sigkill

@@ -1,0 +1,13 @@
+# Every 15 s, after a 90 s grace at boot: the proxy starts on its first query, and the grace avoids a
+# false FAILOPEN. AccuracySec is set because the default of 1 minute would blur the 15 s cadence.
+[Unit]
+Description=Probe the DoH proxy every 15 seconds
+
+[Timer]
+OnBootSec=90
+OnUnitActiveSec=15s
+AccuracySec=1s
+Unit=edr-dns-watch.service
+
+[Install]
+WantedBy=timers.target

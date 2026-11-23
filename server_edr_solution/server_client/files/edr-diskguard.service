@@ -1,0 +1,49 @@
+# Keeps the kit's logs and caches from filling the site's disk (client PLAN section 9). Root
+# oneshot every 2 minutes. It deletes and truncates only regular files that the kit owns, by name
+# under a directory descriptor, and never restarts Suricata. The "-" in ReadWritePaths keeps the
+# unit starting with --no-suricata or --no-tetragon; the installer adds a drop-in with
+# ReadWritePaths=-/var/log/nginx only when [agent] nginx_info_log = on.
+[Unit]
+Description=Keep the kit's logs and caches within their size caps
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I /usr/local/lib/edr-agent/edr-diskguard
+User=root
+Group=edr-agent
+UMask=0027
+CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_CHOWN CAP_FOWNER CAP_KILL CAP_SETUID CAP_SETGID
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+ProtectHome=yes
+SystemCallFilter=@system-service
+ReadWritePaths=-/var/log/suricata -/var/log/tetragon -/var/lib/suricata/cache
+StateDirectory=edr-diskguard
+StateDirectoryMode=0700
+RuntimeDirectory=edr-diskguard
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+MemoryMax=64M
+Nice=19
+IOSchedulingClass=idle
+TimeoutStartSec=90
+TasksMax=64
+NoNewPrivileges=yes
+ProtectSystem=strict
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+LimitCORE=0
+LogNamespace=edr

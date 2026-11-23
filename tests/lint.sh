@@ -15,6 +15,10 @@ for arg in "$@"; do
     if [[ $arg == -- ]]; then in_py=1; elif [[ $in_py -eq 1 ]]; then py_files+=("$arg"); else sh_files+=("$arg"); fi
 done
 
+# One string per list: "printf ... | grep -q" under pipefail reports a false miss when grep quits before printf has finished
+sh_list=$(printf '%s\n' "${sh_files[@]}")
+py_list=$(printf '%s\n' "${py_files[@]}")
+
 LINT_TMP=$(mktemp -d) || exit 1
 trap 'rm -rf "$LINT_TMP"' EXIT
 
@@ -22,6 +26,9 @@ FAIL=0
 ok() { echo "  ok    $*"; }
 bad() { echo "  FAIL  $*"; FAIL=1; }
 skip() { echo "  skip  $*"; }
+# A tool that is not installed is a skip on a workstation. When CI is set in the environment it is a failure: a check
+# that silently does not run proves nothing. Usage: tool_missing TOOL "message for the skip"
+tool_missing() { if [[ -n ${CI:-} ]]; then bad "$1 is not installed, and CI is set: install it (a skipped check is a failed one)"; else skip "$2"; fi; }
 
 echo "== Shell syntax (bash -n)"
 n=0
@@ -32,14 +39,14 @@ done
 ok "$n scripts parse"
 # Every script in the repo should be on the list, or a new one silently goes unchecked
 while IFS= read -r f; do
-    printf '%s\n' "${sh_files[@]}" | grep -qxF -- "$f" || bad "$f is a shell script but is not in the Makefile's SH_FILES"
-done < <(grep -rlE '^#!.*\b(ba)?sh\b' --include='*' -I . 2>/dev/null | grep -v '^./.git/' | sed 's|^\./||' | sort)
+    grep -qxF -- "$f" <<<"$sh_list" || bad "$f is a shell script but is not in the Makefile's SH_FILES"
+done < <(grep -rlE '^#!.*\b(ba)?sh\b' --include='*' -I . 2>/dev/null | grep -v -e '^./.git/' -e '^./dist/' | sed 's|^\./||' | sort)
 
 echo "== shellcheck"
 if command -v shellcheck >/dev/null; then
     if shellcheck -S warning -x "${sh_files[@]}"; then ok "no warnings"; else bad "shellcheck reported problems"; fi
 else
-    skip "shellcheck is not installed (apt install shellcheck)"
+    tool_missing shellcheck "shellcheck is not installed (apt install shellcheck)"
 fi
 
 echo "== Python syntax"
@@ -63,19 +70,31 @@ else
 fi
 # Every Python file in the repo should be on the list, or a new one silently goes uncompiled
 while IFS= read -r f; do
-    printf '%s\n' "${py_files[@]}" | grep -qxF -- "$f" || bad "$f is a Python script but is not in the Makefile's PY_FILES"
+    grep -qxF -- "$f" <<<"$py_list" || bad "$f is a Python script but is not in the Makefile's PY_FILES"
 done < <({ git ls-files -co --exclude-standard -- '*.py' 2>/dev/null \
     || find . -name .git -prune -o -name '*.py' -type f -print | sed 's|^\./||'; } | sort -u)
+# ... and so should every Python script with no .py name (server_hub/hub/edr-hub, the client helpers): the shebang gives it away
+while IFS= read -r f; do
+    grep -qxF -- "$f" <<<"$py_list" || bad "$f has a python3 shebang but is not in the Makefile's PY_FILES"
+done < <(grep -rlE '^#!.*python3' --include='*' -I . 2>/dev/null | grep -v -e '^./.git/' -e '^./dist/' | sed 's|^\./||' | sort)
 
 echo "== Tetragon policies"
-if python3 -I -c 'import yaml' 2>/dev/null; then
-    # Parses each policy and checks the limits Tetragon enforces when it loads one: at most 5
-    # selectors per hook, and 8 prefix lists and 8 exact-match lists across the whole policy
-    if python3 -I - tetragon/policies/*.yaml <<'PY'
+# One run per policy directory: the laptop's, then the server's. A reused laptop policy keeps its metadata.name in
+# the server directory; OVERRIDE_NAMES is the explicit list of those, so the cross-directory duplicate check below
+# still catches an accidental clash.
+OVERRIDE_NAMES="persistence sensitive-files stack-tamper suspicious-exec tcp-listen"
+POLICY_DIRS=(tetragon/policies server_edr_solution/server_client/tetragon/policies)
+policy_lint() {   # policy_lint [--server] FILE... : the limits Tetragon enforces when it loads a policy
+    python3 -I - "$@" <<'PY'
 import sys, yaml
+args = sys.argv[1:]
+server = args and args[0] == "--server"
+if server:
+    args = args[1:]
 failed = False
 names = set()
-for path in sys.argv[1:]:
+follow_total = 0
+for path in args:
     try:
         doc = yaml.safe_load(open(path))
         name = doc["metadata"]["name"]
@@ -87,14 +106,27 @@ for path in sys.argv[1:]:
         problems.append(f"policy name {name!r} is used twice")
     names.add(name)
     prefix = equal = 0
+    calls = set()
     for hook in hooks:
         selectors = hook.get("selectors", [])
         if len(selectors) > 5:
             problems.append(f'{hook["call"]}: {len(selectors)} selectors (Tetragon allows 5)')
+        if len(hook.get("args", [])) > 5:
+            problems.append(f'{hook["call"]}: {len(hook["args"])} args (Tetragon allows 5)')
+        if hook["call"] in calls:
+            problems.append(f'{hook["call"]}: two kprobes on one symbol in one policy')
+        calls.add(hook["call"])
         for sel in selectors:
+            if len(sel.get("matchActions", [])) > 3:
+                problems.append(f'{hook["call"]}: {len(sel["matchActions"])} actions in one selector (Tetragon allows 3)')
             for m in sel.get("matchArgs", []):
                 prefix += m["operator"] in ("Prefix", "NotPrefix", "Postfix", "NotPostfix")
                 equal += m["operator"] in ("Equal", "NotEqual") and any(not str(v).lstrip("-").isdigit() for v in m["values"])
+            # matchBinaries Prefix and Postfix lists count towards the same 8
+            for m in sel.get("matchBinaries", []):
+                prefix += m["operator"] in ("Prefix", "NotPrefix", "Postfix", "NotPostfix")
+                if m.get("followChildren"):
+                    follow_total += len(m.get("values", []))
     if prefix > 8:
         problems.append(f"{prefix} prefix/postfix lists (Tetragon allows 8 per policy)")
     if equal > 8:
@@ -103,17 +135,49 @@ for path in sys.argv[1:]:
         print(f"  FAIL  {path}: {p}"); failed = True
     if not problems:
         print(f"  ok    {path} ({name}: {len(hooks)} hook(s), {prefix} prefix and {equal} exact-match lists)")
+if server and follow_total > 64:
+    print(f"  FAIL  followChildren paths add up to {follow_total} across the server policies (the budget is 64)"); failed = True
+elif server:
+    print(f"  ok    followChildren paths across the server policies: {follow_total} of 64")
+sys.exit(failed)
+PY
+}
+if python3 -I -c 'import yaml' 2>/dev/null; then
+    if policy_lint tetragon/policies/*.yaml; then :; else FAIL=1; fi
+    if policy_lint --server server_edr_solution/server_client/tetragon/policies/*.yaml; then :; else FAIL=1; fi
+    # The same name in both directories is only allowed for the listed server variants, and the list must not go stale
+    if python3 -I - "$OVERRIDE_NAMES" "${POLICY_DIRS[@]}" <<'PY'
+import glob, sys, yaml
+override = set(sys.argv[1].split())
+laptop, server = sys.argv[2], sys.argv[3]
+def names(d):
+    return {yaml.safe_load(open(p))["metadata"]["name"] for p in glob.glob(d + "/*.yaml")}
+same = names(laptop) & names(server)
+failed = False
+for n in sorted(same - override):
+    print(f"  FAIL  policy name {n!r} is in both policy directories and is not on the override list"); failed = True
+for n in sorted(override - same):
+    print(f"  FAIL  {n!r} is on the override list but is no longer in both directories (remove it from lint.sh)"); failed = True
+if not failed:
+    print(f"  ok    {len(same)} server variants keep a laptop policy's name (explicit override list); no other name is shared")
 sys.exit(failed)
 PY
     then :; else FAIL=1; fi
 else
-    skip "PyYAML is not installed (apt install python3-yaml)"
+    tool_missing PyYAML "PyYAML is not installed (apt install python3-yaml)"
 fi
-if grep -rnE '"/home/[a-z]' tetragon/policies/ >/dev/null; then
+if grep -rnE '"/home/[a-z]' "${POLICY_DIRS[@]}" >/dev/null; then
     bad "a policy names a home directory; use @HOME@ (filled in at install time)"
-    grep -rnE '"/home/[a-z]' tetragon/policies/ | sed 's/^/        /'
+    grep -rnE '"/home/[a-z]' "${POLICY_DIRS[@]}" | sed 's/^/        /'
 else
     ok "no hard-coded home directories (policies use @HOME@)"
+fi
+# The server policies are rendered from site discovery, never from a home directory: @HOME@ has no value there
+if grep -rn '@HOME@' "${POLICY_DIRS[1]}" >/dev/null; then
+    bad "a server policy uses @HOME@, which has no value on a server"
+    grep -rn '@HOME@' "${POLICY_DIRS[1]}" | sed 's/^/        /'
+else
+    ok "no @HOME@ in the server policies"
 fi
 
 echo "== Suricata config"
@@ -136,35 +200,38 @@ for n, line in enumerate(open(sys.argv[1]), 1):
             print(f"line {n}: {e}"); sys.exit(1)
 ' suricata/files/drop.conf 2>&1); then ok "suricata/files/drop.conf: every re: line compiles"; else bad "suricata/files/drop.conf: $out"; fi
 else
-    skip "PyYAML is not installed (apt install python3-yaml)"
+    tool_missing PyYAML "PyYAML is not installed (apt install python3-yaml)"
 fi
 
 echo "== Tetragon export denylist"
-if python3 -I - tetragon/export-denylist.jsonl <<'PY'
-import json, sys
+if python3 -I - tetragon/export-denylist.jsonl server_edr_solution/server_client/tetragon/export-denylist.jsonl <<'PY'
+import json, os, sys
 failed = False
-for n, line in enumerate(open(sys.argv[1]), 1):
-    line = line.strip()
-    if not line or line.startswith("#"):
-        continue
-    try:
-        f = json.loads(line)
-    except ValueError as e:
-        print(f"  FAIL  line {n}: {e}"); failed = True; continue
-    # Without one of these the line hides everything a matching process does, policy hits included
-    if not f.get("event_set") and not f.get("policy_names"):
-        print(f"  FAIL  line {n}: no event_set or policy_names: {line[:80]}"); failed = True
-    for key in ("binary_regex", "parent_binary_regex"):
-        for rx in f.get(key, []):
-            if not rx.startswith("^"):
-                print(f"  FAIL  line {n}: {key} {rx!r} is not anchored with ^"); failed = True
-    # Arguments are whatever the process was started with: on their own they hide anything
-    # ... so they count only with the root-owned program that started the process, and whole
-    if f.get("arguments_regex") and not f.get("parent_binary_regex"):
-        print(f"  FAIL  line {n}: arguments_regex without parent_binary_regex: {line[:80]}"); failed = True
-    for rx in f.get("arguments_regex", []):
-        if not (rx.startswith("^") and rx.endswith("$")):
-            print(f"  FAIL  line {n}: arguments_regex {rx[:60]!r} is not anchored at both ends (^...$)"); failed = True
+for path in sys.argv[1:]:
+    if not os.path.exists(path):
+        print(f"  FAIL  {path} does not exist"); failed = True; continue
+    for n, line in enumerate(open(path), 1):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        try:
+            f = json.loads(line)
+        except ValueError as e:
+            print(f"  FAIL  {path} line {n}: {e}"); failed = True; continue
+        # Without one of these the line hides everything a matching process does, policy hits included
+        if not f.get("event_set") and not f.get("policy_names"):
+            print(f"  FAIL  {path} line {n}: no event_set or policy_names: {line[:80]}"); failed = True
+        for key in ("binary_regex", "parent_binary_regex"):
+            for rx in f.get(key, []):
+                if not rx.startswith("^"):
+                    print(f"  FAIL  {path} line {n}: {key} {rx!r} is not anchored with ^"); failed = True
+        # Arguments are whatever the process was started with: on their own they hide anything
+        # ... so they count only with the root-owned program that started the process, and whole
+        if f.get("arguments_regex") and not f.get("parent_binary_regex"):
+            print(f"  FAIL  {path} line {n}: arguments_regex without parent_binary_regex: {line[:80]}"); failed = True
+        for rx in f.get("arguments_regex", []):
+            if not (rx.startswith("^") and rx.endswith("$")):
+                print(f"  FAIL  {path} line {n}: arguments_regex {rx[:60]!r} is not anchored at both ends (^...$)"); failed = True
 if not failed:
     print("  ok    every line is limited to an event type or policy, binary patterns are anchored, and arguments match whole and only under a named parent")
 sys.exit(failed)
@@ -194,15 +261,149 @@ for n, line in enumerate(open(sys.argv[1]), 1):
             print(f"line {n}: {e}"); sys.exit(1)
 ' watch/files/tetragon-ignore.conf 2>&1); then ok "watch/files/tetragon-ignore.conf"; else bad "watch/files/tetragon-ignore.conf: $out"; fi
 
+echo "== Server JSON and the advisory table"
+while IFS= read -r f; do
+    if python3 -I -c 'import json, sys; json.load(open(sys.argv[1]))' "$f" 2>/dev/null; then ok "$f"; else bad "$f is not valid JSON"; fi
+done < <(find server_edr_solution -name '*.json' -not -path '*/__pycache__/*' -not -path '*/node_modules/*' | sort)
+# hub PLAN section 4, Advisory data: the one definition of the file's shape
+if out=$(python3 -I - server_edr_solution/common/advisories.json <<'PY' 2>&1
+import json, re, sys
+doc = json.load(open(sys.argv[1]))
+KEYS = ("id", "origin", "release", "packages", "compare", "fixed_in", "cves", "needs_feature", "ref")
+errors = []
+if not isinstance(doc, dict) or set(doc) != {"updated", "rows"}:
+    errors.append('top level must be {"updated", "rows"}')
+else:
+    if not (isinstance(doc["updated"], str) and re.fullmatch(r"\d{4}-\d\d-\d\d", doc["updated"])):
+        errors.append("updated must be YYYY-MM-DD")
+    if not isinstance(doc["rows"], list):
+        errors.append("rows must be a list")
+    seen = set()
+    for i, row in enumerate(doc["rows"] if isinstance(doc["rows"], list) else []):
+        w = f"row {i}"
+        if not isinstance(row, dict):
+            errors.append(f"{w}: not an object"); continue
+        for k in KEYS:
+            if k not in row:
+                errors.append(f"{w}: missing key {k}")
+        for k in row:
+            if k not in KEYS:
+                errors.append(f"{w}: unknown key {k}")
+        if not (isinstance(row.get("id"), str) and row["id"]):
+            errors.append(f"{w}: id must be a non-empty string")
+        elif row["id"] in seen:
+            errors.append(f"{w}: duplicate id {row['id']}")
+        else:
+            seen.add(row["id"])
+        for k in ("origin", "release", "ref"):
+            if k in row and not (isinstance(row[k], str) and row[k]):
+                errors.append(f"{w}: {k} must be a non-empty string")
+        for k in ("packages", "cves"):
+            if k in row and not (isinstance(row[k], list) and all(isinstance(x, str) for x in row[k])):
+                errors.append(f"{w}: {k} must be a list of strings")
+        if row.get("compare") not in ("dpkg", "upstream", "kernel"):
+            errors.append(f"{w}: compare must be dpkg, upstream or kernel")
+        for k in ("fixed_in", "needs_feature"):
+            if k in row and row[k] is not None and not isinstance(row[k], str):
+                errors.append(f"{w}: {k} must be a string or null")
+for e in errors:
+    print(e)
+sys.exit(1 if errors else 0)
+PY
+); then ok "server_edr_solution/common/advisories.json matches the shape of hub PLAN section 4"; else bad "server_edr_solution/common/advisories.json:"; sed 's/^/        /' <<<"$out"; fi
+
+echo "== Server Python imports (standard library and sibling modules only)"
+if out=$(python3 -I - "${py_files[@]}" <<'PY' 2>&1
+import ast, os, sys
+# The rule covers every Python file under server_edr_solution. A file may import the standard library, modules and
+# packages of its own directory (and, inside a package, of the directories above it up to the one that is not a package),
+# and relative imports. A test may also import the server code it tests and the other half it round-trips with
+# (server_hub/hub and server_client/agent), and PyYAML, which CI requires for the policy checks.
+CODE_FOR_TESTS = ("server_hub/hub", "server_client/agent")
+TEST_DIRS = ("server_hub/tests", "server_client/tests")
+TEST_EXTRA = {"yaml"}
+def local_names(d):
+    names = set()
+    try:
+        entries = os.listdir(d)
+    except OSError:
+        return names
+    for e in entries:
+        full = os.path.join(d, e)
+        if e.endswith(".py"):
+            names.add(e[:-3])
+        elif os.path.isdir(full) and os.path.exists(os.path.join(full, "__init__.py")):
+            names.add(e)
+    return names
+bad = 0
+n = 0
+for path in sys.argv[1:]:
+    if not path.startswith("server_edr_solution/"):
+        continue
+    n += 1
+    d = os.path.dirname(path)
+    allowed = local_names(d)
+    up = d
+    while os.path.exists(os.path.join(up, "__init__.py")):
+        up = os.path.dirname(up)
+        allowed |= local_names(up)
+    rel = os.path.relpath(d, "server_edr_solution")
+    if rel in TEST_DIRS:
+        for code in CODE_FOR_TESTS:
+            allowed |= local_names(os.path.join("server_edr_solution", code))
+        allowed |= TEST_EXTRA
+    try:
+        tree = ast.parse(open(path).read(), path)
+    except SyntaxError as e:
+        print(f"  FAIL  {path}: {e}"); bad = 1; continue
+    for node in ast.walk(tree):
+        mods = []
+        if isinstance(node, ast.Import):
+            mods = [(a.name.split(".")[0], node.lineno) for a in node.names]
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            mods = [(node.module.split(".")[0], node.lineno)]
+        for m, line in mods:
+            if m not in sys.stdlib_module_names and m not in allowed:
+                print(f"  FAIL  {path}:{line}: imports {m!r}, which is neither the standard library nor a sibling module"); bad = 1
+if not bad:
+    print(f"  ok    {n} files import only the standard library and their own modules")
+sys.exit(bad)
+PY
+); then ok "${out#  ok    }"; else bad "imports:"; sed 's/^/        /' <<<"$out"; fi
+
 echo "== systemd units"
 if command -v systemd-analyze >/dev/null; then
     # Missing binaries and units are expected on a machine where the kits aren't installed
-    out=$(systemd-analyze verify suricata/files/*.service suricata/files/*.timer controld/files/*.service watch/files/*.service watch/files/*.timer \
-        server_edr_solution/mock/hub/*.service server_edr_solution/mock/web/*.service 2>&1 \
+    shopt -s nullglob
+    unit_files=(suricata/files/*.service suricata/files/*.timer suricata/files/*.path controld/files/*.service watch/files/*.service watch/files/*.timer
+        server_edr_solution/mock/hub/*.service server_edr_solution/mock/web/*.service
+        server_edr_solution/server_hub/files/*.{service,timer,path,socket} server_edr_solution/server_client/files/*.{service,timer,path,socket})
+    shopt -u nullglob
+    out=$(systemd-analyze verify "${unit_files[@]}" 2>&1 \
         | grep -vE 'is not executable|No such file or directory|not found|Unit .* not found' || true)
     if [[ -z $out ]]; then ok "units parse"; else bad "systemd-analyze verify:"; sed 's/^/        /' <<<"$out"; fi
+
+    # Sandbox score of each server service (lower is tighter), in tenths because --threshold takes an integer. The limit is
+    # the score measured when this check was added plus 0.2: a loosened unit fails, and a unit without an entry must stay
+    # under 3.0.
+    declare -A SEC_MAX=(
+        [edr-hub]=14 [edr-hub-ui]=13 [edr-hub-out]=14 [edr-hub-failed]=14 [edr-hub-backup]=20 [edr-hub-nft]=96
+        [edr-agent]=13 [edr-bans]=22 [edr-diskguard]=25 [edr-dnslock]=22 [edr-dns-watch]=25 [edr-droplet-id]=21
+        [edr-home-net]=18 [edr-inventory]=23 [edr-notify]=15 [edr-policy-check]=21 [edr-rules-update]=41)
+    sec_n=0
+    for u in server_edr_solution/server_hub/files/*.service server_edr_solution/server_client/files/*.service; do
+        [[ -f $u ]] || continue
+        name=$(basename "$u" .service)
+        limit=${SEC_MAX[$name]:-30}
+        if out=$(systemd-analyze security --offline=true --threshold="$limit" "$u" 2>&1); then
+            sec_n=$((sec_n + 1))
+        else
+            bad "$u: sandbox exposure is above $((limit / 10)).$((limit % 10)) ($(grep -o 'exposure level for [^:]*: [0-9.]* [A-Z]*' <<<"$out" | sed 's/.*: //'))"
+        fi
+    done
+    ok "$sec_n server services are within their sandbox score limits"
 else
-    skip "systemd-analyze is not available"
+    tool_missing systemd-analyze "systemd-analyze is not available"
 fi
 
 echo "== Drop-ins and the units the Tetragon installer writes"
@@ -269,7 +470,7 @@ PY
         bad "tetragon/local_install.sh: its here-documents could not be read (see the message above)"
     fi
 else
-    skip "systemd-analyze is not available"
+    tool_missing systemd-analyze "systemd-analyze is not available"
 fi
 
 echo "== tmpfiles and logrotate"
@@ -288,6 +489,15 @@ if command -v logrotate >/dev/null; then
     done
 else
     skip "logrotate is not installed"
+fi
+
+echo "== Distribution tarballs (make dist)"
+# Builds both tarballs in a temp directory (never in dist/), checks the manifests, the agent hash written into the hub tarball,
+# that the checked-in agent-hashes.json is untouched and that every file an installer references is in the tarball.
+if out=$(tests/dist.sh --check 2>&1); then
+    while IFS= read -r line; do ok "$line"; done <<<"$out"
+else
+    bad "tests/dist.sh --check:"; sed 's/^/        /' <<<"$out"
 fi
 
 echo

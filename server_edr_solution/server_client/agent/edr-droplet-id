@@ -1,0 +1,249 @@
+#!/usr/bin/env python3
+"""edr-droplet-id: write the DigitalOcean droplet id where the sandboxed agent can read it (client PLAN section 4.6).
+
+A root oneshot, started before edr-agent.service at every boot and every start of the agent. The
+agent has no access to the metadata service (IPAddressDeny=any), so this unit, which may reach
+169.254.169.254 and nothing else, reads the id and writes /run/edr-droplet-id (root:edr-agent 0640,
+one line). The agent sends the id with enrollment and with every heartbeat; the hub alerts when one
+certificate reports two ids.
+
+  metadata answers   the id (digits only) is written
+  metadata silent    the old /run/edr-droplet-id stays; if there is none, the id stored beside host-id
+                     (/var/lib/edr-agent/droplet-id: written at install, or from --droplet-id on hosts
+                     that are not droplets) is written. Failing open: the identity stays.
+
+Usage    edr-droplet-id [--root DIR] [--dry-run] [--metadata HOST:PORT] [--timeout SECONDS]
+         --metadata   another address for the metadata service (tests); default 169.254.169.254:80
+Python standard library only, run as: python3 -I edr-droplet-id
+"""
+
+import configparser
+import http.client
+import json
+import os
+import re
+import stat
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+
+PROG = "edr-droplet-id"
+VERSION = "0.1.0"
+OUT = "/run/edr-droplet-id"
+STORED = "/var/lib/edr-agent/droplet-id"
+ID_RE = re.compile(r"[A-Za-z0-9._:-]{1,64}")
+
+# ---- Small helpers shared (copied, not imported) by the root helpers --------------------------------
+class Env:
+    """Paths under --root, programs run (or faked), the clock. Used by every root helper."""
+
+    def __init__(self, root="", dry=False, fixtures=None, now=None):
+        self.root = root.rstrip("/")
+        self.dry = dry
+        self.fixtures = fixtures
+        self.now = int(now if now is not None else time.time())
+        self.writes = bool(root) or not dry          # a dry run on the real paths writes nothing
+        self.log_lines = []
+
+    def p(self, path):
+        return self.root + path
+
+    def run(self, argv, timeout=20, stdin=None):
+        """(rc, stdout, stderr), or None when the program cannot run (dry run, missing, timeout)."""
+        if self.fixtures is not None:
+            f = self.fixtures.get(" ".join(argv))
+            return (f.get("rc", 0), f.get("out", ""), f.get("err", "")) if isinstance(f, dict) else None
+        if self.dry:
+            return None
+        try:
+            r = subprocess.run(argv, capture_output=True, timeout=timeout, check=False, input=stdin, text=True,
+                               env={"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C", "LC_ALL": "C"})
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        return r.returncode, r.stdout, r.stderr
+
+    def log(self, msg):
+        print("%s: %s" % (PROG, clean(msg, 300)), flush=True)
+
+
+def clean(text, limit=200):
+    """Printable ASCII only: this ends up in files and logs other programs read."""
+    return "".join(c if " " <= c <= "~" else "?" for c in str(text))[:limit]
+
+
+def read_file(path, max_bytes=65536, one_link=True, owners=None):
+    """Read a file another user may control: no symlink, no FIFO, bounded. Returns bytes; raises OSError or ValueError."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise ValueError("not a regular file")
+        if one_link and st.st_nlink != 1:
+            raise ValueError("more than one link")
+        if owners is not None and st.st_uid not in owners:
+            raise ValueError("unexpected owner")
+        if st.st_size > max_bytes:
+            raise ValueError("file too large")
+        out, total = [], 0
+        while True:
+            b = os.read(fd, 1 << 16)
+            if not b:
+                break
+            total += len(b)
+            if total > max_bytes:
+                raise ValueError("file too large")
+            out.append(b)
+        return b"".join(out)
+    finally:
+        os.close(fd)
+
+
+def read_text(env, path, max_bytes=65536, one_link=True, owners=None):
+    try:
+        return read_file(env.p(path), max_bytes, one_link, owners).decode("utf-8", "replace")
+    except (OSError, ValueError):
+        return None
+
+
+def atomic_write(path, text, mode=0o640):
+    """Write to .tmp, fsync, rename."""
+    os.makedirs(os.path.dirname(path), mode=0o755, exist_ok=True)
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC, mode)
+    try:
+        os.write(fd, text.encode("utf-8"))
+        os.fchmod(fd, mode)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.rename(tmp, path)
+
+
+def load_json(env, path, max_bytes=1 << 20, owners=None):
+    t = read_text(env, path, max_bytes, True, owners)
+    if t is None:
+        return None
+    try:
+        return json.loads(t)
+    except (ValueError, RecursionError):
+        return None
+
+
+def pause_until(env):
+    """The end of a valid pause (epoch s), or 0. An expired or odd file is ignored."""
+    doc = load_json(env, "/etc/edr-agent/pause.json", 4096)
+    u = doc.get("until") if isinstance(doc, dict) else None
+    return u if isinstance(u, int) and not isinstance(u, bool) and u > env.now else 0
+
+
+def read_conf(env, files_dir=""):
+    """local.conf over defaults.conf. Returns a ConfigParser; trouble means the defaults."""
+    cp = configparser.ConfigParser(interpolation=None, strict=False)
+    here = os.path.dirname(os.path.realpath(__file__))
+    for c in ([os.path.join(files_dir, "defaults.conf")] if files_dir else []) + [
+            os.path.join(here, "defaults.conf"), os.path.join(here, "files", "defaults.conf"),
+            os.path.join(here, "..", "files", "defaults.conf")]:
+        try:
+            with open(c, encoding="utf-8") as fh:
+                cp.read_string(fh.read(262144))
+            break
+        except (OSError, configparser.Error):
+            continue
+    t = read_text(env, "/etc/edr-agent/local.conf", 262144)
+    if t is not None:
+        try:
+            cp.read_string(t)
+        except configparser.Error:
+            pass
+    return cp
+
+
+def parse_common(argv, extra=None):
+    """Parse --root, --dry-run, --now, --exec-fixtures, --files-dir. Returns (Env, files_dir, rest, options)."""
+    root = os.environ.get("EDR_AGENT_ROOT", "")
+    dry, fixtures, now, files_dir, rest = False, None, None, "", []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        nxt = argv[i + 1] if i + 1 < len(argv) else None
+        if a == "--root" and nxt is not None:
+            root = nxt; i += 1
+        elif a == "--dry-run":
+            dry = True
+        elif a == "--now" and nxt is not None:
+            now = int(nxt); i += 1
+        elif a == "--exec-fixtures" and nxt is not None:
+            with open(nxt, encoding="utf-8") as fh:
+                fixtures = json.load(fh)
+            i += 1
+        elif a == "--files-dir" and nxt is not None:
+            files_dir = nxt; i += 1
+        elif a in ("-h", "--help"):
+            print(__doc__)
+            sys.exit(0)
+        else:
+            rest.append(a)
+        i += 1
+    return Env(root, dry, fixtures, now), files_dir, rest
+
+
+
+def fetch(addr, timeout):
+    """The droplet id from the metadata service, or None. Digits only: anything else is not an id."""
+    host, _, port = addr.rpartition(":")
+    try:
+        c = http.client.HTTPConnection(host, int(port), timeout=timeout)
+        c.request("GET", "/metadata/v1/id", headers={"Accept": "text/plain", "User-Agent": "edr-droplet-id/" + VERSION})
+        r = c.getresponse()
+        body = r.read(64)
+        c.close()
+    except (OSError, http.client.HTTPException, ValueError):
+        return None
+    if r.status != 200:
+        return None
+    text = body.decode("ascii", "replace").strip()
+    return text if re.fullmatch(r"[0-9]{1,20}", text) else None
+
+
+def main(argv):
+    env, files_dir, rest = parse_common(argv)
+    addr, timeout, i = "169.254.169.254:80", 2.0, 0
+    while i < len(rest):
+        if rest[i] == "--metadata" and i + 1 < len(rest):
+            addr = rest[i + 1]; i += 2
+        elif rest[i] == "--timeout" and i + 1 < len(rest):
+            timeout = float(rest[i + 1]); i += 2
+        else:
+            print("usage: edr-droplet-id [--root DIR] [--dry-run] [--metadata HOST:PORT]", file=sys.stderr)
+            return 2
+    if not env.root and os.geteuid() != 0 and not env.dry:
+        print("edr-droplet-id: must run as root", file=sys.stderr)
+        return 2
+    did = fetch(addr, timeout)
+    source = "metadata"
+    if did is None:
+        old = (read_text(env, OUT, 128, one_link=False) or "").strip()
+        if old and ID_RE.fullmatch(old):
+            env.log("the metadata service does not answer: keeping the old id")
+            return 0
+        stored = (read_text(env, STORED, 128, one_link=True) or "").strip()
+        if not stored or not ID_RE.fullmatch(stored):
+            env.log("no droplet id: the metadata service does not answer and none is stored")
+            return 0
+        did, source = stored, "stored"
+    if env.dry and not env.root:
+        print(did)
+        return 0
+    try:
+        atomic_write(env.p(OUT), did + "\n", 0o640)
+    except OSError as e:
+        env.log("cannot write %s: %s" % (OUT, clean(e, 80)))
+        return 1
+    env.log("droplet id written (%s)" % source)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,71 @@
+# The agent (client PLAN section 4.5, Sandbox). Standard-library Python, no capabilities, and the
+# network reachable only to the hub: the root-written drop-in
+# /etc/systemd/system/edr-agent.service.d/10-hub.conf holds `IPAddressAllow=<each hub address>` at
+# install and rehome; there is none in local mode. The agent starts a self-test of the address
+# filter (a UDP datagram to 127.0.0.1:9 must fail with EPERM) and raises health.sandbox_ineffective
+# if it does not. Every directive here exists in systemd 255 (Ubuntu 24.04).
+[Unit]
+Description=EDR agent (reads Suricata, Tetragon, nginx and journal; sends telemetry to the hub)
+After=network-online.target edr-droplet-id.service
+Wants=edr-droplet-id.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=notify
+NotifyAccess=main
+WatchdogSec=90
+Restart=always
+RestartSec=5
+ExecStop=/usr/bin/python3 -I /usr/local/lib/edr-agent/edr-agent.py shutdown-notice
+TimeoutStopSec=5
+ExecStart=/usr/bin/python3 -I /usr/local/lib/edr-agent/edr-agent.py
+User=edr-agent
+SupplementaryGroups=suricata adm
+CapabilityBoundingSet=
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectProc=invisible
+PrivateTmp=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SocketBindDeny=any
+IPAddressDeny=any
+TemporaryFileSystem=/var/log:ro
+BindReadOnlyPaths=-/var/log/suricata -/var/log/nginx -/var/log/tetragon -/var/log/dnscrypt-proxy -/var/log/journal -/run/log/journal
+StateDirectory=edr-agent
+StateDirectoryMode=0700
+RuntimeDirectory=edr-agent
+RuntimeDirectoryMode=0755
+MemoryHigh=96M
+MemoryMax=128M
+CPUQuota=10%
+OOMScoreAdjust=300
+RuntimeDirectoryPreserve=yes
+LogNamespace=edr
+PrivateDevices=yes
+PrivateIPC=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+UMask=0077
+RemoveIPC=yes
+MemorySwapMax=0
+TasksMax=32
+LimitNOFILE=512
+LimitCORE=0
+Nice=10
+LogRateLimitBurst=50000
+
+[Install]
+WantedBy=multi-user.target

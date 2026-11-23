@@ -1,0 +1,86 @@
+#!/usr/bin/python3 -I
+"""/etc/update-motd.d/90-edr: the top local alerts and hub reachability at login (client PLAN section 4.7).
+
+It runs as root (pam_motd) on a file the unprivileged agent wrote, and the summaries carry attacker
+text (user agents, arguments), so: the file is opened with O_NOFOLLOW, capped in size, parsed as
+JSON, and every string is cut to printable ASCII and 120 characters. It prints nothing unless the
+person logging in is root or in the sudo or adm group (PAM_USER, else SUDO_USER); when it cannot tell, it prints nothing.
+"""
+import grp
+import json
+import os
+import pwd
+import stat
+import sys
+import time
+
+SUMMARY = os.environ.get("EDR_SUMMARY_JSON", "/run/edr-agent/summary.json")
+MAX_BYTES = 256 * 1024
+HUB_DOWN_S = 15 * 60
+
+
+def safe(v, n=120):
+    return "".join(c if " " <= c <= "~" else "?" for c in str(v))[:n]
+
+
+def allowed(user):
+    """root, or a member of the sudo or adm group."""
+    if not user:
+        return False
+    try:
+        pw = pwd.getpwnam(user)
+        gids = set(os.getgrouplist(user, pw.pw_gid))
+    except (KeyError, OSError):
+        return False
+    if pw.pw_uid == 0:
+        return True
+    for g in ("sudo", "adm"):
+        try:
+            if grp.getgrnam(g).gr_gid in gids:
+                return True
+        except KeyError:
+            pass
+    return False
+
+
+def main():
+    user = os.environ.get("PAM_USER") or os.environ.get("SUDO_USER") or ""
+    if "EDR_SUMMARY_JSON" not in os.environ and not allowed(user):
+        return 0
+    try:
+        fd = os.open(SUMMARY, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError:
+        return 0
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > MAX_BYTES:
+            return 0
+        data = os.read(fd, MAX_BYTES + 1)
+    finally:
+        os.close(fd)
+    try:
+        doc = json.loads(data.decode("utf-8", "replace"))
+    except (ValueError, RecursionError):
+        return 0
+    if not isinstance(doc, dict):
+        return 0
+    out = []
+    alerts = doc.get("alerts") if isinstance(doc.get("alerts"), list) else []
+    shown = [a for a in alerts if isinstance(a, dict)][:5]
+    counts = doc.get("counts") if isinstance(doc.get("counts"), dict) else {}
+    crit, high = counts.get("CRITICAL", 0), counts.get("HIGH", 0)
+    if shown:
+        out.append("EDR: %s CRITICAL and %s HIGH alert(s) in the last 7 days (edr-agent status --alerts --since 7d):" % (safe(crit, 8), safe(high, 8)))
+        for a in shown:
+            out.append(safe("  %s %s %s %s" % (a.get("sev", ""), a.get("kind", ""), a.get("src_ip", ""), a.get("summary", ""))))
+    hub = doc.get("hub") if isinstance(doc.get("hub"), dict) else {}
+    un = hub.get("unreachable_s")
+    if hub.get("mode") == "enrolled" and isinstance(un, int) and un > HUB_DOWN_S:
+        out.append("EDR: the hub has been unreachable for %d minutes" % (un // 60))
+    if out:
+        sys.stdout.write("\n".join(out) + "\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

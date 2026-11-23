@@ -1,0 +1,119 @@
+# Server variant of the laptop policy (client PLAN section 4.3). Observe-only: access to
+# credential and access-control files. The metadata name is kept; the file replaces the laptop
+# one on a server. Desktop entries, browser stores and keyrings are dropped, and no home-directory placeholder is
+# used: SSH and cloud keys of any user are matched by the end of the path.
+#
+# Selectors are OR'ed:
+#   1  any access to the system files below by a program that is not a normal authentication tool
+#   2  any write (MAY_WRITE, 0x02) to them, by anyone (also /etc/passwd and /etc/group)
+#   3  any access to a private key or cloud credential by a program that does not own it
+# "/etc/sudoers" is a prefix, so it also covers /etc/sudoers.d/. Selector 3 is rate limited to
+# one event per process and file per minute.
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "sensitive-files"
+spec:
+  kprobes:
+  - call: "security_file_permission"
+    syscall: false
+    return: true
+    message: "Access to a credential or access-control file"
+    args:
+    - index: 0
+      type: "file"
+    - index: 1
+      type: "int" # 0x04 is MAY_READ, 0x02 is MAY_WRITE
+    returnArg:
+      index: 0
+      type: "int"
+    selectors:
+    - matchArgs:
+      - index: 0
+        operator: "Prefix"
+        values:
+        - "/etc/shadow"
+        - "/etc/gshadow"
+        - "/etc/sudoers"
+        - "/etc/ssh/sshd_config"
+        - "/root/.ssh/"
+      matchBinaries:
+      - operator: "NotIn"
+        values:
+        - "/usr/bin/sudo"
+        - "/usr/lib/cargo/bin/sudo" # sudo-rs on newer Ubuntu: binaries are matched by their real path
+        - "/usr/sbin/unix_chkpwd"
+        - "/usr/bin/su"
+        - "/usr/bin/login"
+        - "/usr/sbin/sshd"
+        - "/usr/sbin/cron"
+        - "/usr/bin/passwd"
+        - "/usr/sbin/useradd"
+        - "/usr/sbin/usermod"
+    - matchArgs:
+      - index: 0
+        operator: "Prefix"
+        values:
+        - "/etc/shadow"
+        - "/etc/gshadow"
+        - "/etc/sudoers"
+        - "/etc/ssh/sshd_config"
+        - "/root/.ssh/"
+        - "/etc/passwd"
+        - "/etc/group"
+      - index: 1
+        operator: "Mask"
+        values:
+        - "2" # MAY_WRITE
+    - matchArgs:
+      - index: 0
+        operator: "Postfix"
+        values:
+        - "/.ssh/id_rsa"
+        - "/.ssh/id_ecdsa"
+        - "/.ssh/id_ed25519"
+        - "/.aws/credentials"
+        - "/.kube/config"
+        - "/.docker/config.json"
+        - "/.git-credentials"
+        - "/.netrc"
+        - "/.config/gcloud/credentials.db"
+      matchBinaries:
+      - operator: "NotIn"
+        values:
+        - "/usr/bin/ssh"
+        - "/usr/bin/ssh-add"
+        - "/usr/bin/ssh-agent"
+        - "/usr/bin/ssh-keygen"
+        - "/usr/bin/scp"
+        - "/usr/bin/sftp"
+        - "/usr/bin/git"
+        - "/usr/lib/git-core/git-remote-http" # git-remote-https symlinks here
+        - "/usr/lib/git-core/git"
+        - "/usr/bin/docker"
+        - "/usr/bin/rsync"
+      matchActions:
+      - action: Post
+        rateLimit: "1m"
+  - call: "security_path_truncate"
+    syscall: false
+    return: true
+    message: "Truncation of a credential or access-control file"
+    args:
+    - index: 0
+      type: "path"
+    returnArg:
+      index: 0
+      type: "int"
+    selectors:
+    - matchArgs:
+      - index: 0
+        operator: "Prefix"
+        values:
+        - "/etc/shadow"
+        - "/etc/gshadow"
+        - "/etc/sudoers"
+        - "/etc/ssh/sshd_config"
+        - "/root/.ssh/"
+        - "/etc/passwd"
+        - "/etc/group"

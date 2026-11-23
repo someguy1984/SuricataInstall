@@ -1,0 +1,253 @@
+# Server variant of the laptop policy (client PLAN section 4.3). Observe-only: log changes to the
+# kit itself the way tetragon-tamper.yaml does for Tetragon. Switching off a rule, loosening a
+# config or swapping one of the root-run helpers is quieter than stopping a service.
+#
+# Watched (group A):
+#   /etc/suricata, /var/lib/suricata/rules      Suricata's config and live ruleset
+#   /etc/edr-agent, /etc/edr-dns                the kit's configuration, pause file, DoH stamps
+#   /usr/local/lib/edr-agent                    the installed code (root-run helpers)
+#   /var/lib/edr-agent/identity                 the agent's client key and certificate
+#   /usr/local/sbin/edr-                        the command links
+#   /etc/systemd/system/edr-, the drop-ins of suricata and dnscrypt-proxy, /etc/systemd/resolved.conf.d
+#                                               the units and the resolver set-up
+#   /etc/nftables.conf, /usr/libexec/edr/       the firewall file and the canary
+# and, for deletion, truncation and renames only (group B): /var/log/suricata, /var/log/nginx
+# and /var/log/auth.log (a single file: matched by directory and name where the hook sees only those). Writes to the logs are constant, so only the removal, truncation or move of a
+# log is logged. Also logged: an exec of journalctl (a --vacuum is seen in the exec event's
+# arguments, which the agent reads).
+#
+# Expected entries, all from the kit's own automation: the daily rule update (python3 writing
+# /var/lib/suricata/rules), `edr-agent apply-config`, re-running the installer, logrotate.
+#
+# Tetragon allows a policy 8 prefix lists in total, and this one uses all 8. One case is left
+# out to fit: a file moved INTO /var/log/suricata, /var/log/nginx or /var/log/auth.log from
+# somewhere else. Firewall rules changed directly with nft leave no file behind; the exec of nft
+# is in the event log, and check.sh reports the rules.
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "stack-tamper"
+spec:
+  kprobes:
+  - call: "security_file_permission"
+    syscall: false
+    message: "Write to the kit's config, rules, code or identity"
+    args:
+    - index: 0
+      type: "file"
+    - index: 1
+      type: "int" # 0x04 is MAY_READ, 0x02 is MAY_WRITE
+    selectors:
+    - matchArgs:
+      - index: 0
+        operator: "Prefix"
+        values:
+        - "/etc/suricata"
+        - "/var/lib/suricata/rules"
+        - "/etc/edr-agent"
+        - "/etc/edr-dns"
+        - "/usr/local/lib/edr-agent"
+        - "/var/lib/edr-agent/identity"
+        - "/usr/local/sbin/edr-"
+        - "/etc/systemd/system/edr-"
+        - "/etc/systemd/system/suricata.service.d"
+        - "/etc/systemd/system/dnscrypt-proxy.service.d"
+        - "/etc/systemd/resolved.conf.d"
+        - "/etc/nftables.conf"
+        - "/usr/libexec/edr/"
+      - index: 1
+        operator: "Mask"
+        values:
+        - "2" # MAY_WRITE
+      matchActions:
+      - action: Post
+        rateLimit: "1m"
+
+  - call: "security_path_truncate"
+    syscall: false
+    message: "Truncation of the kit's config, rules, code or logs"
+    args:
+    - index: 0
+      type: "path"
+    selectors:
+    - matchArgs:
+      - index: 0
+        operator: "Prefix"
+        values:
+        - "/etc/suricata"
+        - "/var/lib/suricata/rules"
+        - "/etc/edr-agent"
+        - "/etc/edr-dns"
+        - "/usr/local/lib/edr-agent"
+        - "/var/lib/edr-agent/identity"
+        - "/usr/local/sbin/edr-"
+        - "/etc/systemd/system/edr-"
+        - "/etc/systemd/system/suricata.service.d"
+        - "/etc/systemd/system/dnscrypt-proxy.service.d"
+        - "/etc/systemd/resolved.conf.d"
+        - "/etc/nftables.conf"
+        - "/usr/libexec/edr/"
+    - matchArgs:
+      - index: 0
+        operator: "Prefix"
+        values:
+        - "/var/log/suricata"
+        - "/var/log/auth.log"
+        - "/var/log/nginx"
+      matchBinaries:
+      - operator: "NotIn"
+        values:
+        - "/usr/bin/suricata"
+        - "/usr/sbin/logrotate"
+        - "/usr/bin/gzip"
+        - "/usr/sbin/nginx"
+        - "/usr/sbin/nginx (deleted)"
+        - "/usr/sbin/rsyslogd"
+
+  - call: "security_path_unlink"
+    syscall: false
+    message: "File deleted from the kit's config, rules, code or logs"
+    args:
+    - index: 0 # const struct path *dir: the directory the file is removed from
+      type: "path"
+    - index: 1 # struct dentry *dentry: the file being removed
+      type: "string"
+      resolve: "d_name.name"
+      label: "file"
+    selectors:
+    - matchArgs:
+      - args: [0]
+        operator: "Prefix"
+        values:
+        - "/etc/suricata"
+        - "/var/lib/suricata/rules"
+        - "/etc/edr-agent"
+        - "/etc/edr-dns"
+        - "/usr/local/lib/edr-agent"
+        - "/var/lib/edr-agent/identity"
+        - "/usr/local/sbin"
+        - "/etc/systemd/system"
+        - "/etc/systemd/resolved.conf.d"
+        - "/usr/libexec/edr"
+    - matchArgs:
+      - args: [0]
+        operator: "Prefix"
+        values:
+        - "/var/log/suricata"
+        - "/var/log/nginx"
+      matchBinaries:
+      - operator: "NotIn"
+        values:
+        - "/usr/bin/suricata"
+        - "/usr/sbin/logrotate"
+        - "/usr/bin/gzip"
+        - "/usr/sbin/nginx"
+        - "/usr/sbin/nginx (deleted)"
+        - "/usr/sbin/rsyslogd"
+    - matchArgs: # auth.log is a single file in a shared directory
+      - args: [0]
+        operator: "Equal"
+        values:
+        - "/var/log"
+      - args: [1]
+        operator: "Equal"
+        values:
+        - "auth.log"
+      matchBinaries:
+      - operator: "NotIn"
+        values:
+        - "/usr/sbin/logrotate"
+        - "/usr/sbin/rsyslogd"
+
+  - call: "security_path_rename"
+    syscall: false
+    message: "File renamed in or out of the kit's config, rules, code or logs"
+    args:
+    - index: 0 # const struct path *old_dir
+      type: "path"
+      label: "from_dir"
+    - index: 1 # struct dentry *old_dentry
+      type: "string"
+      resolve: "d_name.name"
+      label: "from"
+    - index: 2 # const struct path *new_dir
+      type: "path"
+      label: "to_dir"
+    - index: 3 # struct dentry *new_dentry
+      type: "string"
+      resolve: "d_name.name"
+      label: "to"
+    selectors:
+    - matchArgs: # moved out of (or within) a watched directory
+      - args: [0]
+        operator: "Prefix"
+        values:
+        - "/etc/suricata"
+        - "/var/lib/suricata/rules"
+        - "/etc/edr-agent"
+        - "/etc/edr-dns"
+        - "/usr/local/lib/edr-agent"
+        - "/var/lib/edr-agent/identity"
+        - "/usr/local/sbin"
+        - "/etc/systemd/system"
+        - "/etc/systemd/resolved.conf.d"
+        - "/usr/libexec/edr"
+    - matchArgs: # moved into a watched directory
+      - args: [2]
+        operator: "Prefix"
+        values:
+        - "/etc/suricata"
+        - "/var/lib/suricata/rules"
+        - "/etc/edr-agent"
+        - "/etc/edr-dns"
+        - "/usr/local/lib/edr-agent"
+        - "/var/lib/edr-agent/identity"
+        - "/usr/local/sbin"
+        - "/etc/systemd/system"
+        - "/etc/systemd/resolved.conf.d"
+        - "/usr/libexec/edr"
+    - matchArgs: # a log moved away or renamed
+      - args: [0]
+        operator: "Prefix"
+        values:
+        - "/var/log/suricata"
+        - "/var/log/nginx"
+      matchBinaries:
+      - operator: "NotIn"
+        values:
+        - "/usr/bin/suricata"
+        - "/usr/sbin/logrotate"
+        - "/usr/bin/gzip"
+        - "/usr/sbin/nginx"
+        - "/usr/sbin/nginx (deleted)"
+        - "/usr/sbin/rsyslogd"
+    - matchArgs: # auth.log is a single file in a shared directory
+      - args: [0]
+        operator: "Equal"
+        values:
+        - "/var/log"
+      - args: [1]
+        operator: "Equal"
+        values:
+        - "auth.log"
+      matchBinaries:
+      - operator: "NotIn"
+        values:
+        - "/usr/sbin/logrotate"
+        - "/usr/sbin/rsyslogd"
+
+  - call: "security_bprm_check"
+    syscall: false
+    message: "journalctl was started (read its arguments for --vacuum)"
+    args:
+    - index: 0
+      type: "linux_binprm"
+    selectors:
+    - matchArgs:
+      - index: 0
+        operator: "Equal"
+        values:
+        - "/usr/bin/journalctl"
+      matchActions:
+      - action: Post
+        rateLimit: "1m"

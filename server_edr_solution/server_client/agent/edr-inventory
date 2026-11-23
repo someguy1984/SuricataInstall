@@ -1,0 +1,1711 @@
+#!/usr/bin/env python3
+"""edr-inventory: what is installed, exposed and drifting on this host (client PLAN section 4.5.1).
+
+A root oneshot with a fixed output file, like edr-bans. It reads files that a web user may
+control (nginx includes, .env, php ini, pool files), so every such file is opened with
+O_NOFOLLOW|O_NONBLOCK, must be a regular file, is capped in size and is read once. A check
+that fails or hits a limit is "unknown", never "clean".
+
+Output   /run/edr-inventory/inventory.json (root:edr-agent 0640), written to .tmp and renamed:
+         {"v": 1, "written_at", "os_release", "checks": {<field>: {"status": true|false|"unknown", ...}},
+          "posture": {...}, "findings": [{"check", "sev", "summary", "details"}]}
+         status is true when the condition the field names is present (a vulnerable, exposed or
+         changed state, or the feature is in use), false when the check ran and found it absent,
+         "unknown" when it could not run or hit a limit.
+State    /var/lib/edr-inventory/state.json (baselines for auth_state and listeners, the nginx
+         debounce marker, when each security update was first seen)
+
+Usage    edr-inventory [--root DIR] [--dry-run] [--advisories FILE] [--include-root DIR]...
+                       [--exec-fixtures FILE] [--now EPOCH] [--stdout]
+         --root DIR       prefix every path with DIR (also EDR_AGENT_ROOT); tests and dev runs
+         --dry-run        run no program (those checks are unknown) and call no systemctl;
+                          without --root nothing is written
+         --exec-fixtures  JSON {"argv joined by spaces": {"rc": 0, "out": "...", "err": "..."}} standing in for programs
+Python standard library only, run as: python3 -I edr-inventory
+"""
+
+import configparser
+import glob
+import hashlib
+import ipaddress
+import json
+import os
+import re
+import stat
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+
+VERSION = "0.1.0"
+UNKNOWN = "unknown"
+
+# Parser limits for files a non-root user may be able to write (PLAN section 4.5.1)
+MAX_DEPTH = 8
+MAX_FILES = 500
+MAX_TOTAL = 4 * 1024 * 1024
+MAX_FILE = 1024 * 1024
+MAX_BLOCK_DEPTH = 64
+RUN_BUDGET_S = 100             # the unit has TimeoutStartSec=120
+NGINX_ROOT = "/etc/nginx"
+DEBOUNCE_S = 3600              # nginx's keepalive_time default
+
+
+class Limit(Exception):
+    """A parser limit was hit; the fields that depend on the file become unknown."""
+
+
+# ---- Environment: paths, programs, time ------------------------------------------------------------
+class Env:
+    def __init__(self, root="", dry=False, fixtures=None, now=None):
+        self.root = root.rstrip("/")
+        self.dry = dry
+        self.fixtures = fixtures
+        self.now = int(now if now is not None else time.time())
+        self.t0 = time.monotonic()
+        self.writes = bool(root) or not dry
+
+    def p(self, path):
+        return self.root + path
+
+    def over_budget(self):
+        return time.monotonic() - self.t0 > RUN_BUDGET_S
+
+    def run(self, argv, timeout=20):
+        """Run a program. Returns (rc, stdout, stderr) or None when it cannot run (dry run, missing, timeout)."""
+        key = " ".join(argv)
+        if self.fixtures is not None:
+            f = self.fixtures.get(key)
+            return (f.get("rc", 0), f.get("out", ""), f.get("err", "")) if isinstance(f, dict) else None
+        if self.dry or self.over_budget():
+            return None
+        env = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C", "LC_ALL": "C"}
+        try:
+            r = subprocess.run(argv, capture_output=True, timeout=timeout, check=False, env=env, stdin=subprocess.DEVNULL)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        return r.returncode, r.stdout.decode("utf-8", "replace"), r.stderr.decode("utf-8", "replace")
+
+
+def clean(text, limit=200):
+    """Printable ASCII only: this text is shown to people and sent to the hub."""
+    return "".join(c if " " <= c <= "~" else "?" for c in str(text))[:limit]
+
+
+def read_file(path, max_bytes=MAX_FILE, one_link=True):
+    """Read a file a less trusted user may control. Returns (bytes, stat_result).
+
+    Raises OSError or ValueError. No symlink, no FIFO or device, capped, read once.
+    """
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise ValueError("not a regular file")
+        if one_link and st.st_nlink != 1:
+            raise ValueError("more than one link")
+        if st.st_size > max_bytes:
+            raise ValueError("file too large")
+        chunks, total = [], 0
+        while True:
+            b = os.read(fd, 1 << 16)
+            if not b:
+                break
+            total += len(b)
+            if total > max_bytes:
+                raise ValueError("file too large")
+            chunks.append(b)
+        return b"".join(chunks), st
+    finally:
+        os.close(fd)
+
+
+def read_text(env, path, max_bytes=MAX_FILE, one_link=True):
+    """None when the file is absent, unreadable or over a limit."""
+    try:
+        data, _ = read_file(env.p(path), max_bytes, one_link)
+    except (OSError, ValueError):
+        return None
+    return data.decode("utf-8", "replace")
+
+
+def read_proc(env, path, max_bytes=4 * 1024 * 1024):
+    """/proc and /sys files report size 0 and have one link; no further checks apply."""
+    return read_text(env, path, max_bytes, one_link=False)
+
+
+# ---- Debian version comparison, in pure Python -------------------------------------------------------
+def _order(c):
+    if "0" <= c <= "9":
+        return 0
+    if c.isascii() and c.isalpha():
+        return ord(c)
+    if c == "~":
+        return -1
+    return ord(c) + 256
+
+
+def _verrevcmp(a, b):
+    i = j = 0
+    while i < len(a) or j < len(b):
+        first = 0
+        while (i < len(a) and not "0" <= a[i] <= "9") or (j < len(b) and not "0" <= b[j] <= "9"):
+            ac = _order(a[i]) if i < len(a) else 0
+            bc = _order(b[j]) if j < len(b) else 0
+            if ac != bc:
+                return ac - bc
+            i += 1
+            j += 1
+        while i < len(a) and a[i] == "0":
+            i += 1
+        while j < len(b) and b[j] == "0":
+            j += 1
+        while i < len(a) and j < len(b) and "0" <= a[i] <= "9" and "0" <= b[j] <= "9":
+            if not first:
+                first = ord(a[i]) - ord(b[j])
+            i += 1
+            j += 1
+        if i < len(a) and "0" <= a[i] <= "9":
+            return 1
+        if j < len(b) and "0" <= b[j] <= "9":
+            return -1
+        if first:
+            return first
+    return 0
+
+
+def split_version(v):
+    """(epoch, upstream, revision) of a Debian version string."""
+    epoch = 0
+    if ":" in v:
+        e, _, rest = v.partition(":")
+        if e.isdigit():
+            epoch, v = int(e), rest
+    upstream, rev = v, ""
+    if "-" in v:
+        upstream, _, rev = v.rpartition("-")
+    return epoch, upstream, rev
+
+
+def dpkg_compare(a, b):
+    """-1, 0 or 1 like `dpkg --compare-versions`. Raises ValueError on an empty or odd string."""
+    for v in (a, b):
+        if not isinstance(v, str) or not v or len(v) > 200 or not re.fullmatch(r"[0-9A-Za-z.+:~-]+", v):
+            raise ValueError("not a version")
+    ea, ua, ra = split_version(a)
+    eb, ub, rb = split_version(b)
+    if ea != eb:
+        return -1 if ea < eb else 1
+    for x, y in ((ua, ub), (ra, rb)):
+        d = _verrevcmp(x, y)
+        if d:
+            return -1 if d < 0 else 1
+    return 0
+
+
+def upstream_of(v):
+    return split_version(v)[1]
+
+
+# ---- dpkg and apt ---------------------------------------------------------------------------------------
+def dpkg_status(env):
+    """{package: {"version", "state", "hold"}} for installed packages, from /var/lib/dpkg/status."""
+    text = read_text(env, "/var/lib/dpkg/status", 128 * 1024 * 1024, one_link=False)
+    if text is None:
+        return None
+    pk = {}
+    for stanza in text.split("\n\n"):
+        f = {}
+        for line in stanza.split("\n"):
+            if line[:1] in (" ", "\t") or ":" not in line:
+                continue
+            k, _, v = line.partition(":")
+            if k in ("Package", "Status", "Version", "Architecture"):
+                f[k] = v.strip()
+        st = f.get("Status", "").split()
+        if f.get("Package") and len(st) == 3 and st[2] == "installed":
+            pk[f["Package"]] = {"version": f.get("Version", ""), "hold": st[0] == "hold"}
+    return pk
+
+
+def os_release(env):
+    text = read_text(env, "/etc/os-release", 64 * 1024, one_link=False) or ""
+    kv = {}
+    for line in text.splitlines():
+        k, eq, v = line.partition("=")
+        if eq:
+            kv[k.strip()] = v.strip().strip('"')
+    return {"id": clean(kv.get("ID", ""), 32), "version_id": clean(kv.get("VERSION_ID", ""), 16),
+            "codename": clean(kv.get("VERSION_CODENAME", ""), 32)}
+
+
+def origin_of(env, names):
+    """{package: "ubuntu"|"nginx.org"|"ppa"|"local"|"unknown"} from `apt-cache policy` (read only)."""
+    out = {}
+    r = env.run(["apt-cache", "-o", "Dir::Cache::pkgcache=", "-o", "Dir::Cache::srcpkgcache=", "policy"] + sorted(names))
+    if r is None or r[0] != 0:
+        return {n: UNKNOWN for n in names}
+    cur, installed, in_inst = None, None, False
+    srcs = {}
+    for line in r[1].splitlines():
+        if line and not line.startswith(" "):
+            cur = line.rstrip(":").strip()
+            installed, in_inst = None, False
+            srcs.setdefault(cur, [])
+            continue
+        s = line.strip()
+        if s.startswith("Installed:"):
+            installed = s.split(":", 1)[1].strip()
+        m = re.match(r"(\*\*\*\s+)?(\S+)\s+\d+\s*$", s)
+        if m and cur:
+            in_inst = bool(m.group(1)) and m.group(2) == installed
+            continue
+        if in_inst and cur and re.match(r"\d+\s+\S+", s):
+            srcs[cur].append(s)
+    for n in names:
+        lines = srcs.get(n, [])
+        joined = " ".join(lines).lower()
+        if "nginx.org" in joined:
+            out[n] = "nginx.org"
+        elif "ppa.launchpad" in joined or "launchpadcontent.net" in joined:
+            out[n] = "ppa"
+        elif re.search(r"/ubuntu\S* [a-z]+(-updates|-security|-backports)?/", joined) or "ubuntu" in joined:
+            out[n] = "ubuntu"
+        elif lines and all("/var/lib/dpkg/status" in s for s in lines):
+            out[n] = "local"
+        else:
+            out[n] = UNKNOWN
+    return out
+
+
+# ---- Advisories -------------------------------------------------------------------------------------------
+ROW_KEYS = ("id", "origin", "release", "packages", "compare", "fixed_in", "cves", "needs_feature", "ref")
+
+
+def valid_row(r):
+    return (isinstance(r, dict) and all(k in r for k in ROW_KEYS) and isinstance(r["id"], str)
+            and isinstance(r["origin"], str) and isinstance(r["release"], str)
+            and isinstance(r["packages"], list) and r["compare"] in ("dpkg", "upstream", "kernel")
+            and (r["fixed_in"] is None or isinstance(r["fixed_in"], str))
+            and isinstance(r["cves"], list) and (r["needs_feature"] is None or isinstance(r["needs_feature"], str))
+            and isinstance(r["ref"], str))
+
+
+def load_advisories(env, explicit):
+    """The shipped table, then rows from /etc/edr-agent/advisories.d/*.json: a row with the same id replaces."""
+    here = os.path.dirname(os.path.realpath(__file__))
+    cands = [explicit] if explicit else []
+    cands += [os.path.join(here, "advisories.json"), os.path.join(here, "files", "advisories.json"),
+              os.path.join(here, "..", "files", "advisories.json"), os.path.join(here, "..", "..", "common", "advisories.json")]
+    rows, updated = {}, None
+    for c in cands:
+        try:
+            with open(c, "rb") as fh:
+                doc = json.loads(fh.read(4 * 1024 * 1024).decode("utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(doc, dict) and isinstance(doc.get("rows"), list):
+            updated = doc.get("updated")
+            for r in doc["rows"]:
+                if valid_row(r):
+                    rows[r["id"]] = r
+            break
+    else:
+        return None, None
+    for path in sorted(glob.glob(env.p("/etc/edr-agent/advisories.d/*.json")))[:20]:
+        try:
+            data, _ = read_file(path, MAX_FILE)
+            doc = json.loads(data.decode("utf-8"))
+        except (OSError, ValueError):
+            continue
+        for r in (doc.get("rows", []) if isinstance(doc, dict) else []):
+            if valid_row(r):
+                rows[r["id"]] = r
+    return list(rows.values()), updated
+
+
+def row_origin(r):
+    o = r["origin"].lower()
+    if "nginx" in o and "org" in o:
+        return "nginx.org"
+    if o.startswith("kernel"):
+        return "kernel"
+    return o
+
+
+# ---- nginx configuration parser -------------------------------------------------------------------------
+class Directive:
+    __slots__ = ("name", "args", "block", "file", "line")
+
+    def __init__(self, name, args, block, file, line):
+        self.name, self.args, self.block, self.file, self.line = name, args, block, file, line
+
+
+def tokenize(text):
+    """Yield (kind, value, line). kind is 'w' (word), ';', '{' or '}'."""
+    i, n, line = 0, len(text), 1
+    while i < n:
+        c = text[i]
+        if c == "\n":
+            line += 1
+            i += 1
+        elif c in " \t\r":
+            i += 1
+        elif c == "#":
+            while i < n and text[i] != "\n":
+                i += 1
+        elif c in ";{}":
+            yield c, c, line
+            i += 1
+        elif c in "\"'":
+            q, j, buf = c, i + 1, []
+            while j < n and text[j] != q:
+                if text[j] == "\\" and j + 1 < n:
+                    j += 1
+                if text[j] == "\n":
+                    line += 1
+                buf.append(text[j])
+                j += 1
+            yield "w", "".join(buf), line
+            i = j + 1
+        else:
+            j = i
+            while j < n and text[j] not in " \t\r\n;{}":
+                if text[j] == "$" and j + 1 < n and text[j + 1] == "{":
+                    k = text.find("}", j)
+                    j = k + 1 if k != -1 else n
+                    continue
+                j += 1
+            yield "w", text[i:j], line
+            i = max(j, i + 1)
+
+
+class NginxConfig:
+    """Parse /etc/nginx with includes under the limits of PLAN section 4.5.1.
+
+    The tree is not trusted: includes may reach files a web user can write. Nothing is executed.
+    """
+
+    def __init__(self, env, include_roots=()):
+        self.env = env
+        base = env.p(NGINX_ROOT)
+        self.base = os.path.realpath(base)
+        self.roots = [self.base] + [os.path.realpath(env.p(r)) for r in include_roots]
+        self.files = 0
+        self.total = 0
+        self.problems = []          # {"kind": ..., "path": ...}
+        self.limit_hit = None
+        self.incomplete = False
+        self.root_dirs = []         # filled by analysis
+
+    def note(self, kind, path, incomplete=True):
+        if len(self.problems) < 30:
+            self.problems.append({"kind": kind, "path": clean(path, 160)})
+        if incomplete:
+            self.incomplete = True
+
+    def inside(self, rp):
+        return any(rp == r or rp.startswith(r + os.sep) for r in self.roots)
+
+    def parse_main(self):
+        main = os.path.join(self.base, "nginx.conf")
+        try:
+            return self.load(main, 0)
+        except Limit as e:
+            self.limit_hit = str(e)
+            self.incomplete = True
+            return []
+
+    def load(self, path, depth):
+        """Parse one file. Returns a list of Directive; includes are spliced in place."""
+        if depth > MAX_DEPTH:
+            self.note("include_depth", path)
+            raise Limit("include depth")
+        abspath = os.path.abspath(path)
+        rp = os.path.realpath(abspath)
+        if not self.inside(rp):
+            self.note("include_outside", abspath)
+            return []
+        if self.files >= MAX_FILES:
+            self.note("include_files", abspath)
+            raise Limit("file count")
+        try:
+            fd = os.open(rp, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+        except OSError:
+            self.note("include_unreadable", abspath)
+            return []
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                self.note("include_not_regular", abspath)
+                return []
+            if st.st_size > MAX_FILE or self.total + st.st_size > MAX_TOTAL:
+                self.note("include_too_large", abspath)
+                raise Limit("size")
+            writable = st.st_uid != 0 or bool(st.st_mode & 0o022)
+            if writable:
+                self.note("include_writable", abspath, incomplete=False)
+            if rp != abspath and writable:
+                # a symlink to a target a non-root user can write is not followed
+                self.note("include_symlink_writable", abspath)
+                return []
+            data = b""
+            while len(data) <= st.st_size:
+                b = os.read(fd, 1 << 16)
+                if not b:
+                    break
+                data += b
+                if len(data) > MAX_FILE:
+                    raise Limit("size")
+        finally:
+            os.close(fd)
+        self.files += 1
+        self.total += len(data)
+        return self.parse(data.decode("utf-8", "replace"), abspath, depth)
+
+    def parse(self, text, fname, depth):
+        top = []
+        stack = [top]
+        words, start = [], 0
+        owners = []                           # (name, args, line) of open blocks
+        for kind, val, line in tokenize(text):
+            if kind == "w":
+                if not words:
+                    start = line
+                words.append(val)
+            elif kind == ";" or kind == "{":
+                if not words:
+                    if kind == "{":
+                        self.note("syntax", fname)
+                    continue
+                name, args = words[0], words[1:]
+                words = []
+                if kind == ";":
+                    if name == "include" and len(args) == 1:
+                        stack[-1].extend(self.include(args[0], depth))
+                    else:
+                        stack[-1].append(Directive(name, args, None, fname, start))
+                else:
+                    if len(stack) > MAX_BLOCK_DEPTH:
+                        raise Limit("block depth")
+                    d = Directive(name, args, [], fname, start)
+                    stack[-1].append(d)
+                    stack.append(d.block)
+            else:                              # }
+                if len(stack) > 1:
+                    stack.pop()
+                else:
+                    self.note("syntax", fname)
+        if len(stack) > 1 or words:
+            self.note("syntax", fname)
+        return top
+
+    def include(self, pattern, depth):
+        if os.path.isabs(pattern):
+            pattern = self.env.p(pattern)
+        else:
+            pattern = os.path.join(self.base, pattern)
+        pattern = os.path.normpath(pattern)
+        if any(c in pattern for c in "*?["):
+            matches = sorted(glob.glob(pattern))
+            if len(matches) > MAX_FILES:
+                self.note("include_files", pattern)
+                raise Limit("file count")
+        else:
+            matches = [pattern]
+        out = []
+        for m in matches:
+            out.extend(self.load(m, depth + 1))
+        return out
+
+
+def walk(directives, ctx=()):
+    """Yield (directive, context names) depth first."""
+    for d in directives:
+        yield d, ctx
+        if d.block is not None:
+            yield from walk(d.block, ctx + (d.name,))
+
+
+def find_blocks(directives, name):
+    return [d for d, _ in walk(directives) if d.name == name and d.block is not None]
+
+
+def parse_listen(args):
+    """address, port, flags of a listen directive."""
+    if not args:
+        return None
+    target, flags = args[0], set(a.lower().split("=")[0] for a in args[1:])
+    addr, port = "*", 80
+    if target.startswith("unix:"):
+        return None
+    if target.startswith("["):
+        a, _, rest = target[1:].partition("]")
+        addr, port = a, int(rest[1:]) if rest[1:].isdigit() else 80
+    elif target.isdigit():
+        port = int(target)
+    elif ":" in target:
+        a, _, p = target.rpartition(":")
+        addr, port = a, int(p) if p.isdigit() else 80
+    else:
+        addr = target
+    return addr, port, flags
+
+
+def is_loopback(addr):
+    try:
+        return ipaddress.ip_address(addr).is_loopback
+    except ValueError:
+        return addr == "localhost"
+
+
+def last_arg(children, name):
+    """The last value of a simple directive among direct children, lower-cased, or None."""
+    val = None
+    for d in children:
+        if d.name == name and d.block is None and d.args:
+            val = d.args[0].lower()
+    return val
+
+
+def analyse_nginx(cfg, tree):
+    """Everything the checks need from the parsed tree."""
+    res = {"listens": [], "http2": False, "h2c": False, "http3": False, "tls": False, "mail": False,
+           "mail_public": False, "resolver": [], "resolver_bug": False, "mirror_body_off": False,
+           "roots": [], "access_logs": [], "error_logs": [], "log_formats": {}, "set_real_ip_from": [],
+           "real_ip_header": [], "user": "", "php_any": False, "php_locations": 0, "dotfile_deny": False,
+           "default_server": False, "pool_sockets": [], "uploads_hint": False}
+    has_var_proxy = has_resolver = has_mirror = False
+    for d, ctx in walk(tree):
+        n = d.name
+        if n == "user" and not ctx and d.args:
+            res["user"] = clean(d.args[0], 32)
+        if n == "root" and d.args and "location" not in ctx:
+            res["roots"].append(d.args[0])
+        if n == "access_log" and d.args and d.args[0] != "off":
+            res["access_logs"].append({"path": clean(d.args[0], 200), "format": clean(d.args[1], 64) if len(d.args) > 1 else "combined"})
+        if n == "error_log" and d.args:
+            res["error_logs"].append({"path": clean(d.args[0], 200), "level": clean(d.args[1], 16) if len(d.args) > 1 else "error"})
+        if n == "log_format" and len(d.args) >= 2:
+            fmt = [a for a in d.args[1:] if not a.startswith("escape=")]
+            esc = next((a.split("=", 1)[1] for a in d.args[1:] if a.startswith("escape=")), "default")
+            res["log_formats"][clean(d.args[0], 64)] = {
+                "starts_remote_addr": bool(fmt) and fmt[0].startswith("$remote_addr"),
+                "has_xff": bool(re.search(r"\$http_(x_forwarded_for|cf_connecting_ip|x_real_ip)", " ".join(fmt))),
+                "escape": clean(esc, 8)}
+        if n == "set_real_ip_from" and d.args:
+            res["set_real_ip_from"].append(clean(d.args[0], 64))
+        if n == "real_ip_header" and d.args:
+            res["real_ip_header"].append(clean(d.args[0], 64))
+        if n == "resolver" and d.args:
+            has_resolver = True
+            for a in d.args:
+                if not a.startswith(("valid=", "ipv", "status_zone=")):
+                    res["resolver"].append(clean(a, 64))
+        if n == "proxy_pass" and d.args and "$" in d.args[0]:
+            has_var_proxy = True
+        if n == "mirror" and d.args and d.args[0] != "off":
+            has_mirror = True
+        if n == "ssi" and d.args and d.args[0].lower() == "on":
+            has_mirror = True
+        if n == "mirror_request_body" and d.args and d.args[0].lower() == "off":
+            res["mirror_body_off"] = True
+        if n == "ssl_certificate":
+            res["tls"] = True
+        if n == "fastcgi_pass" and d.args:
+            res["pool_sockets"].append(clean(d.args[0], 120))
+        if n == "location" and "http" in ctx and d.args:
+            mod = d.args[0] if len(d.args) > 1 else ""
+            rx = d.args[-1]
+            if mod in ("~", "~*") and "php" in rx:
+                res["php_locations"] += 1
+                if "index\\.php" not in rx and "index.php" not in rx:
+                    res["php_any"] = True
+            if mod in ("~", "~*") and re.search(r"/\\\.", rx):
+                if any((x.name == "deny" and x.args[:1] == ["all"]) or (x.name == "return" and x.args[:1] in (["403"], ["404"], ["444"]))
+                       for x in (d.block or [])):
+                    res["dotfile_deny"] = True
+            if re.search(r"upload|storage|media|files", rx):
+                res["uploads_hint"] = True
+
+    # listen groups: HTTP/2 is on for an address:port when a listen has the parameter or any server
+    # sharing it has "http2 on" in effect (a leftover parameter keeps it on whatever "http2 off" says)
+    groups = {}
+    for h in find_blocks(tree, "http"):
+        http_h2 = last_arg(h.block, "http2")
+        for srv in (x for x in h.block if x.name == "server" and x.block is not None):
+            srv_h2 = last_arg(srv.block, "http2") or http_h2
+            for d in srv.block:
+                if d.name != "listen":
+                    continue
+                pl = parse_listen(d.args)
+                if not pl:
+                    continue
+                addr, port, flags = pl
+                g = groups.setdefault((addr, port), {"ssl": False, "nossl": False, "http2": False, "quic": False, "default": False})
+                if "ssl" in flags:
+                    g["ssl"] = True
+                elif "quic" not in flags:
+                    g["nossl"] = True
+                if "http2" in flags or srv_h2 == "on":
+                    g["http2"] = True
+                if "quic" in flags:
+                    g["quic"] = True
+                if "default_server" in flags:
+                    g["default"] = True
+    for (addr, port), g in groups.items():
+        res["listens"].append({"addr": clean(addr, 64), "port": port, "ssl": g["ssl"], "http2": g["http2"], "quic": g["quic"]})
+        if g["http2"]:
+            res["http2"] = True
+            if g["nossl"]:
+                res["h2c"] = True               # cleartext HTTP/2: an ALPN check cannot see it
+        if g["quic"]:
+            res["http3"] = True
+        if g["ssl"]:
+            res["tls"] = True
+        if g["default"] and port in (80, 443):
+            res["default_server"] = True
+    for m in find_blocks(tree, "mail"):
+        inner = list(walk(m.block))
+        proxy_on = any(x.name == "proxy" and x.args[:1] == ["on"] for x, _ in inner)
+        auth = any(x.name == "auth_http" for x, _ in inner)
+        if proxy_on and auth:
+            servers = find_blocks(m.block, "server")
+            if not servers:
+                res["mail_public"] = True
+            for s in servers:
+                for x in s.block:
+                    if x.name == "listen":
+                        pl = parse_listen(x.args)
+                        if pl and not is_loopback(pl[0]):
+                            res["mail_public"] = True
+            res["mail"] = res["mail_public"]       # every mail listener on loopback is not exposed
+    res["resolver_bug"] = has_resolver and has_var_proxy and has_mirror
+    return res
+
+
+def nginx_tree(env, include_roots):
+    cfg = NginxConfig(env, include_roots)
+    tree = cfg.parse_main()
+    return cfg, tree
+
+
+# ---- /proc helpers ---------------------------------------------------------------------------------------
+def list_pids(env):
+    try:
+        names = os.listdir(env.p("/proc"))
+    except OSError:
+        return []
+    return sorted(int(n) for n in names if n.isdigit())
+
+
+def proc_start(env, pid, btime):
+    st = read_proc(env, "/proc/%d/stat" % pid, 4096)
+    if not st or ")" not in st:
+        return None
+    fields = st.rsplit(")", 1)[1].split()
+    try:
+        ticks = int(fields[19])
+    except (IndexError, ValueError):
+        return None
+    hz = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
+    return int(btime + ticks / hz)
+
+
+def boot_time(env):
+    t = read_proc(env, "/proc/stat", 1 << 20) or ""
+    m = re.search(r"^btime\s+(\d+)", t, re.M)
+    return int(m.group(1)) if m else 0
+
+
+def listeners(env):
+    """[{"port", "addr", "pid", "name"}] from `ss -ltnpH`, or None."""
+    r = env.run(["ss", "-ltnpH"])
+    if r is None or r[0] != 0:
+        return None
+    out = []
+    for line in r[1].splitlines():
+        f = line.split()
+        if len(f) < 4:
+            continue
+        local = f[3]
+        addr, _, port = local.rpartition(":")
+        addr = addr.strip("[]").split("%")[0]
+        if not port.isdigit():
+            continue
+        m = re.search(r'\(\("([^"]*)",pid=(\d+)', line)
+        out.append({"port": int(port), "addr": clean(addr, 64), "pid": int(m.group(2)) if m else 0,
+                    "name": clean(m.group(1), 32) if m else ""})
+    return out
+
+
+# ---- The checks -------------------------------------------------------------------------------------------
+def feature_flags(exp):
+    """Exposure of each feature a row can need: True, False or UNKNOWN."""
+    return {"http2": exp["http2"], "http3": exp["http3"], "mail": exp["mail"], "resolver": exp["resolver_bug"],
+            "h2c": exp["h2c"], "tls": exp["tls"]}
+
+
+def feature_for(name, flags):
+    """Map the needs_feature text of an advisory row to an exposure value."""
+    if name is None:
+        return None
+    n = name.lower()
+    if n in ("http2", "h2", "http/2"):
+        return flags["http2"]
+    if n in ("http3", "quic", "http/3"):
+        return flags["http3"]
+    if n in ("mail", "mail_proxy", "mail-proxy"):
+        return flags["mail"]
+    if n in ("resolver", "resolver_variable", "resolver-bug"):
+        return flags["resolver"]
+    if n in ("tls", "https", "ssl"):
+        return flags["tls"]
+    return UNKNOWN
+
+
+def rate_row(needs, need, flags, mirror_off):
+    """The client's rating of a package below its fix (PLAN section 4.5.1): exposed and unfixed is HIGH,
+    the resolver bug without `mirror_request_body off` is MEDIUM. With no feature named (the version
+    alone decides) any of HTTP/2, HTTP/3 or mail exposed is HIGH, a TLS listener alone is MEDIUM (the
+    hub raises it to HIGH after 24 h), and nothing exposed is a LOW digest entry."""
+    if needs is None:
+        hard = [flags["http2"], flags["http3"], flags["mail"]]
+        if any(v is True for v in hard):
+            return "HIGH"
+        if flags["resolver"] is True:
+            return "HIGH" if mirror_off else "MEDIUM"
+        if any(v == UNKNOWN for v in hard + [flags["resolver"]]):
+            return "MEDIUM"
+        return "MEDIUM" if flags["tls"] is True else "LOW"
+    if need is True:
+        return "MEDIUM" if needs.lower().startswith("resolver") and not mirror_off else "HIGH"
+    if need == UNKNOWN:
+        return "MEDIUM"
+    return "LOW"
+
+
+def tri(found, incomplete):
+    """A feature found in the parsed text is real; absence counts only if the parse was complete."""
+    if found:
+        return True
+    return UNKNOWN if incomplete else False
+
+
+class Inventory:
+    def __init__(self, env, rows, include_roots, state):
+        self.env = env
+        self.rows = rows
+        self.include_roots = include_roots
+        self.state = state
+        self.checks = {}
+        self.findings = []
+        self.posture = {}
+        self.codename = os_release(env)["codename"]
+        self.cache = {}
+
+    def finding(self, check, sev, summary, **details):
+        self.findings.append({"check": check, "sev": sev, "summary": clean(summary, 240), "details": details})
+
+    # -- nginx configuration, parsed once
+    def nginx(self):
+        if "nginx" not in self.cache:
+            cfg, tree = nginx_tree(self.env, self.include_roots)
+            present = os.path.isfile(os.path.join(cfg.base, "nginx.conf"))
+            exp = analyse_nginx(cfg, tree) if present else None
+            self.cache["nginx"] = (cfg, tree, exp, present)
+        return self.cache["nginx"]
+
+    def packages(self):
+        if "pk" not in self.cache:
+            self.cache["pk"] = dpkg_status(self.env)
+        return self.cache["pk"]
+
+    # -- nginx_pkg, nginx_build
+    def check_nginx_pkg(self):
+        pk = self.packages()
+        if pk is None:
+            return {"status": UNKNOWN, "error": "dpkg status unreadable"}
+        names = sorted(n for n in pk if n == "nginx" or n.startswith("nginx-") and n != "nginx-common")
+        if not names:
+            return {"status": False, "installed": False}
+        origins = origin_of(self.env, names)
+        cfg, tree, exp, present = self.nginx()
+        incomplete = cfg.incomplete if present else True
+        flags = feature_flags(exp) if exp else {k: UNKNOWN for k in ("http2", "http3", "mail", "resolver", "h2c", "tls")}
+        if exp:
+            for k in ("http2", "http3", "mail", "resolver", "h2c", "tls"):
+                flags[k] = tri(flags[k], incomplete)
+        out = {"status": False, "installed": True, "packages": [], "advisories": []}
+        worst = None
+        sevorder = ["LOW", "MEDIUM", "HIGH"]
+        if self.rows is None:
+            out["status"] = UNKNOWN
+            out["error"] = "no advisory file"
+        for n in names:
+            v = pk[n]["version"]
+            o = origins.get(n, UNKNOWN)
+            out["packages"].append({"name": clean(n, 64), "version": clean(v, 80), "origin": o})
+        for p in out["packages"] if self.rows is not None else []:
+            n, v, o = p["name"], p["version"], p["origin"]
+            matching = [r for r in self.rows if r["compare"] in ("dpkg", "upstream") and n in r["packages"]
+                        and row_origin(r) == o and r["release"] in (self.codename, "any")]
+            if not matching:
+                p["verdict"] = UNKNOWN
+                p["note"] = ("no advisory row for this release; check by hand" if o in ("ubuntu", "nginx.org")
+                             else "origin cannot be judged; check by hand")
+                continue
+            vuln_rows = []
+            groups = {}
+            for r in matching:
+                if r["compare"] == "upstream":
+                    groups.setdefault((r["origin"], tuple(r["packages"]), r["release"]), []).append(r)
+                elif r["fixed_in"] is None:
+                    vuln_rows.append((r, "no fix known"))
+                else:
+                    try:
+                        if dpkg_compare(v, r["fixed_in"]) < 0:
+                            vuln_rows.append((r, "below fix"))
+                    except ValueError:
+                        pass
+            for g in groups.values():
+                try:
+                    u = upstream_of(v)
+                    branch = ".".join(u.split(".")[:2])
+                    same = [r for r in g if r["fixed_in"] and ".".join(upstream_of(r["fixed_in"]).split(".")[:2]) == branch]
+                    if same:
+                        for r in same:
+                            if dpkg_compare(u, upstream_of(r["fixed_in"])) < 0:
+                                vuln_rows.append((r, "below fix"))
+                    else:
+                        top = max((r for r in g if r["fixed_in"]), key=lambda r: [int(x) if x.isdigit() else 0 for x in re.split(r"[.]", upstream_of(r["fixed_in"]))], default=None)
+                        if top and dpkg_compare(u, upstream_of(top["fixed_in"])) < 0:
+                            vuln_rows.append((top, "below fix"))
+                except ValueError:
+                    pass
+            p["verdict"] = bool(vuln_rows)
+            for r, why in vuln_rows:
+                need = feature_for(r["needs_feature"], flags)
+                sev = rate_row(r["needs_feature"], need, flags, bool(exp and exp["mirror_body_off"]))
+                a = {"id": clean(r["id"], 64), "package": n, "installed": clean(v, 80), "fixed_in": r["fixed_in"],
+                     "cves": [clean(c, 32) for c in r["cves"][:12]], "ref": clean(r["ref"], 160), "feature": r["needs_feature"],
+                     "exposed": need, "sev": sev, "why": why}
+                out["advisories"].append(a)
+                if worst is None or sevorder.index(sev) > sevorder.index(worst[0]):
+                    worst = (sev, a)
+        if out["advisories"]:
+            out["status"] = True
+        elif out["status"] is not UNKNOWN and any(p.get("verdict") == UNKNOWN for p in out["packages"]):
+            out["status"] = UNKNOWN
+        if worst:
+            sev, a = worst
+            self.finding("nginx_pkg", sev,
+                         "nginx %s is below its security fix %s (%s)" % (a["installed"], a["fixed_in"], ", ".join(a["cves"][:3]) or a["id"]),
+                         package=a["package"], installed=a["installed"], fixed_in=a["fixed_in"], advisory=a["id"],
+                         cves=a["cves"], feature=a["feature"], exposed=a["exposed"], ref=a["ref"],
+                         advisories=[x["id"] for x in out["advisories"]])
+        return out
+
+    def check_nginx_build(self):
+        r = self.env.run(["nginx", "-V"])
+        if r is None:
+            return {"status": UNKNOWN, "error": "nginx -V did not run"}
+        text = r[2] + r[1]
+        if r[0] != 0 and "configure arguments" not in text:
+            return {"status": False, "installed": False}
+        m = re.search(r"nginx version: nginx/([0-9][0-9A-Za-z.+~-]*)", text)
+        args = re.search(r"configure arguments:(.*)", text)
+        a = args.group(1) if args else ""
+        blockers = [k for k in ("lua", "perl", "rtmp", "passenger", "njs") if re.search(r"(^|[-_/ ])%s" % k, a)]
+        return {"status": True, "version": clean(m.group(1), 32) if m else "", "http_v2": "http_v2_module" in a,
+                "http_v3": "http_v3_module" in a, "mail": "--with-mail" in a, "stream": "--with-stream" in a,
+                "exec_blockers": blockers, "modules": len(re.findall(r"--with-|--add-", a))}
+
+    # -- nginx_exposure, udp443
+    def check_nginx_exposure(self):
+        cfg, tree, exp, present = self.nginx()
+        if not present:
+            return {"status": False, "installed": False, "problems": []}
+        inc = cfg.incomplete
+        flags = {k: tri(v, inc) for k, v in feature_flags(exp).items()}
+        out = {"status": UNKNOWN, "http2": flags["http2"], "h2c": flags["h2c"], "http3": flags["http3"],
+               "mail": flags["mail"], "resolver_bug": flags["resolver"], "tls": flags["tls"],
+               "resolver": sorted(set(exp["resolver"]))[:8], "mirror_request_body_off": exp["mirror_body_off"],
+               "listens": exp["listens"][:16], "problems": cfg.problems[:30], "limit_hit": cfg.limit_hit,
+               "files_read": cfg.files}
+        found = any(flags[k] is True for k in ("http2", "http3", "mail", "resolver", "h2c"))
+        unknown = any(v == UNKNOWN for v in flags.values())
+        out["status"] = True if found else (UNKNOWN if unknown else False)
+        out["features"] = [k for k in ("http2", "h2c", "http3", "mail", "resolver") if flags[k] is True]
+        writable = [p for p in cfg.problems if p["kind"] in ("include_writable", "include_symlink_writable")]
+        if writable:
+            self.finding("nginx_exposure", "MEDIUM", "an nginx include file can be written by a non-root user",
+                         files=[p["path"] for p in writable[:10]])
+        outside = [p for p in cfg.problems if p["kind"] == "include_outside"]
+        if outside:
+            self.finding("nginx_exposure", "LOW", "an nginx include points outside /etc/nginx and was not read",
+                         files=[p["path"] for p in outside[:10]])
+        return out
+
+    def check_udp443(self):
+        r = self.env.run(["ss", "-lunH", "sport = :443"])
+        if r is None or r[0] != 0:
+            return {"status": UNKNOWN}
+        return {"status": bool(r[1].strip())}
+
+    def check_nginx_logs(self):
+        cfg, tree, exp, present = self.nginx()
+        if not present:
+            return {"status": False, "installed": False}
+        return {"status": True if not cfg.incomplete else UNKNOWN, "access_logs": exp["access_logs"][:8],
+                "error_logs": exp["error_logs"][:8], "log_formats": dict(list(exp["log_formats"].items())[:8]),
+                "complete": not cfg.incomplete}
+
+    def check_real_ip(self):
+        cfg, tree, exp, present = self.nginx()
+        if not present:
+            return {"status": False, "installed": False}
+        xff = any(f["has_xff"] for f in exp["log_formats"].values())
+        found = bool(exp["set_real_ip_from"] or exp["real_ip_header"] or xff)
+        return {"status": True if found else (UNKNOWN if cfg.incomplete else False),
+                "set_real_ip_from": exp["set_real_ip_from"][:8], "header": exp["real_ip_header"][:2], "xff_format": xff}
+
+    # -- deleted_exe
+    def check_deleted_exe(self):
+        env = self.env
+        pids = list_pids(env)
+        if not pids and not os.path.isdir(env.p("/proc")):
+            return {"status": UNKNOWN}
+        btime = boot_time(env)
+        ls = listeners(env) or []
+        public_pids = {l["pid"] for l in ls if l["pid"] and not is_loopback(l["addr"])}
+        found, nginx_stale, truncated = [], [], False
+        nginx_pids = []
+        for pid in pids:
+            if env.over_budget():
+                return {"status": UNKNOWN, "error": "time budget"}
+            try:
+                comm = (read_proc(env, "/proc/%d/comm" % pid, 64) or "").strip()
+                exe = os.readlink(env.p("/proc/%d/exe" % pid))
+            except OSError:
+                continue
+            base = os.path.basename(exe.replace(" (deleted)", ""))
+            if base == "nginx" or comm == "nginx":
+                nginx_pids.append(pid)
+            kinds = []
+            if exe.endswith(" (deleted)"):
+                kinds.append(("exe", exe[:-10]))
+            maps = read_proc(env, "/proc/%d/maps" % pid, 2 * 1024 * 1024) or ""
+            for line in maps.splitlines():
+                if line.endswith(" (deleted)"):
+                    path = line.split(None, 5)[-1] if len(line.split(None, 5)) >= 6 else ""
+                    path = path[:-10]
+                    if ".so" in path and not path.startswith(("/tmp", "/dev/shm", "/memfd:")) and "memfd:" not in path:
+                        kinds.append(("lib", path))
+                        break
+            if not kinds:
+                continue
+            cg = read_proc(env, "/proc/%d/cgroup" % pid, 2048) or ""
+            m = re.search(r"/([A-Za-z0-9@:._-]+\.service)\s*$", cg, re.M)
+            unit = m.group(1) if m else ""
+            important = (base == "nginx" or base.startswith("php-fpm") or base.startswith("sshd") or pid in public_pids)
+            entry = {"pid": pid, "comm": clean(comm, 16), "exe": clean(kinds[0][1], 120), "kind": kinds[0][0],
+                     "unit": clean(unit, 64), "important": important}
+            if len(found) < 50:
+                found.append(entry)
+            else:
+                truncated = True
+            if base == "nginx" or comm == "nginx":
+                nginx_stale.append(pid)
+        starts = [s for s in (proc_start(env, p, btime) for p in nginx_pids) if s]
+        out = {"status": bool(found), "processes": found, "truncated": truncated,
+               "nginx_stale": bool(nginx_stale), "nginx_started_min": min(starts) if starts else 0,
+               "nginx_started_max": max(starts) if starts else 0}
+        rr = read_proc(env, "/run/reboot-required", 4096) is not None or os.path.exists(env.p("/var/run/reboot-required"))
+        out["reboot_required"] = bool(rr)
+        # nginx: debounce, then rate (PLAN 4.5.1)
+        st = self.state
+        now = env.now
+        key_first = "nginx_stale_first"
+        important = [e for e in found if e["important"] and not (e["comm"] == "nginx")]
+        if nginx_stale:
+            first = st.get(key_first)
+            installed_at = 0
+            try:
+                installed_at = int(os.stat(env.p("/usr/sbin/nginx")).st_mtime)
+            except OSError:
+                pass
+            if not first:
+                st[key_first] = now
+                out["debounce"] = "first sighting: re-check in 15 minutes"
+                if not env.dry:
+                    env.run(["systemd-run", "--on-active=15m", "--unit=edr-inventory-recheck", "--collect",
+                             "systemctl", "start", "--no-block", "edr-inventory.service"])
+            elif now - first >= 600 or (installed_at and now - installed_at > DEBOUNCE_S):
+                self.finding("deleted_exe", "HIGH", "nginx is running a binary that was replaced on disk (%d process(es))" % len(nginx_stale),
+                             unit="nginx.service", pids=nginx_stale[:8], first_seen=first)
+            else:
+                out["debounce"] = "waiting for the second sighting"
+            if installed_at and now - installed_at > DEBOUNCE_S and first:
+                pass
+        else:
+            st.pop(key_first, None)
+        for e in important:
+            self.finding("deleted_exe", "HIGH", "%s runs a replaced %s: %s" % (e["comm"] or "process", e["kind"] == "exe" and "binary" or "library", e["exe"]),
+                         pid=e["pid"], unit=e["unit"], comm=e["comm"], exe=e["exe"])
+        others = [e for e in found if not e["important"] and e["comm"] != "nginx"]
+        if others:
+            self.finding("deleted_exe", "LOW", "%d other process(es) run replaced files (restart them or reboot)" % len(others),
+                         units=sorted({e["unit"] for e in others if e["unit"]})[:10], count=len(others))
+        return out
+
+    # -- security_pending
+    def check_security_pending(self):
+        env = self.env
+        r = env.run(["apt-get", "-s", "-o", "Debug::NoLocking=1", "-o", "Dir::Cache::pkgcache=", "-o", "Dir::Cache::srcpkgcache=",
+                     "dist-upgrade"], timeout=40)
+        if r is None or r[0] != 0:
+            return {"status": UNKNOWN, "error": "apt-get -s failed"}
+        pk = self.packages() or {}
+        pending, keptback, in_kept = [], [], False
+        for line in r[1].splitlines():
+            if line.startswith("The following packages have been kept back"):
+                in_kept = True
+                continue
+            if in_kept:
+                if line.startswith("  "):
+                    keptback.extend(line.split())
+                    continue
+                in_kept = False
+            m = re.match(r"Inst (\S+) \[([^\]]+)\] \((\S+) ([^\]]*)", line) or re.match(r"Inst (\S+) \((\S+) ([^\]]*)", line)
+            if not m:
+                continue
+            if len(m.groups()) == 4:
+                name, inst, cand, rest = m.groups()
+            else:
+                name, cand, rest = m.groups()
+                inst = ""
+            if "-security" in rest:
+                pending.append({"pkg": clean(name, 64), "installed": clean(inst, 80), "candidate": clean(cand, 80)})
+        seen = self.state.setdefault("security_seen", {})
+        now = env.now
+        live = {}
+        for p in pending:
+            k = p["pkg"] + "=" + p["candidate"]
+            live[k] = seen.get(k, now)
+            p["since"] = live[k]
+        self.state["security_seen"] = dict(list(live.items())[:500])
+        held = sum(1 for v in pk.values() if v.get("hold"))
+        phased = len([k for k in keptback if k not in pk or not pk[k].get("hold")])
+        lists_age = None
+        newest = 0
+        try:
+            for fn in os.listdir(env.p("/var/lib/apt/lists")):
+                if fn.endswith("_Packages") or fn.endswith("_InRelease") or fn.endswith("Release"):
+                    newest = max(newest, int(os.stat(os.path.join(env.p("/var/lib/apt/lists"), fn)).st_mtime))
+        except OSError:
+            pass
+        if newest:
+            lists_age = int((now - newest) / 3600)
+        out = {"status": bool(pending), "pending": pending[:50], "count": len(pending), "lists_age_hours": lists_age,
+               "held": held, "phased": phased, "stale_lists": bool(lists_age is not None and lists_age > 48)}
+        if pending:
+            old = [p for p in pending if now - p["since"] > 7 * 86400]
+            nginx_pending = [p for p in pending if p["pkg"].startswith("nginx")]
+            sev = "LOW"
+            if old or any(p["pkg"].startswith(("openssl", "openssh", "linux-image", "libssl", "nginx", "php")) for p in pending):
+                sev = "MEDIUM"
+            if nginx_pending:
+                cfg, tree, exp, present = self.nginx()
+                if exp and any(feature_flags(exp)[k] for k in ("http2", "http3", "mail", "resolver")):
+                    sev = "HIGH"
+            self.finding("security_pending", sev, "%d security update(s) not installed" % len(pending),
+                         count=len(pending), packages=[p["pkg"] for p in pending[:20]], oldest_since=min(p["since"] for p in pending),
+                         lists_age_hours=lists_age)
+        return out
+
+    # -- sctp, kernel_pending
+    def check_sctp(self):
+        env = self.env
+        loaded = os.path.isdir(env.p("/sys/module/sctp")) and os.path.exists(env.p("/sys/module/sctp/initstate"))
+        release = (read_proc(env, "/proc/sys/kernel/osrelease", 128) or "").strip()
+        builtin = False
+        if release and re.fullmatch(r"[0-9A-Za-z.+_-]+", release):
+            mb = read_proc(env, "/lib/modules/%s/modules.builtin" % release, 16 * 1024 * 1024)
+            cfg = read_proc(env, "/boot/config-%s" % release, 4 * 1024 * 1024)
+            if mb is not None:
+                builtin = "kernel/net/sctp/sctp.ko" in mb
+            if cfg is not None and re.search(r"^CONFIG_IP_SCTP=y", cfg, re.M):
+                builtin = True
+            if mb is None and cfg is None and not loaded:
+                known = False
+            else:
+                known = True
+        else:
+            known = False
+        blocked = None
+        r = env.run(["modprobe", "-n", "-v", "sctp"])
+        if r is not None:
+            blocked = bool(re.search(r"install\s+/bin/(false|true)", r[1] + r[2])) or bool(re.search(r"install\s+/usr/bin/(false|true)", r[1] + r[2]))
+        else:
+            # without modprobe: read the drop-ins
+            txt = ""
+            try:
+                for fn in sorted(os.listdir(env.p("/etc/modprobe.d")))[:100]:
+                    t = read_text(env, "/etc/modprobe.d/" + fn, 65536, one_link=False)
+                    txt += t or ""
+                blocked = bool(re.search(r"^\s*install\s+sctp\s+/(usr/)?bin/(false|true)", txt, re.M))
+            except OSError:
+                blocked = None
+        out = {"loaded": loaded, "blocked": blocked, "builtin": builtin}
+        if builtin or loaded:
+            out["status"] = True
+        elif blocked is None or not known:
+            out["status"] = UNKNOWN
+        else:
+            out["status"] = not blocked
+        out["advisories"] = [r["id"] for r in (self.rows or []) if r["compare"] == "kernel" and r["fixed_in"] is None][:4]
+        if out["status"] is True:
+            how = "built in" if builtin else ("loaded" if loaded else "loadable")
+            self.finding("sctp", "MEDIUM", "SCTP is %s (NGINX2Root's root step)" % how, loaded=loaded, blocked=blocked, builtin=builtin)
+        return out
+
+    def check_kernel_pending(self):
+        env = self.env
+        sig = read_proc(env, "/proc/version_signature", 512)
+        if not sig:
+            return {"status": UNKNOWN, "error": "no /proc/version_signature"}
+        parts = sig.split()
+        if len(parts) < 2:
+            return {"status": UNKNOWN}
+        token = parts[1]
+        running = re.sub(r"-[a-z][a-z0-9]*$", "", token)
+        m = re.match(r"(\d+)\.(\d+)\.", running)
+        if not m or not re.fullmatch(r"[0-9A-Za-z.+~-]+", running):
+            return {"status": UNKNOWN, "error": "odd kernel version"}
+        series = "%s-%s.%s" % (self.codename, m.group(1), m.group(2))
+        reboot = os.path.exists(env.p("/run/reboot-required")) or os.path.exists(env.p("/var/run/reboot-required"))
+        out = {"running": clean(running, 64), "series": series, "reboot_required": reboot}
+        if self.rows is None:
+            out["status"] = UNKNOWN
+            out["error"] = "no advisory file"
+            return out
+        mine = [r for r in self.rows if r["compare"] == "kernel" and r["fixed_in"] and r["release"] in (series, self.codename)]
+        # a flavour row ("noble-6.8") beats a plain release row
+        mine.sort(key=lambda r: r["release"] != series)
+        if not mine:
+            out["status"] = UNKNOWN
+            out["error"] = "no advisory row for this kernel series"
+            return out
+        bad = []
+        for r in mine:
+            if r["release"] != mine[0]["release"]:
+                continue
+            try:
+                if dpkg_compare(running, r["fixed_in"]) < 0:
+                    bad.append(r)
+            except ValueError:
+                pass
+        out["status"] = bool(bad)
+        out["advisories"] = [{"id": clean(r["id"], 64), "fixed_in": r["fixed_in"], "cves": [clean(c, 32) for c in r["cves"][:6]]} for r in bad]
+        if bad:
+            self.finding("kernel_pending", "MEDIUM", "the running kernel %s is below its fix %s (reboot needed after the update)" % (clean(running, 40), bad[0]["fixed_in"]),
+                         running=out["running"], fixed_in=bad[0]["fixed_in"], advisory=bad[0]["id"],
+                         cves=[clean(c, 32) for c in bad[0]["cves"][:6]], reboot_required=reboot)
+        return out
+
+    # -- php
+    def check_php(self):
+        env = self.env
+        pk = self.packages()
+        if pk is None:
+            return {"status": UNKNOWN}
+        pkgs = [{"name": clean(n, 48), "version": clean(v["version"], 64)} for n, v in sorted(pk.items())
+                if re.fullmatch(r"php[0-9.]*-fpm", n)]
+        masters = []
+        for pid in list_pids(env):
+            try:
+                exe = os.readlink(env.p("/proc/%d/exe" % pid))
+            except OSError:
+                continue
+            b = os.path.basename(exe.replace(" (deleted)", ""))
+            if re.fullmatch(r"php-fpm[0-9.]*", b):
+                cm = (read_proc(env, "/proc/%d/cmdline" % pid, 4096) or "")
+                if "master process" in cm or not any(m["exe"] == exe for m in masters):
+                    masters.append({"pid": pid, "exe": clean(exe, 80)})
+            if len(masters) >= 16:
+                break
+        pools = self.pools()
+        return {"status": bool(pkgs or masters), "packages": pkgs, "masters": masters, "pools": pools[:32]}
+
+    def pools(self):
+        if "pools" in self.cache:
+            return self.cache["pools"]
+        env = self.env
+        pools = []
+        for path in sorted(glob.glob(env.p("/etc/php/*/fpm/pool.d/*.conf")))[:64]:
+            try:
+                data, _ = read_file(path, MAX_FILE)
+            except (OSError, ValueError):
+                continue
+            cur = None
+            for line in data.decode("utf-8", "replace").splitlines():
+                s = line.split(";", 1)[0].strip()
+                m = re.match(r"\[([^\]]+)\]$", s)
+                if m:
+                    cur = {"name": clean(m.group(1), 48), "user": "", "listen": "", "limit_extensions": None,
+                           "open_basedir": False, "disable_functions": False, "file": clean(path[len(env.root):], 120)}
+                    pools.append(cur)
+                    continue
+                kv = re.match(r"([A-Za-z_.\[\]]+)\s*=\s*(.*)$", s)
+                if cur is None or not kv:
+                    continue
+                k, v = kv.group(1), kv.group(2).strip().strip('"')
+                if k == "user":
+                    cur["user"] = clean(v, 32)
+                elif k == "listen":
+                    cur["listen"] = clean(v, 120)
+                elif k == "security.limit_extensions":
+                    cur["limit_extensions"] = clean(v, 64)
+                elif re.match(r"php_(admin_)?value\[open_basedir\]", k) and v:
+                    cur["open_basedir"] = True
+                elif re.match(r"php_(admin_)?value\[disable_functions\]", k) and v:
+                    cur["disable_functions"] = True
+        self.cache["pools"] = pools
+        return pools
+
+    # -- coverage drift, from what discover recorded in local.conf
+    def check_uncovered(self):
+        env = self.env
+        cp = configparser.ConfigParser(interpolation=None, strict=False)
+        txt = read_text(env, "/etc/edr-agent/local.conf", 256 * 1024)
+        if txt is None:
+            return None
+        try:
+            cp.read_string(txt)
+        except configparser.Error:
+            return None
+
+        def lst(key):
+            if not cp.has_option("sites", key):
+                return None
+            return [x.strip() for x in cp.get("sites", key).split(",") if x.strip()]
+        roots, bins, users = lst("web_roots"), lst("phpfpm_bins"), lst("web_users")
+        cfg, tree, exp, present = self.nginx()
+        res = {}
+        # web roots
+        if roots is None or not present:
+            res["uncovered_webroots"] = {"status": UNKNOWN}
+        else:
+            found = sorted({os.path.normpath(r) for r in exp["roots"] if r.startswith("/")})
+            miss = [r for r in found if not any(r == c.rstrip("/") or r.startswith(c.rstrip("/") + "/") or
+                                                 c.startswith(r.rstrip("/") + "/") for c in roots)]
+            res["uncovered_webroots"] = {"status": True if miss else (UNKNOWN if cfg.incomplete else False), "paths": [clean(m, 160) for m in miss[:10]]}
+        # php-fpm binaries
+        pm = self.check_php()
+        if bins is None or pm.get("status") is UNKNOWN:
+            res["uncovered_fpm_binaries"] = {"status": UNKNOWN}
+        else:
+            run = sorted({m["exe"] for m in pm.get("masters", [])})
+            miss = [b for b in run if b not in bins]
+            res["uncovered_fpm_binaries"] = {"status": bool(miss), "paths": miss[:10]}
+        # pool and nginx users
+        if users is None:
+            res["uncovered_pool_users"] = {"status": UNKNOWN}
+        else:
+            have = {p["user"] for p in self.pools() if p["user"]}
+            if present and exp["user"]:
+                have.add(exp["user"])
+            miss = sorted(u for u in have if u not in users)
+            res["uncovered_pool_users"] = {"status": bool(miss), "users": [clean(u, 32) for u in miss[:10]]}
+        for name, r in res.items():
+            if r["status"] is True:
+                self.finding(name, "MEDIUM", "%s: run edr-agent discover, then apply-config" % name.replace("_", " "),
+                             **{k: v for k, v in r.items() if k != "status"})
+        return res
+
+    # -- auth_state (P1b)
+    def check_auth_state(self):
+        env = self.env
+        pw = read_text(env, "/etc/passwd", MAX_FILE, one_link=False)
+        if pw is None:
+            return {"status": UNKNOWN}
+        uid0 = sorted(l.split(":")[0] for l in pw.splitlines() if l.count(":") >= 6 and l.split(":")[2] == "0")
+        uid0_h = sorted(hashlib.sha256(n.encode()).hexdigest()[:16] for n in uid0)
+        sud = hashlib.sha256()
+        files = ["/etc/sudoers"] + ["/etc/sudoers.d/" + f for f in sorted(os.listdir(env.p("/etc/sudoers.d")))[:200]] \
+            if os.path.isdir(env.p("/etc/sudoers.d")) else ["/etc/sudoers"]
+        sud_ok = True
+        for f in files:
+            t = read_text(env, f, MAX_FILE, one_link=False)
+            if t is None:
+                if f == "/etc/sudoers":
+                    sud_ok = False
+                continue
+            sud.update(f.encode() + b"\0" + t.encode("utf-8", "replace"))
+        keys = {}
+        homes = ["/root"] + sorted({l.split(":")[5] for l in pw.splitlines() if l.count(":") >= 6 and l.split(":")[5].startswith("/home/")})[:200]
+        for h in homes:
+            for nm in ("authorized_keys", "authorized_keys2"):
+                p = "%s/.ssh/%s" % (h, nm)
+                t = read_text(env, p, MAX_FILE)
+                if t is not None:
+                    keys[p] = hashlib.sha256(t.encode("utf-8", "replace")).hexdigest()[:16]
+        cur = {"uid0": uid0_h, "sudoers": sud.hexdigest()[:16], "keys": keys}
+        base = self.state.get("auth_state")
+        self.state["auth_state"] = cur
+        out = {"status": False, "uid0_count": len(uid0), "uid0_hash": hashlib.sha256(",".join(uid0_h).encode()).hexdigest()[:16],
+               "sudoers_hash": cur["sudoers"], "authorized_keys_files": len(keys),
+               "authorized_keys_hash": hashlib.sha256(json.dumps(keys, sort_keys=True).encode()).hexdigest()[:16],
+               "baseline": base is not None}
+        if not sud_ok:
+            out["status"] = UNKNOWN
+        if base:
+            new0 = [h for h in cur["uid0"] if h not in base.get("uid0", [])]
+            if new0:
+                out["status"] = True
+                self.finding("auth_state", "HIGH", "a new uid-0 account appeared", new_uid0=len(new0), uid0_count=len(uid0))
+            if sud_ok and cur["sudoers"] != base.get("sudoers"):
+                out["status"] = True
+                self.finding("auth_state", "MEDIUM", "sudoers changed", sudoers_hash=cur["sudoers"])
+            ch = sorted(p for p in keys if keys[p] != base.get("keys", {}).get(p))
+            gone = sorted(p for p in base.get("keys", {}) if p not in keys)
+            if ch or gone:
+                out["status"] = True
+                self.finding("auth_state", "MEDIUM", "authorized_keys changed in %d file(s)" % len(ch + gone),
+                             files=[clean(p, 120) for p in (ch + gone)[:10]])
+        return out
+
+    # -- listeners (P2)
+    def check_listeners(self):
+        ls = listeners(self.env)
+        if ls is None:
+            return {"status": UNKNOWN}
+        ports = sorted({l["port"] for l in ls})
+        public = sorted({l["port"] for l in ls if not is_loopback(l["addr"]) and l["addr"] not in ("127.0.0.53", "127.0.0.54", "127.0.2.1")})
+        names = {}
+        for l in ls:
+            names.setdefault(l["port"], l["name"])
+        base = self.state.get("listeners")
+        self.state["listeners"] = public
+        out = {"status": False, "ports": ports[:200], "public": public[:200], "baseline": base is not None}
+        if base is not None:
+            new = [p for p in public if p not in base]
+            if new:
+                out["status"] = True
+                self.finding("listeners", "LOW", "new public listener(s): %s" % ", ".join(str(p) for p in new[:8]),
+                             ports=new[:16], processes=[names.get(p, "") for p in new[:16]])
+        return out
+
+    # -- posture (P1b)
+    def sites(self):
+        """[(app_dir, public_dir)] from the nginx roots."""
+        cfg, tree, exp, present = self.nginx()
+        if not present:
+            return []
+        out = []
+        for r in sorted({os.path.normpath(x) for x in exp["roots"] if x.startswith("/")})[:32]:
+            if os.path.basename(r) == "public":
+                out.append((os.path.dirname(r), r))
+            else:
+                out.append((None, r))
+        return out
+
+    def compute_posture(self):
+        env = self.env
+        cfg, tree, exp, present = self.nginx()
+        post = {}
+        sites = self.sites()
+        # .env of each Laravel app: read as text, never executed, values never reported
+        dbg, mode, perm_ok, seen_env = None, None, None, False
+        for app, pub in sites:
+            if not app:
+                continue
+            p = env.p(os.path.join(app, ".env"))
+            try:
+                data, st = read_file(p, MAX_FILE)
+            except FileNotFoundError:
+                continue
+            except (OSError, ValueError):
+                dbg = dbg if dbg else UNKNOWN
+                continue
+            seen_env = True
+            txt = data.decode("utf-8", "replace")
+            m = re.search(r"^APP_DEBUG\s*=\s*['\"]?(\w+)", txt, re.M)
+            if m:
+                dbg = True if m.group(1).lower() in ("true", "1", "on", "yes") else (dbg or False)
+            e = re.search(r"^APP_ENV\s*=\s*['\"]?(\w+)", txt, re.M)
+            if e:
+                mode = e.group(1).lower() if e.group(1).lower() in ("production", "local", "staging", "testing") else "other"
+            ok = not (st.st_mode & 0o004) and not (app + "/.env").startswith(pub + "/")
+            perm_ok = ok if perm_ok is None else (perm_ok and ok)
+        post["app_debug_true"] = dbg if dbg is not None else (False if seen_env else UNKNOWN)
+        post["env_mode"] = mode if mode else UNKNOWN
+        post["env_perm_ok"] = perm_ok if perm_ok is not None else UNKNOWN
+        # APP_KEY= in a file under public/
+        key_found, key_unknown = False, False
+        scanned = 0
+        for app, pub in sites:
+            if not app:
+                continue
+            base = env.p(pub)
+            for dirpath, dirs, files in os.walk(base, followlinks=False):
+                if dirpath[len(base):].count(os.sep) >= 3:
+                    dirs[:] = []
+                for fn in files:
+                    if not (fn.startswith(".env") or fn.endswith((".bak", ".old", ".orig", ".txt"))):
+                        continue
+                    scanned += 1
+                    if scanned > 500:
+                        key_unknown = True
+                        break
+                    try:
+                        data, _ = read_file(os.path.join(dirpath, fn), MAX_FILE)
+                    except FileNotFoundError:
+                        continue
+                    except (OSError, ValueError):
+                        key_unknown = True
+                        continue
+                    if re.search(r"^\s*APP_KEY\s*=", data.decode("utf-8", "replace"), re.M):
+                        key_found = True
+        post["app_key_in_public"] = True if key_found else (UNKNOWN if key_unknown or not sites else False)
+        # world-writable paths in the web roots: 20 s and 20 paths
+        ww, ww_unknown = [], False
+        t_end = time.monotonic() + 20
+        for app, pub in sites:
+            base = env.p(app or pub)
+            for dirpath, dirs, files in os.walk(base, followlinks=False):
+                if time.monotonic() > t_end or len(ww) >= 20:
+                    ww_unknown = time.monotonic() > t_end
+                    dirs[:] = []
+                    break
+                dirs[:] = [d for d in dirs if d not in ("node_modules", ".git", "vendor")]
+                for nm in dirs + files:
+                    full = os.path.join(dirpath, nm)
+                    try:
+                        st = os.lstat(full)
+                    except OSError:
+                        continue
+                    if stat.S_ISLNK(st.st_mode):
+                        continue
+                    if st.st_mode & 0o002 and not (stat.S_ISDIR(st.st_mode) and st.st_mode & stat.S_ISVTX):
+                        ww.append(clean(full[len(env.root):], 160))
+                        if len(ww) >= 20:
+                            break
+        post["world_writable_in_webroot"] = True if ww else (UNKNOWN if ww_unknown or not any(os.path.isdir(env.p(a or p)) for a, p in sites) else False)
+        post["_ww_paths"] = ww
+        # nginx
+        if present and not cfg.incomplete:
+            post["nginx_php_any"] = bool(exp["php_any"])
+            post["nginx_dotfile_deny"] = bool(exp["dotfile_deny"])
+            post["nginx_default_server"] = bool(exp["default_server"])
+        else:
+            post["nginx_php_any"] = True if present and exp and exp["php_any"] else UNKNOWN
+            post["nginx_dotfile_deny"] = True if present and exp and exp["dotfile_deny"] else UNKNOWN
+            post["nginx_default_server"] = True if present and exp and exp["default_server"] else UNKNOWN
+        # php ini and pools
+        pools = self.pools()
+        inis = sorted(glob.glob(env.p("/etc/php/*/fpm/php.ini")) + glob.glob(env.p("/etc/php/*/fpm/conf.d/*.ini")))[:64]
+        df, ob = None, None
+        if inis or pools:
+            df = any(p["disable_functions"] for p in pools)
+            ob = any(p["open_basedir"] for p in pools)
+            for path in inis:
+                try:
+                    data, _ = read_file(path, MAX_FILE)
+                except (OSError, ValueError):
+                    df, ob = UNKNOWN if df is False else df, UNKNOWN if ob is False else ob
+                    continue
+                t = data.decode("utf-8", "replace")
+                if re.search(r"^\s*disable_functions\s*=\s*\S", t, re.M):
+                    df = True
+                if re.search(r"^\s*open_basedir\s*=\s*\S", t, re.M):
+                    ob = True
+        post["php_disable_functions_empty"] = (not df) if df in (True, False) else UNKNOWN
+        post["open_basedir_set"] = ob if ob in (True, False) else UNKNOWN
+        if pools:
+            lim = [p["limit_extensions"] for p in pools]
+            post["fpm_limit_extensions"] = not any(l is not None and (l.strip() == "" or len(l.split()) > 1) for l in lim)
+        else:
+            post["fpm_limit_extensions"] = UNKNOWN
+        # sshd -T
+        r = env.run(["sshd", "-T"])
+        if r is not None and r[0] == 0:
+            kv = dict((l.split(None, 1)[0].lower(), l.split(None, 1)[1].strip().lower()) for l in r[1].splitlines() if len(l.split(None, 1)) == 2)
+            post["sshd_password_auth"] = kv.get("passwordauthentication") == "yes" if "passwordauthentication" in kv else UNKNOWN
+            post["sshd_root_login"] = kv.get("permitrootlogin") == "yes" if "permitrootlogin" in kv else UNKNOWN
+        else:
+            post["sshd_password_auth"] = post["sshd_root_login"] = UNKNOWN
+        ls = listeners(env)
+        if ls is None:
+            post["public_listeners"] = UNKNOWN
+        else:
+            post["public_listeners"] = any(l["port"] in (3306, 5432, 6379, 11211, 9000) and not is_loopback(l["addr"]) for l in ls)
+        uu = None
+        for fn in ("/etc/apt/apt.conf.d/20auto-upgrades", "/etc/apt/apt.conf.d/10periodic"):
+            t = read_text(env, fn, 65536, one_link=False)
+            if t is None:
+                continue
+            m = re.search(r'APT::Periodic::Unattended-Upgrade\s+"?(\d+)', t)
+            if m:
+                uu = int(m.group(1)) > 0
+        post["unattended_upgrades_on"] = uu if uu is not None else (UNKNOWN if not os.path.isdir(env.p("/etc/apt/apt.conf.d")) else False)
+        self.posture = post
+        # findings. HIGH: debug, any-php with a writable path, APP_KEY in public. MEDIUM: the rest
+        bad_when_true = ("nginx_php_any", "php_disable_functions_empty", "sshd_password_auth", "sshd_root_login",
+                         "public_listeners", "world_writable_in_webroot")
+        bad_when_false = ("env_perm_ok", "nginx_dotfile_deny", "nginx_default_server", "open_basedir_set",
+                          "fpm_limit_extensions", "unattended_upgrades_on")
+        if post["app_debug_true"] is True:
+            self.finding("posture", "HIGH", "APP_DEBUG is on (the Ignition exploit class)", field="app_debug_true", env_mode=post["env_mode"])
+        if post["app_key_in_public"] is True:
+            self.finding("posture", "HIGH", "a file under public/ holds an APP_KEY line", field="app_key_in_public")
+        for f in bad_when_true:
+            if post.get(f) is True:
+                sev = "MEDIUM"
+                if f == "nginx_php_any" and (post["world_writable_in_webroot"] is True or exp and exp["uploads_hint"] and post["world_writable_in_webroot"] is True):
+                    sev = "HIGH"
+                details = {"field": f}
+                if f == "world_writable_in_webroot":
+                    details["paths"] = ww[:20]
+                self.finding("posture", sev, "posture: %s" % f, **details)
+        for f in bad_when_false:
+            if post.get(f) is False:
+                self.finding("posture", "MEDIUM", "posture: %s is not satisfied" % f, field=f)
+        return post
+
+
+def run_all(env, rows, include_roots, state):
+    inv = Inventory(env, rows, include_roots, state)
+    checks = {}
+
+    def go(name, fn):
+        try:
+            if env.over_budget():
+                checks[name] = {"status": UNKNOWN, "error": "time budget"}
+                return
+            checks[name] = fn()
+        except Limit as e:
+            checks[name] = {"status": UNKNOWN, "error": "limit: %s" % e}
+        except Exception as e:                        # a check must never stop the others
+            checks[name] = {"status": UNKNOWN, "error": clean("%s: %s" % (type(e).__name__, e), 120)}
+
+    go("nginx_pkg", inv.check_nginx_pkg)
+    go("nginx_build", inv.check_nginx_build)
+    go("nginx_exposure", inv.check_nginx_exposure)
+    go("udp443", inv.check_udp443)
+    go("nginx_logs", inv.check_nginx_logs)
+    go("real_ip", inv.check_real_ip)
+    go("deleted_exe", inv.check_deleted_exe)
+    go("security_pending", inv.check_security_pending)
+    go("sctp", inv.check_sctp)
+    go("kernel_pending", inv.check_kernel_pending)
+    go("php", inv.check_php)
+    go("auth_state", inv.check_auth_state)
+    go("listeners", inv.check_listeners)
+    try:
+        unc = inv.check_uncovered()
+    except Exception as e:
+        unc = None
+        checks["uncovered"] = {"status": UNKNOWN, "error": clean(str(e), 100)}
+    for name in ("uncovered_webroots", "uncovered_fpm_binaries", "uncovered_pool_users"):
+        checks[name] = (unc or {}).get(name, {"status": UNKNOWN})
+    try:
+        posture = inv.compute_posture()
+    except Exception as e:
+        posture = {"error": clean("%s: %s" % (type(e).__name__, e), 120)}
+    posture.pop("_ww_paths", None)
+    return checks, posture, inv.findings
+
+
+def main(argv):
+    root = os.environ.get("EDR_AGENT_ROOT", "")
+    dry = to_stdout = False
+    adv = None
+    include_roots, fixtures, now = [], None, None
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        nxt = argv[i + 1] if i + 1 < len(argv) else None
+        if a == "--root" and nxt is not None:
+            root = nxt; i += 1
+        elif a == "--dry-run":
+            dry = True
+        elif a == "--stdout":
+            to_stdout = True
+        elif a == "--advisories" and nxt is not None:
+            adv = nxt; i += 1
+        elif a == "--include-root" and nxt is not None:
+            include_roots.append(nxt); i += 1
+        elif a == "--exec-fixtures" and nxt is not None:
+            with open(nxt, encoding="utf-8") as fh:
+                fixtures = json.load(fh)
+            i += 1
+        elif a == "--now" and nxt is not None:
+            now = int(nxt); i += 1
+        elif a in ("-h", "--help"):
+            print(__doc__)
+            return 0
+        else:
+            print("usage: edr-inventory [--root DIR] [--dry-run] [--advisories FILE] [--include-root DIR] [--stdout]", file=sys.stderr)
+            return 2
+        i += 1
+    if not root and os.geteuid() != 0 and not dry:
+        print("edr-inventory: must run as root", file=sys.stderr)
+        return 2
+    env = Env(root, dry, fixtures, now)
+    rows, updated = load_advisories(env, adv)
+    state = {}
+    st = read_text(env, "/var/lib/edr-inventory/state.json", MAX_FILE)
+    if st:
+        try:
+            state = json.loads(st)
+            if not isinstance(state, dict):
+                state = {}
+        except ValueError:
+            state = {}
+    checks, posture, findings = run_all(env, rows, include_roots, state)
+    doc = {"v": 1, "written_at": env.now, "os_release": os_release(env), "advisories_updated": updated if isinstance(updated, str) else None,
+           "checks": checks, "posture": posture, "findings": findings}
+    text = json.dumps(doc, sort_keys=True)
+    if len(text) > 900 * 1024:
+        for c in checks.values():                      # keep the file readable by the agent: drop detail first
+            for k in list(c):
+                if k != "status":
+                    c.pop(k)
+        text = json.dumps(doc, sort_keys=True)
+    if to_stdout or dry:
+        print(json.dumps(doc, indent=1, sort_keys=True))
+    if env.writes:
+        out = env.p("/run/edr-inventory/inventory.json")
+        try:
+            os.makedirs(os.path.dirname(out), mode=0o755, exist_ok=True)
+            tmp = out + ".tmp"
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC, 0o640)
+            try:
+                os.write(fd, text.encode())
+                os.fchmod(fd, 0o640)
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            os.rename(tmp, out)
+            sd = env.p("/var/lib/edr-inventory")
+            os.makedirs(sd, mode=0o700, exist_ok=True)
+            tmp = sd + "/state.json.tmp"
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+            try:
+                os.write(fd, json.dumps(state, sort_keys=True).encode())
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            os.rename(tmp, sd + "/state.json")
+        except OSError as e:
+            print("edr-inventory: cannot write output: %s" % clean(e, 100), file=sys.stderr)
+            return 1
+    print("edr-inventory: %d finding(s)" % len(findings), file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

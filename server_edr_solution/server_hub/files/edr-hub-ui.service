@@ -1,0 +1,54 @@
+[Unit]
+Description=EDR hub dashboard (loopback only, reached through an SSH tunnel)
+Wants=edr-hub.service
+After=edr-hub.service
+OnFailure=edr-hub-failed.service
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=exec
+Restart=on-failure
+RestartSec=5
+User=edr-hub-ui
+Group=edr-hub-ui
+UMask=0077
+ExecStart=/usr/bin/python3 -I /usr/local/lib/edr-hub/edr_hub_ui.py
+
+# Loopback only, no write access to the state directory, no view of the CA or the server key
+RestrictAddressFamilies=AF_INET AF_UNIX
+IPAddressDeny=any
+IPAddressAllow=127.0.0.0/8
+MemoryMax=128M
+TasksMax=64
+ReadOnlyPaths=/var/lib/edr-hub
+InaccessiblePaths=/var/lib/edr-hub/ca /var/lib/edr-hub/tls
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+DevicePolicy=closed
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+RemoveIPC=yes
+KeyringMode=private
+LogNamespace=edr-hub
+
+[Install]
+WantedBy=multi-user.target

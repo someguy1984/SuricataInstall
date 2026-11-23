@@ -1,0 +1,67 @@
+# The base of table "inet edr" (client PLAN section 4.2). Installed as
+# /usr/local/lib/edr-agent/files/edr-base.nft and read by edr-bans, which loads this text
+# followed by the "add element" lines and the rules that depend on configuration (the
+# large-connection threshold and the web-user egress record). Loaded alone it gives an empty,
+# working table: the never-ban set is checked first and the ban sets are empty.
+#
+# The first two lines make the replace atomic: the first creates the table if it is absent (so
+# the delete cannot fail), the delete and the definition then go through as one transaction.
+# Deleting this table lifts every ban; nothing else in the kit depends on it.
+#
+# Notes for editing:
+#   - Sets are declared before the chains that use them. Chains hold no rule that needs a
+#     number from local.conf: edr-bans adds those after this text.
+#   - nft takes a ";" before "}" in a one-line chain, and "fwd" is a reserved word.
+#   - Ban sets carry no auto-merge: edr-bans merges overlaps itself (widest CIDR, longest TTL).
+table inet edr
+delete table inet edr
+
+table inet edr {
+  # Never banned: checked first in the kernel, and again in edr-bans before anything is written.
+  set edr_never4 { type ipv4_addr; flags interval; }
+  set edr_never6 { type ipv6_addr; flags interval; }
+  # Local and hub bans. Every element has a timeout; "size" is a kernel backstop (the caps are in edr-bans).
+  set edr_ban4 { type ipv4_addr; flags interval,timeout; size 16384; }
+  set edr_ban6 { type ipv6_addr; flags interval,timeout; size 16384; }
+  # Feeds (P3): empty until the hub sends them.
+  set edr_feed4 { type ipv4_addr; flags interval,timeout; size 400000; }
+  set edr_feed6 { type ipv6_addr; flags interval,timeout; size 400000; }
+  # Large-connection watch: one address is logged once per 10 minutes.
+  set edr_big4 { type ipv4_addr; flags dynamic,timeout; size 4096; timeout 10m; }
+  set edr_big6 { type ipv6_addr; flags dynamic,timeout; size 4096; timeout 10m; }
+  # Web-user egress record: first connection of each (uid, address, port) is logged, never dropped.
+  set edr_egress_seen4 { typeof meta skuid . ip daddr . tcp dport; flags dynamic,timeout; size 4096; timeout 1d; }
+  set edr_egress_seen6 { typeof meta skuid . ip6 daddr . tcp dport; flags dynamic,timeout; size 4096; timeout 1d; }
+
+  # One named counter for each drop rule: edr-bans reads these instead of listing the sets.
+  counter hit_ban4 { }
+  counter hit_ban6 { }
+  counter hit_feed4 { }
+  counter hit_feed6 { }
+  counter hit_bigconn { }
+
+  # After conntrack (-200), before the iptables-nft nat chains (-100): DNAT-forwarded Docker
+  # traffic is covered. "ct direction original" leaves the replies to our own connections alone,
+  # and a new ban cuts an established inbound flow at once.
+  chain ban {
+    type filter hook prerouting priority -150; policy accept;
+    ip saddr @edr_never4 return
+    ip6 saddr @edr_never6 return
+    ct direction original ip saddr @edr_ban4 counter name hit_ban4 drop
+    ct direction original ip6 saddr @edr_ban6 counter name hit_ban6 drop
+    ct direction original ip saddr @edr_feed4 counter name hit_feed4 drop
+    ct direction original ip6 saddr @edr_feed6 counter name hit_feed6 drop
+    ct state untracked ip saddr @edr_ban4 drop
+    ct state untracked ip6 saddr @edr_ban6 drop
+  }
+
+  # The rules of this chain are added by edr-bans (threshold from [bans] bigconn_bytes).
+  chain bigconn {
+    type filter hook prerouting priority -140; policy accept;
+  }
+
+  # The rule of this chain is added by edr-bans (the web uids from [sites] web_users).
+  chain egress {
+    type filter hook output priority 0; policy accept;
+  }
+}

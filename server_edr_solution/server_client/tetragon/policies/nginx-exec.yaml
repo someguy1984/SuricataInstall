@@ -1,0 +1,62 @@
+# Server policy: any program started by an nginx process is killed once this policy is in
+# enforce mode (client PLAN section 4.3). A healthy worker never execs. The only exec that is
+# allowed is the master re-executing its own binary during an upgrade, by host root.
+#
+# Placeholders (filled by edr-agent discover / apply-config; a line that holds one is repeated
+# once per value and left out when there is no value):
+#   @NGINX_BIN@   the nginx binary, found from the running master. Both spellings are listed:
+#                 a process older than Tetragon with an upgraded binary reads "<path> (deleted)".
+#
+# Mode: installed with policy-mode "monitor". edr-policy-check flips it with
+# `tetra tp set-mode` once the gate passes ([tetragon] enforce, PLAN section 4.3). Monitor mode
+# counts the would-be kills in NMONITOR.
+#
+# Selectors, first match wins: 1 lets the master's own upgrade through (host user namespace and
+# CAP_SYS_ADMIN, so a worker cannot run "nginx -c evil.conf"); 2 kills everything else.
+# A master without CAP_SYS_ADMIN fails selector 1 and would be killed on an upgrade: those
+# hosts stay in monitor (the gate checks the unit's bounding set).
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "nginx-exec"
+spec:
+  options:
+  - name: "policy-mode"
+    value: "monitor"
+  kprobes:
+  - call: "security_bprm_check"
+    syscall: false
+    message: "An nginx process started a program"
+    args:
+    - index: 0
+      type: "linux_binprm"
+    selectors:
+    - matchBinaries:
+      - operator: "In"
+        values:
+        - "@NGINX_BIN@"
+        - "@NGINX_BIN@ (deleted)"
+      matchArgs:
+      - index: 0
+        operator: "Equal"
+        values:
+        - "@NGINX_BIN@"
+      matchNamespaces:
+      - namespace: User
+        operator: In
+        values:
+        - "host_ns"
+      matchCapabilities:
+      - type: Effective
+        operator: In
+        values:
+        - "CAP_SYS_ADMIN"
+      matchActions:
+      - action: NoPost
+    - matchBinaries:
+      - operator: "In"
+        values:
+        - "@NGINX_BIN@"
+        - "@NGINX_BIN@ (deleted)"
+      matchActions:
+      - action: Sigkill

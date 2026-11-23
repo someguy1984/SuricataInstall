@@ -1,0 +1,933 @@
+#!/usr/bin/env python3
+"""edr-bans: apply the agent's ban state to nftables (client PLAN section 4.2).
+
+A small root oneshot with fixed input and output. The unprivileged agent decides, this program
+applies. It trusts nothing it reads: /run/edr-agent/bans.json belongs to the agent, which may be
+compromised, so every field is checked, the never-ban literals are compiled in, and the nft
+script is built only from str(ipaddress.ip_network(...)) and integers.
+
+Input   /run/edr-agent/bans.json   (agent, hostile)            see contract section 8
+        /etc/edr-agent/pause.json  (root, {"until": epoch})    while valid: ban and feed sets are emptied
+        /etc/edr-agent/local.conf  ([bans] bigconn_bytes, bigconn_cap; [sites] web_users)
+        /var/lib/edr-bans/state.json   the last good state, absolute expiries
+Output  table inet edr (nft -c, then nft -f: one atomic replace)
+        /var/lib/edr-bans/state.json, /run/edr-bans/counters.json, /run/edr-bans/applied.json
+
+Usage   edr-bans [--root DIR] [--dry-run] [--print-script] [--files-dir DIR] [--now EPOCH]
+        --root DIR       prefix every path with DIR (also EDR_AGENT_ROOT); tests and dev runs
+        --dry-run        do not call nft; print the script; files are still written under --root
+        --print-script   print the nft script for the current bans.json and exit; writes nothing
+Python standard library only, run as: python3 -I edr-bans
+"""
+
+import bisect
+import hashlib
+import ipaddress
+import json
+import os
+import pwd
+import re
+import stat
+import subprocess
+import sys
+import time
+import configparser
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+
+VERSION = "0.1.0"
+
+# ---- Constants: guards are code, not configuration (PLAN section 4.2) ----------------------------
+NEVER_V4 = ("0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16",
+            "172.16.0.0/12", "192.0.0.0/24", "192.168.0.0/16", "224.0.0.0/3")
+NEVER_V6 = ("::/128", "::1/128", "fc00::/7", "fe80::/10", "ff00::/8")
+
+MAX_BANS_FILE = 16 * 1024 * 1024
+MAX_BANS = 10_000
+MAX_FEED_CIDRS = 200_000
+MAX_NEVER = 4096
+MAX_TTL_S = 7 * 86400
+MIN_PREFIX = {"ban4": 16, "ban6": 32, "feed4": 12, "feed6": 29}
+V4_SPACE = 2 ** 32
+# Coverage caps after never-ban carving, as numbers of addresses.
+COVER_CAP = {"ban4": V4_SPACE // 1000, "ban6": 16 * 2 ** 96,
+             "feed4": V4_SPACE // 50, "feed6": 1024 * 2 ** 96}
+NEW_FEED_COVER_V4 = V4_SPACE * 5 // 1000        # 0.5% of IPv4 per update
+MAX_NEW_HUB_BANS = 20
+SOURCES = ("local", "fleet", "operator")
+REASONS = ("ssh_fail", "tripwire", "suricata", "bigconn", "window_update", "fleet_quorum", "operator")
+FEED_NAMES = ("spamhaus_drop_v4", "spamhaus_drop_v6", "dshield")
+REFUSED_KEPT = 20
+CHUNK = 5000
+DEFAULT_BIGCONN = 4 * 1024 ** 3
+
+CIDR_RE = re.compile(r"[0-9A-Fa-f:.]{2,45}(?:/[0-9]{1,3})?")
+V4MAPPED = ipaddress.ip_network("::ffff:0:0/96")
+
+
+class Refuse(Exception):
+    """The whole new state is refused; the last good state stays."""
+
+
+# ---- Paths -----------------------------------------------------------------------------------
+class Paths:
+    def __init__(self, root=""):
+        self.root = root.rstrip("/")
+
+    def p(self, path):
+        return self.root + path
+
+    @property
+    def bans_json(self): return self.p("/run/edr-agent/bans.json")
+    @property
+    def pause_json(self): return self.p("/etc/edr-agent/pause.json")
+    @property
+    def local_conf(self): return self.p("/etc/edr-agent/local.conf")
+    @property
+    def state_dir(self): return self.p("/var/lib/edr-bans")
+    @property
+    def state_json(self): return self.p("/var/lib/edr-bans/state.json")
+    @property
+    def run_dir(self): return self.p("/run/edr-bans")
+    @property
+    def counters_json(self): return self.p("/run/edr-bans/counters.json")
+    @property
+    def applied_json(self): return self.p("/run/edr-bans/applied.json")
+
+
+# ---- Safe reading ----------------------------------------------------------------------------
+def agent_uids(rooted):
+    """Owners accepted for files in the agent's directory."""
+    uids = set()
+    try:
+        uids.add(pwd.getpwnam("edr-agent").pw_uid)
+    except KeyError:
+        pass
+    if rooted:
+        uids.update((0, os.geteuid()))     # tests and dev runs: nobody is the agent
+    return uids
+
+
+def read_regular(path, max_bytes, owners=None):
+    """Read a file that a less trusted user may control: no symlink, no FIFO, one link, bounded.
+
+    Returns (bytes, (inode, mtime_ns, size)). Raises OSError or ValueError with a short fixed text.
+    """
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise ValueError("not a regular file")
+        if st.st_nlink != 1:
+            raise ValueError("more than one link")
+        if owners is not None and st.st_uid not in owners:
+            raise ValueError("unexpected owner")
+        if st.st_size > max_bytes:
+            raise ValueError("file too large")
+        chunks, total = [], 0
+        while True:
+            b = os.read(fd, 1 << 20)
+            if not b:
+                break
+            total += len(b)
+            if total > max_bytes:
+                raise ValueError("file too large")
+            chunks.append(b)
+        return b"".join(chunks), (st.st_ino, st.st_mtime_ns, st.st_size)
+    finally:
+        os.close(fd)
+
+
+def _no_const(name):
+    raise ValueError("bad JSON constant")
+
+
+def parse_json(data):
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ValueError("not UTF-8")
+    try:
+        return json.loads(text, parse_constant=_no_const)
+    except RecursionError:
+        raise ValueError("JSON nested too deeply")
+    except ValueError:
+        raise ValueError("not valid JSON")
+
+
+def atomic_write(path, text, mode=0o640):
+    """Write to .tmp, fsync, rename. The directory must exist and belong to us."""
+    d = os.path.dirname(path)
+    os.makedirs(d, mode=0o755, exist_ok=True)
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC, mode)
+    try:
+        os.write(fd, text.encode("utf-8"))
+        os.fchmod(fd, mode)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.rename(tmp, path)
+
+
+def clean(text, limit=80):
+    """Printable ASCII only: this ends up in a file that other programs read."""
+    return "".join(c if " " <= c <= "~" else "?" for c in str(text))[:limit]
+
+
+# ---- Address handling --------------------------------------------------------------------------
+def norm_net(text):
+    """One strict parser for every address and CIDR that came from outside.
+
+    Rejects whitespace, leading zeros, zone IDs and host bits; maps ::ffff:a.b.c.d to IPv4.
+    Never uses is_private or is_global (they call 203.0.113.0/24 and 198.18.0.0/15 private).
+    A bare address is a /32 or /128.
+    """
+    if not isinstance(text, str) or len(text) > 64 or not CIDR_RE.fullmatch(text):
+        raise ValueError("not an address")
+    plen = text.partition("/")[2]
+    if len(plen) > 1 and plen[0] == "0":
+        raise ValueError("leading zero in prefix")
+    try:
+        net = ipaddress.ip_network(text, strict=True)
+    except ValueError:
+        raise ValueError("not an address or has host bits")
+    if net.version == 6 and net.prefixlen >= 96 and net.subnet_of(V4MAPPED):
+        net = ipaddress.IPv4Network((int(net.network_address) & 0xFFFFFFFF, net.prefixlen - 96))
+    return net
+
+
+class Intervals:
+    """Disjoint sorted intervals of one family, with an overlap test by bisect."""
+
+    def __init__(self, nets):
+        merged = list(ipaddress.collapse_addresses(nets)) if nets else []
+        self.nets = merged
+        self.starts = [int(n.network_address) for n in merged]
+        self.ends = [int(n.broadcast_address) for n in merged]
+
+    def overlaps(self, net):
+        s, e = int(net.network_address), int(net.broadcast_address)
+        i = bisect.bisect_right(self.starts, e) - 1
+        return i >= 0 and self.ends[i] >= s
+
+
+class NeverList:
+    def __init__(self, extra_nets):
+        v4 = [ipaddress.ip_network(c) for c in NEVER_V4] + [n for n in extra_nets if n.version == 4]
+        v6 = [ipaddress.ip_network(c) for c in NEVER_V6] + [n for n in extra_nets if n.version == 6]
+        self.v4 = Intervals(v4)
+        self.v6 = Intervals(v6)
+
+    def overlaps(self, net):
+        return (self.v4 if net.version == 4 else self.v6).overlaps(net)
+
+
+def kind_of(net, group):
+    return group + ("4" if net.version == 4 else "6")
+
+
+def merge_overlaps(items):
+    """items: [(network, expires)]. CIDRs nest or are disjoint, so keep the widest of each
+    nest and give it the longest expiry in it. Returns a sorted list of (network, expires)."""
+    out = []
+    for fam in (4, 6):
+        mine = sorted((i for i in items if i[0].version == fam),
+                      key=lambda i: (int(i[0].network_address), i[0].prefixlen))
+        cur = None
+        for net, exp in mine:
+            if cur is not None and int(net.network_address) <= int(cur[0].broadcast_address):
+                cur = (cur[0], max(cur[1], exp))     # nested in the widest one so far
+                out[-1] = cur
+                continue
+            cur = (net, exp)
+            out.append(cur)
+    return out
+
+
+def coverage(nets):
+    return sum(n.num_addresses for n in nets)
+
+
+# ---- Validation ---------------------------------------------------------------------------------
+def empty_state():
+    return {"v": 1, "written_at": 0, "empty": False, "never": [], "bans": [], "feeds": {}, "paused_until": 0}
+
+
+def _int(v):
+    return isinstance(v, int) and not isinstance(v, bool) and -2 ** 53 < v < 2 ** 53
+
+
+def validate(doc, now, never_fixed, prev, breaker=True):
+    """Check a bans.json document. Returns (state, refused, notes).
+
+    Per-entry problems drop the entry and are listed in `refused`. A guard breach (a cap, a
+    coverage limit, a malformed top level) raises Refuse: the caller keeps the last good state.
+    `never_fixed` is a NeverList of the machine's own addresses and the literals; the document's
+    own `never` is added on top of it.
+    """
+    refused = []
+
+    def refuse(cidr, why):
+        refused.append({"cidr": clean(cidr, 64), "why": clean(why, 80)})
+
+    if not isinstance(doc, dict):
+        raise Refuse("bans.json is not an object")
+    if doc.get("v") != 1:
+        raise Refuse("bans.json version is not 1")
+    wa = doc.get("written_at", 0)
+    if not _int(wa):
+        raise Refuse("written_at is not an integer")
+    empty = doc.get("empty", False)
+    if not isinstance(empty, bool):
+        raise Refuse("empty is not a boolean")
+    bans_in, feeds_in, never_in = doc.get("bans", []), doc.get("feeds", {}), doc.get("never", [])
+    if not isinstance(bans_in, list) or not isinstance(feeds_in, dict) or not isinstance(never_in, list):
+        raise Refuse("bans, feeds or never has the wrong type")
+    if len(bans_in) > MAX_BANS:
+        raise Refuse("guard: more than %d bans" % MAX_BANS)
+    if len(never_in) > MAX_NEVER:
+        raise Refuse("guard: more than %d never-ban entries" % MAX_NEVER)
+    if sum(len(f.get("cidrs", [])) if isinstance(f, dict) and isinstance(f.get("cidrs"), list) else 0
+           for f in feeds_in.values()) > MAX_FEED_CIDRS:
+        raise Refuse("guard: more than %d feed CIDRs" % MAX_FEED_CIDRS)
+    if empty and (bans_in or feeds_in):
+        raise Refuse("empty is true but bans or feeds are not empty")
+
+    # The document's never-ban entries: only valid ones count; ranges are allowed (allow_cidr, VPC).
+    extra = []
+    for c in never_in:
+        try:
+            extra.append(norm_net(c))
+        except ValueError:
+            refuse(c, "never-ban entry is not valid")
+    never = NeverList(list(never_fixed.v4.nets) + list(never_fixed.v6.nets) + extra)
+
+    # Bans
+    prev_bans = {b["cidr"] for b in prev.get("bans", [])}
+    kept, new_hub = [], 0
+    for b in bans_in:
+        if not isinstance(b, dict):
+            refuse("?", "ban is not an object")
+            continue
+        c = b.get("cidr")
+        try:
+            net = norm_net(c)
+        except ValueError:
+            refuse(c if isinstance(c, str) else "?", "not a valid address")
+            continue
+        exp = b.get("expires")
+        if not _int(exp):
+            refuse(str(net), "expiry is not an integer")
+            continue
+        if exp - now < 1:
+            continue                                   # already over: not a fault
+        group = kind_of(net, "ban")
+        if net.prefixlen < MIN_PREFIX[group]:
+            refuse(str(net), "shorter than the minimum prefix /%d" % MIN_PREFIX[group])
+            continue
+        if never.overlaps(net):
+            refuse(str(net), "overlaps the never-ban list")
+            continue
+        src = b.get("source") if b.get("source") in SOURCES else "unknown"
+        reason = b.get("reason") if b.get("reason") in REASONS else "unknown"
+        if breaker and src in ("fleet", "operator") and str(net) not in prev_bans:
+            new_hub += 1
+            if new_hub > MAX_NEW_HUB_BANS:
+                refuse(str(net), "more than %d new hub bans in one update" % MAX_NEW_HUB_BANS)
+                continue
+        kept.append((net, exp, src, reason))
+    merged = merge_overlaps([(n, e) for n, e, _, _ in kept])
+    meta = {}
+    for n, e, s, r in kept:
+        meta.setdefault(str(n), (s, r))
+    bans = []
+    for net, exp in merged:
+        s, r = meta.get(str(net), ("unknown", "unknown"))
+        bans.append({"cidr": str(net), "expires": exp, "source": s, "reason": r})
+    for fam, group in ((4, "ban4"), (6, "ban6")):
+        cov = coverage([ipaddress.ip_network(b["cidr"]) for b in bans if ipaddress.ip_network(b["cidr"]).version == fam])
+        if cov > COVER_CAP[group]:
+            raise Refuse("guard: %s coverage above the cap" % group)
+
+    # Feeds (P3: empty in P2)
+    feeds = {}
+    for name, f in feeds_in.items():
+        if name not in FEED_NAMES:
+            refuse(name if isinstance(name, str) else "?", "unknown feed name")
+            continue
+        if not isinstance(f, dict) or not _int(f.get("expires")) or not isinstance(f.get("cidrs"), list):
+            refuse(name, "feed is malformed")
+            continue
+        if f["expires"] - now < 1:
+            continue
+        items, dropped = [], 0
+        for c in f["cidrs"]:
+            try:
+                net = norm_net(c)
+            except ValueError:
+                dropped += 1
+                continue
+            if net.prefixlen < MIN_PREFIX[kind_of(net, "feed")] or never.overlaps(net):
+                dropped += 1
+                continue
+            items.append(net)
+        if dropped:
+            refuse(name, "%d feed entries dropped" % dropped)
+        old = prev.get("feeds", {}).get(name)
+        if not items:
+            if old:                                   # an empty feed never replaces a non-empty one
+                feeds[name] = old
+            continue
+        if old and breaker:
+            added = set(items) - {ipaddress.ip_network(c) for c in old["cidrs"]}
+            if coverage([n for n in added if n.version == 4]) > NEW_FEED_COVER_V4:
+                refuse(name, "new feed coverage above 0.5% of IPv4: update refused")
+                feeds[name] = old
+                continue
+        feeds[name] = {"expires": f["expires"], "cidrs": sorted({str(n) for n in items})}
+    for fam, group in ((4, "feed4"), (6, "feed6")):
+        allnets = [ipaddress.ip_network(c) for f in feeds.values() for c in f["cidrs"]]
+        cov = coverage(list(ipaddress.collapse_addresses([n for n in allnets if n.version == fam])))
+        if cov > COVER_CAP[group]:
+            raise Refuse("guard: %s coverage above the cap" % group)
+
+    state = {"v": 1, "written_at": wa, "empty": empty,
+             "never": sorted({str(n) for n in extra}), "bans": bans, "feeds": feeds, "paused_until": 0}
+    return state, refused
+
+
+def live_count(state, now):
+    n = sum(1 for b in state.get("bans", []) if b["expires"] - now >= 1)
+    n += sum(len(f["cidrs"]) for f in state.get("feeds", {}).values() if f["expires"] - now >= 1)
+    return n
+
+
+def load_state(paths, now, never_fixed):
+    """The last good state; anything wrong with it means an empty state, never a crash."""
+    try:
+        data, _ = read_regular(paths.state_json, MAX_BANS_FILE, owners={0, os.geteuid()})
+        doc = parse_json(data)
+        # A state we wrote is re-validated like any other input.
+        st, _ = validate({"v": 1, "written_at": doc.get("written_at", 0), "never": doc.get("never", []),
+                          "bans": doc.get("bans", []), "feeds": doc.get("feeds", {})},
+                         0, never_fixed, {}, breaker=False)
+        pu = doc.get("paused_until", 0)
+        st["paused_until"] = pu if _int(pu) else 0
+        return st
+    except (OSError, ValueError, Refuse, AttributeError, TypeError):
+        return empty_state()
+
+
+# ---- Machine addresses -------------------------------------------------------------------------------
+def machine_nets(paths):
+    """The machine's own addresses, gateway, resolvers and DoH stamps, and live SSH sessions.
+
+    Each is a single address. Anything unreadable is skipped: the compiled-in literals still hold.
+    """
+    found = set()
+
+    def add(text):
+        try:
+            net = norm_net(text)
+        except ValueError:
+            return
+        if len(found) < 4096:
+            found.add(net)
+
+    def lines(path, limit=1 << 20):
+        try:
+            data, _ = read_regular(paths.p(path), limit)
+            return data.decode("utf-8", "replace").splitlines()
+        except (OSError, ValueError):
+            return []
+
+    last = None
+    for ln in lines("/proc/net/fib_trie"):
+        s = ln.strip()
+        if s.startswith("|--") or s.startswith("+--"):
+            last = s.split()[-1] if s.startswith("|--") else None
+        elif s.startswith("/32 host LOCAL") and last:
+            add(last)
+    for ln in lines("/proc/net/if_inet6"):
+        f = ln.split()
+        if f and len(f[0]) == 32:
+            try:
+                add(str(ipaddress.IPv6Address(bytes.fromhex(f[0]))))
+            except ValueError:
+                pass
+    for ln in lines("/proc/net/route")[1:]:
+        f = ln.split()
+        if len(f) > 3 and f[1] == "00000000":
+            try:
+                add(str(ipaddress.IPv4Address(int(f[2], 16).to_bytes(4, "little"))))
+            except (ValueError, OverflowError):
+                pass
+    for path in ("/run/systemd/resolve/resolv.conf", "/etc/resolv.conf"):
+        for ln in lines(path):
+            f = ln.split()
+            if len(f) == 2 and f[0] == "nameserver":
+                add(f[1].split("%")[0])
+    for ln in lines("/etc/edr-dns/doh-self.conf"):
+        s = ln.split("#")[0].strip()
+        if s:
+            add(s)
+    for a in ssh_sessions(paths):
+        add(a)
+    return sorted(found, key=lambda n: (n.version, int(n.network_address)))
+
+
+UTMP = "<h2xi32s4s32s256s2hi2i16s20s"
+UTMP_SIZE = 384
+
+
+def ssh_sessions(paths):
+    """Remote addresses of authenticated logins, read from utmp at each apply.
+
+    A connection still in pre-authentication has no utmp record, so a brute-forcer cannot
+    place itself on the list. At most 64 records are used.
+    """
+    import struct
+    out = []
+    for name in ("/run/utmp", "/var/run/utmp"):
+        try:
+            data, _ = read_regular(paths.p(name), 4 * 1024 * 1024)
+        except (OSError, ValueError):
+            continue
+        for off in range(0, len(data) - UTMP_SIZE + 1, UTMP_SIZE):
+            f = struct.unpack_from(UTMP, data, off)
+            if f[0] != 7:                                   # USER_PROCESS
+                continue
+            raw = f[11]
+            host = f[5].split(b"\0", 1)[0].decode("ascii", "replace")
+            if not host:
+                continue
+            try:
+                if raw[4:] == b"\0" * 12:
+                    out.append(str(ipaddress.IPv4Address(raw[:4])))
+                else:
+                    out.append(str(ipaddress.IPv6Address(raw)))
+            except ValueError:
+                continue
+            if len(out) >= 64:
+                return out
+        break
+    return out
+
+
+# ---- Configuration --------------------------------------------------------------------------------------
+def parse_size(text):
+    m = re.fullmatch(r"\s*([0-9]{1,15})\s*([KMGT]?)i?B?\s*", text or "", re.I)
+    if not m:
+        raise ValueError("bad size")
+    return int(m.group(1)) * {"": 1, "K": 1024, "M": 1024 ** 2, "G": 1024 ** 3, "T": 1024 ** 4}[m.group(2).upper()]
+
+
+def find_defaults(files_dir):
+    here = os.path.dirname(os.path.realpath(__file__))
+    cands = [os.path.join(files_dir, "defaults.conf")] if files_dir else []
+    cands += [os.path.join(here, "defaults.conf"), os.path.join(here, "files", "defaults.conf"),
+              os.path.join(here, "..", "files", "defaults.conf")]
+    return cands
+
+
+def read_conf(paths, files_dir):
+    """The few keys this helper needs. Any trouble means the defaults: this never stops a ban."""
+    cp = configparser.ConfigParser(interpolation=None, strict=True)
+    sources = []
+    for c in find_defaults(files_dir):
+        if os.path.isfile(c):
+            sources.append(c)
+            break
+    sources.append(paths.local_conf)
+    for path in sources:
+        try:
+            data, _ = read_regular(path, 256 * 1024)
+            cp.read_string(data.decode("utf-8", "replace"))
+        except (OSError, ValueError, configparser.Error):
+            continue
+    big, cap, users, web = DEFAULT_BIGCONN, None, [], True
+    try:
+        b = parse_size(cp.get("bans", "bigconn_bytes", fallback="4G"))
+        if 1024 ** 2 <= b <= 1024 ** 5:
+            big = b
+    except ValueError:
+        pass
+    try:
+        v = cp.get("bans", "bigconn_cap", fallback="off").strip().lower()
+        if v not in ("", "off"):
+            c = parse_size(v)
+            if 1024 ** 2 <= c <= 1024 ** 5:
+                cap = c
+    except ValueError:
+        pass
+    if cp.get("kit", "web", fallback="on").strip().lower() == "off":
+        web = False
+    if web:
+        for name in cp.get("sites", "web_users", fallback="").split(","):
+            name = name.strip()
+            if name and re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", name):
+                try:
+                    uid = pwd.getpwnam(name).pw_uid
+                except KeyError:
+                    continue
+                if uid not in users and len(users) < 16:
+                    users.append(uid)
+    return {"bigconn_bytes": big, "bigconn_cap": cap, "web_uids": users}
+
+
+def pause_until(paths, now):
+    """The end of a valid pause, or 0. An expired or odd file is ignored."""
+    try:
+        data, _ = read_regular(paths.pause_json, 4096, owners={0, os.geteuid()})
+        doc = parse_json(data)
+        until = doc.get("until") if isinstance(doc, dict) else None
+        if _int(until) and until > now:
+            return until
+    except (OSError, ValueError):
+        pass
+    return 0
+
+
+# ---- The nft script ----------------------------------------------------------------------------------------
+def find_base(files_dir):
+    here = os.path.dirname(os.path.realpath(__file__))
+    cands = [os.path.join(files_dir, "edr-base.nft")] if files_dir else []
+    cands += [os.path.join(here, "files", "edr-base.nft"), os.path.join(here, "..", "files", "edr-base.nft")]
+    for c in cands:
+        try:
+            with open(c, encoding="utf-8") as fh:
+                return fh.read()
+        except OSError:
+            continue
+    raise OSError("edr-base.nft not found")
+
+
+def elements(set_name, items, now, with_timeout):
+    """add element lines. items: [(network, expires)]; every value is an ipaddress string or an integer."""
+    lines, cur = [], []
+    count = 0
+    for net, exp in items:
+        if with_timeout:
+            t = min(int(exp - now), MAX_TTL_S)
+            if t < 1:
+                continue
+            cur.append("%s timeout %ds" % (net, t))
+        else:
+            cur.append(str(net))
+        count += 1
+        if len(cur) >= CHUNK:
+            lines.append("add element inet edr %s { %s }" % (set_name, ", ".join(cur)))
+            cur = []
+    if cur:
+        lines.append("add element inet edr %s { %s }" % (set_name, ", ".join(cur)))
+    return lines, count
+
+
+def build_script(base, never_nets, bans, feeds, conf, now):
+    """Returns (script, sizes). Built only from ipaddress strings and integers."""
+    out = [base.rstrip("\n"), ""]
+    sizes = {}
+    n4 = [n for n in never_nets if n.version == 4]
+    n6 = [n for n in never_nets if n.version == 6]
+    for name, nets in (("edr_never4", n4), ("edr_never6", n6)):
+        ls, c = elements(name, [(n, 0) for n in nets], now, False)
+        out += ls
+        sizes[name] = c
+    ban_items = [(ipaddress.ip_network(b["cidr"]), b["expires"]) for b in bans]
+    feed_items = [(ipaddress.ip_network(c), f["expires"]) for f in feeds.values() for c in f["cidrs"]]
+    for prefix, items in (("edr_ban", ban_items), ("edr_feed", feed_items)):
+        items = merge_overlaps([i for i in items if i[1] - now >= 1])
+        for fam in (4, 6):
+            ls, c = elements("%s%d" % (prefix, fam), [i for i in items if i[0].version == fam], now, True)
+            out += ls
+            sizes["%s%d" % (prefix, fam)] = c
+    # Rules that depend on configuration: integers only.
+    b = int(conf["bigconn_bytes"])
+    for fam, hdr in ((4, "ip saddr"), (6, "ip6 saddr")):
+        out.append('add rule inet edr bigconn tcp dport 443 ct original bytes > %d %s != @edr_big%d '
+                   'add @edr_big%d { %s } counter name hit_bigconn log prefix "edr-bigconn: "'
+                   % (b, hdr, fam, fam, hdr))
+    if conf.get("bigconn_cap"):
+        out.append("add rule inet edr bigconn tcp dport 443 ct original bytes > %d reject with tcp reset"
+                   % int(conf["bigconn_cap"]))
+    uids = sorted({int(u) for u in conf.get("web_uids", [])})
+    if uids:
+        u = ", ".join(str(i) for i in uids)
+        for fam, a in ((4, "ip daddr"), (6, "ip6 daddr")):
+            out.append('add rule inet edr egress meta skuid { %s } ct state new tcp dport { 80, 443 } '
+                       'meta skuid . %s . tcp dport != @edr_egress_seen%d '
+                       'add @edr_egress_seen%d { meta skuid . %s . tcp dport } '
+                       'limit rate 30/minute log prefix "edr-egress: " flags skuid' % (u, a, fam, fam, a))
+    return "\n".join(out) + "\n", sizes
+
+
+# ---- nft and counters -----------------------------------------------------------------------------------------
+def run_nft(args, stdin=None, timeout=20):
+    try:
+        r = subprocess.run(["nft"] + args, input=stdin, capture_output=True, text=True, timeout=timeout, check=False)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return 127, "", clean(e, 200)
+    return r.returncode, r.stdout, r.stderr
+
+
+def read_counters_nft():
+    rc, out, _ = run_nft(["-t", "-j", "list", "counters", "table", "inet", "edr"])
+    if rc != 0:
+        return False, {}
+    try:
+        doc = json.loads(out)
+    except ValueError:
+        return True, {}
+    res = {}
+    for item in doc.get("nftables", []):
+        c = item.get("counter") if isinstance(item, dict) else None
+        if isinstance(c, dict) and isinstance(c.get("name"), str) and _int(c.get("packets")):
+            res[c["name"]] = c["packets"]
+    return True, res
+
+
+def conntrack(paths):
+    out = {"count": 0, "max": 0, "drop": 0, "early_drop": 0}
+
+    def num(path):
+        try:
+            data, _ = read_regular(paths.p(path), 64)
+            return int(data.decode().strip())
+        except (OSError, ValueError):
+            return 0
+    out["count"] = num("/proc/sys/net/netfilter/nf_conntrack_count")
+    out["max"] = num("/proc/sys/net/netfilter/nf_conntrack_max")
+    try:
+        data, _ = read_regular(paths.p("/proc/net/stat/nf_conntrack"), 1 << 20)
+        rows = data.decode("utf-8", "replace").splitlines()
+        head = rows[0].split()
+        for row in rows[1:]:
+            f = row.split()
+            if len(f) == len(head):
+                for key in ("drop", "early_drop"):
+                    if key in head:
+                        out[key] += int(f[head.index(key)], 16)
+    except (OSError, ValueError, IndexError):
+        pass
+    return out
+
+
+def write_counters(paths, now, table_present, sizes, ctr, last_apply):
+    doc = {"written_at": now, "table_present": bool(table_present),
+           "sets": {k: int(sizes.get(k, 0)) for k in ("edr_ban4", "edr_ban6", "edr_feed4", "edr_feed6", "edr_never4", "edr_never6")},
+           "counters": {"ban_drop": ctr.get("hit_ban4", 0) + ctr.get("hit_ban6", 0),
+                        "feed_drop": ctr.get("hit_feed4", 0) + ctr.get("hit_feed6", 0),
+                        "bigconn": ctr.get("hit_bigconn", 0)},
+           "conntrack": conntrack(paths),
+           "last_apply": last_apply}
+    atomic_write(paths.counters_json, json.dumps(doc, sort_keys=True) + "\n", 0o640)
+
+
+# ---- The run ------------------------------------------------------------------------------------------------
+def fingerprint_live(never_nets, bans, feeds, conf, now):
+    """What the kernel holds, in a form that survives natural expiry (see should_replace)."""
+    return {"never": sorted(str(n) for n in never_nets),
+            "bans": sorted([b["cidr"], b["expires"]] for b in bans if b["expires"] - now >= 1),
+            "feeds": {k: [hashlib.sha256("\n".join(f["cidrs"]).encode()).hexdigest(), f["expires"]]
+                      for k, f in sorted(feeds.items()) if f["expires"] - now >= 1},
+            "conf": [conf["bigconn_bytes"], conf.get("bigconn_cap"), sorted(conf.get("web_uids", []))]}
+
+
+def same_as_applied(applied, fp, now):
+    """True when the table already holds this state. Entries that ran out on their own are not
+    a change; an entry that is gone from the new state while still live in the kernel is."""
+    if not isinstance(applied, dict):
+        return False
+    try:
+        old_bans = sorted(b for b in applied["bans"] if b[1] - now >= 1)
+        return (applied["never"] == fp["never"] and old_bans == fp["bans"]
+                and applied["feeds"] == fp["feeds"] and applied["conf"] == fp["conf"])
+    except (KeyError, TypeError, IndexError):
+        return False
+
+
+def log(msg):
+    print("edr-bans: " + clean(msg, 300), flush=True)
+
+
+def main(argv):
+    root = os.environ.get("EDR_AGENT_ROOT", "")
+    dry = print_only = False
+    files_dir = ""
+    now_override = None
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--root" and i + 1 < len(argv):
+            root = argv[i + 1]; i += 1
+        elif a == "--dry-run":
+            dry = True
+        elif a == "--print-script":
+            print_only = True
+        elif a == "--files-dir" and i + 1 < len(argv):
+            files_dir = argv[i + 1]; i += 1
+        elif a == "--now" and i + 1 < len(argv):
+            now_override = int(argv[i + 1]); i += 1
+        elif a in ("-h", "--help"):
+            print(__doc__)
+            return 0
+        else:
+            print("usage: edr-bans [--root DIR] [--dry-run] [--print-script] [--files-dir DIR]", file=sys.stderr)
+            return 2
+        i += 1
+    paths = Paths(root)
+    rooted = bool(root)
+    if not rooted and os.geteuid() != 0 and not (dry or print_only):
+        print("edr-bans: must run as root", file=sys.stderr)
+        return 2
+    now = now_override if now_override is not None else int(time.time())
+    try:
+        base = find_base(files_dir)
+    except OSError as e:
+        log("cannot continue: %s" % e)
+        return 1
+
+    for _attempt in range(4):
+        rc, again = apply_once(paths, rooted, dry, print_only, files_dir, base, now)
+        if not again:
+            return rc
+        now = now_override if now_override is not None else int(time.time())
+    return rc
+
+
+def never_set(machine, extra_strs):
+    """The never-ban nets as written to the kernel: literals, machine addresses and the state's own list."""
+    extra = [ipaddress.ip_network(c) for c in extra_strs]
+    nl = NeverList(list(machine) + extra)
+    return list(nl.v4.nets) + list(nl.v6.nets)
+
+
+def apply_once(paths, rooted, dry, print_only, files_dir, base, now):
+    persist = not ((dry or print_only) and not rooted)    # a dry run on the real paths writes nothing
+    """One pass. Returns (exit code, read again); read-again means bans.json changed meanwhile."""
+    conf = read_conf(paths, files_dir)
+    machine = machine_nets(paths)
+    never_fixed = NeverList(machine)
+    prev = load_state(paths, now, never_fixed)
+    paused = pause_until(paths, now)
+    refused, error = [], ""
+    new_state, ident = None, None
+
+    # 1. bans.json is hostile. A missing file keeps the table; any error keeps the last good state.
+    try:
+        data, ident = read_regular(paths.bans_json, MAX_BANS_FILE, owners=agent_uids(rooted))
+        doc = parse_json(data)
+        cand, refused = validate(doc, now, never_fixed, prev)
+        # An empty state after a non-empty one needs an explicit "empty": true.
+        if not cand["bans"] and not cand["feeds"] and not cand["empty"] and live_count(prev, now) > 0:
+            raise Refuse("empty state refused after a non-empty one (needs \"empty\": true)")
+        new_state = cand
+        if paused:
+            # The agent writes an empty file during a pause: that is not a request to forget the bans.
+            new_state = None
+        elif cand["empty"] and prev["paused_until"] and cand["written_at"] <= prev["paused_until"]:
+            new_state = None                      # the same file, read again after the pause ended
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError) as e:
+        error = "bans.json refused: %s" % e
+    except Refuse as e:
+        error = str(e)
+
+    state = new_state if new_state is not None else prev
+    # What goes to the kernel: during a pause the ban and feed sets are empty, the rest stays.
+    eff_bans = [] if paused else state["bans"]
+    eff_feeds = {} if paused else state["feeds"]
+    never_nets = never_set(machine, state["never"])
+    script, sizes = build_script(base, never_nets, eff_bans, eff_feeds, conf, now)
+    if print_only:
+        sys.stdout.write(script)
+        return 0, False
+    if dry:
+        sys.stdout.write(script)
+
+    fp = fingerprint_live(never_nets, eff_bans, eff_feeds, conf, now)
+    applied = None
+    try:
+        data, _ = read_regular(paths.applied_json, 64 * 1024 * 1024, owners={0, os.geteuid()})
+        applied = parse_json(data)
+    except (OSError, ValueError):
+        pass
+    present, ctr = (applied is not None, {}) if dry else read_counters_nft()
+
+    nft_ok = True
+    if present and not dry and same_as_applied(applied, fp, now):
+        pass                                      # unchanged, and the table is there: leave it alone
+    else:
+        if not dry:
+            rc, _, err = run_nft(["-c", "-f", "-"], stdin=script, timeout=60)
+            if rc != 0:
+                nft_ok, error = False, "nft -c refused the script: %s" % clean(err, 160)
+            else:
+                rc, _, err = run_nft(["-f", "-"], stdin=script, timeout=60)
+                if rc != 0:
+                    nft_ok, error = False, "nft -f failed: %s" % clean(err, 160)
+        if nft_ok:
+            present = True
+            try:
+                if persist:
+                    atomic_write(paths.applied_json, json.dumps(fp), 0o640)
+            except OSError as e:
+                log("cannot write applied.json: %s" % clean(e, 100))
+            if not dry and eff_feeds and not self_test(machine):
+                error = "feed self-test failed: the feed sets were deleted"
+
+    # 2. The last good state is saved only when the table now holds it.
+    save = None
+    if nft_ok:
+        if paused:
+            if prev["paused_until"] != paused or not os.path.exists(paths.state_json):
+                save = dict(prev, paused_until=paused)
+        elif new_state is not None:
+            save = dict(new_state, paused_until=0)
+        elif not os.path.exists(paths.state_json) and (prev["bans"] or prev["feeds"]):
+            save = prev
+    if save is not None and persist:
+        try:
+            os.makedirs(paths.state_dir, mode=0o700, exist_ok=True)
+            atomic_write(paths.state_json, json.dumps(save, sort_keys=True), 0o600)
+        except OSError as e:
+            error = error or "cannot write state.json: %s" % clean(e, 120)
+
+    last_apply = {"ok": not error, "at": now, "error": clean(error, 200), "refused": refused[:REFUSED_KEPT]}
+    if len(refused) > REFUSED_KEPT:
+        last_apply["refused_total"] = len(refused)
+    try:
+        if persist:
+            write_counters(paths, now, present, sizes, ctr, last_apply)
+    except OSError as e:
+        log("cannot write counters.json: %s" % clean(e, 100))
+    if error:
+        log(error)
+    elif refused:
+        log("%d entries refused (see counters.json)" % len(refused))
+    if ident is not None:
+        try:
+            _, again = read_regular(paths.bans_json, MAX_BANS_FILE, owners=agent_uids(rooted))
+            if again != ident:
+                return 0, True                    # the file changed while we worked: read it again
+        except (OSError, ValueError):
+            pass
+    return (0 if nft_ok else 1), False
+
+
+def self_test(machine):
+    """After a feed apply: the metadata address and the machine's own addresses must be absent."""
+    probes = ["169.254.169.254"] + [str(n.network_address) for n in machine if n.version == 4][:8]
+    for a in probes:
+        rc, _, _ = run_nft(["get", "element", "inet", "edr", "edr_feed4", "{ %s }" % a])
+        if rc == 0:
+            run_nft(["flush", "set", "inet", "edr", "edr_feed4"])
+            run_nft(["flush", "set", "inet", "edr", "edr_feed6"])
+            return False
+    return True
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

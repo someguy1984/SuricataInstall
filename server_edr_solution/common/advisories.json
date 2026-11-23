@@ -1,0 +1,93 @@
+{
+  "updated": "2026-11-19",
+  "rows": [
+    {
+      "id": "nginx-ubuntu-noble",
+      "origin": "ubuntu",
+      "release": "noble",
+      "packages": ["nginx", "nginx-core", "nginx-full", "nginx-light", "nginx-extras"],
+      "compare": "dpkg",
+      "fixed_in": "1.24.0-2ubuntu7.20",
+      "cves": ["CVE-2026-123007", "CVE-2026-123633", "CVE-2026-123634", "CVE-2026-113425", "CVE-2026-118899"],
+      "needs_feature": null,
+      "ref": "https://ubuntu.com/security/notices/USN-9159-1"
+    },
+    {
+      "id": "nginx-ubuntu-resolute",
+      "origin": "ubuntu",
+      "release": "resolute",
+      "packages": ["nginx", "nginx-core", "nginx-full", "nginx-light", "nginx-extras"],
+      "compare": "dpkg",
+      "fixed_in": "1.28.3-2ubuntu1.13",
+      "cves": ["CVE-2026-123007", "CVE-2026-123633", "CVE-2026-123634", "CVE-2026-113425", "CVE-2026-118899", "CVE-2026-120967", "CVE-2026-121810", "CVE-2026-123640"],
+      "needs_feature": null,
+      "ref": "https://ubuntu.com/security/notices/USN-9159-1"
+    },
+    {
+      "id": "nginx-org-stable",
+      "origin": "nginx.org",
+      "release": "any",
+      "packages": ["nginx"],
+      "compare": "upstream",
+      "fixed_in": "1.30.7",
+      "cves": ["CVE-2026-123007", "CVE-2026-123633", "CVE-2026-123634", "CVE-2026-113425", "CVE-2026-118899"],
+      "needs_feature": null,
+      "ref": "https://nginx.org/en/security_advisories.html"
+    },
+    {
+      "id": "nginx-org-mainline",
+      "origin": "nginx.org",
+      "release": "any",
+      "packages": ["nginx"],
+      "compare": "upstream",
+      "fixed_in": "1.31.9",
+      "cves": ["CVE-2026-123007", "CVE-2026-123633", "CVE-2026-123634", "CVE-2026-113425", "CVE-2026-118899"],
+      "needs_feature": null,
+      "ref": "https://nginx.org/en/security_advisories.html"
+    },
+    {
+      "id": "kernel-sctp-noble-6.8",
+      "origin": "ubuntu",
+      "release": "noble-6.8",
+      "packages": [],
+      "compare": "kernel",
+      "fixed_in": "6.8.0-147.147",
+      "cves": ["CVE-2026-64564"],
+      "needs_feature": "sctp",
+      "ref": "https://ubuntu.com/security/CVE-2026-64564"
+    },
+    {
+      "id": "kernel-sctp-noble-7.0",
+      "origin": "ubuntu",
+      "release": "noble-7.0",
+      "packages": [],
+      "compare": "kernel",
+      "fixed_in": "7.0.0-38.38~24.04.4",
+      "cves": ["CVE-2026-64564"],
+      "needs_feature": "sctp",
+      "ref": "https://ubuntu.com/security/CVE-2026-64564"
+    },
+    {
+      "id": "kernel-sctp-resolute",
+      "origin": "ubuntu",
+      "release": "resolute",
+      "packages": [],
+      "compare": "kernel",
+      "fixed_in": "7.0.0-38.38",
+      "cves": ["CVE-2026-64564"],
+      "needs_feature": "sctp",
+      "ref": "https://ubuntu.com/security/CVE-2026-64564"
+    },
+    {
+      "id": "kernel-sctp-xint",
+      "origin": "ubuntu",
+      "release": "any",
+      "packages": [],
+      "compare": "kernel",
+      "fixed_in": null,
+      "cves": [],
+      "needs_feature": "sctp",
+      "ref": "https://xint.io/blog/nginx2root-remote-code-execution"
+    }
+  ]
+}

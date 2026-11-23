@@ -1,0 +1,15 @@
+# The fast path: apply as soon as the agent writes a new bans.json. edr-bans.timer runs the same
+# idempotent apply every minute, so a dead path unit costs a minute at most. check.sh FAILs if
+# this unit is not active.
+[Unit]
+Description=Apply bans when the agent writes bans.json
+
+[Path]
+PathChanged=/run/edr-agent/bans.json
+PathModified=/run/edr-agent/bans.json
+# A burst of ban writes must not trip the path unit's own rate limit
+TriggerLimitIntervalSec=0
+Unit=edr-bans.service
+
+[Install]
+WantedBy=multi-user.target

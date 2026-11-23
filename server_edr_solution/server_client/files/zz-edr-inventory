@@ -1,0 +1,4 @@
+// Installed as /etc/apt/apt.conf.d/zz-edr-inventory (client PLAN section 4.5.1). "zz" sorts after
+// needrestart's hook. It starts the inventory after every dpkg run, never waits for it and cannot
+// fail apt: the command ends in "|| true" and runs under a 10 second timeout.
+DPkg::Post-Invoke { "[ -d /run/systemd/system ] && timeout 10 systemctl start --no-block edr-inventory.service >/dev/null 2>&1 || true"; };

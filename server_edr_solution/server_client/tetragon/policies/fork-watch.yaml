@@ -1,0 +1,47 @@
+# Server policy, log only: a non-root nginx process forking (client PLAN section 4.3). A payload
+# usually forks first, so nginx-exec kills the child and the worker survives; workers never fork.
+# real_cred.euid of the new task (argument 0) is the parent's uid, and user namespaces cannot
+# hide it. Installed only where pre-flight saw an nginx master with euid 0.
+#
+# Placeholder: @NGINX_BIN@, both spellings (see nginx-exec.yaml).
+# Selector 1 drops thread creation (CLONE_THREAD, 0x10000 = 65536) with NoPost; selector 2 logs a
+# process whose euid is not 0. A hit followed by any web-policy event within 10 minutes is a hub
+# rule rated CRITICAL (hub PLAN section 4). No rateLimit: forks by workers are never routine.
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "fork-watch"
+spec:
+  kprobes:
+  - call: "security_task_alloc"
+    syscall: false
+    message: "A non-root nginx process forked"
+    args:
+    - index: 0
+      type: "uint32"
+      resolve: "real_cred.euid.val"
+    - index: 1
+      type: "ulong"
+    selectors:
+    - matchBinaries:
+      - operator: "In"
+        values:
+        - "@NGINX_BIN@"
+        - "@NGINX_BIN@ (deleted)"
+      matchArgs:
+      - index: 1
+        operator: "Mask"
+        values:
+        - "65536"
+      matchActions:
+      - action: NoPost
+    - matchBinaries:
+      - operator: "In"
+        values:
+        - "@NGINX_BIN@"
+        - "@NGINX_BIN@ (deleted)"
+      matchArgs:
+      - index: 0
+        operator: "NotEqual"
+        values:
+        - "0"

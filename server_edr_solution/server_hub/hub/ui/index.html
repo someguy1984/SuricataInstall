@@ -1,0 +1,611 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>edr-hub</title>
+<style>
+:root {
+  --bg: #f6f7f9; --panel: #ffffff; --text: #1b1f24; --muted: #5b6573; --line: #d5dae1; --accent: #1f5fbf;
+  --crit: #a30d2d; --high: #c2410c; --med: #8a6100; --low: #1d6b8a; --info: #5b6573; --ok: #1a7f37;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14171c; --panel: #1c2027; --text: #e6e9ee; --muted: #9aa4b2; --line: #343b46; --accent: #6aa5ff;
+    --crit: #ff6b81; --high: #ff9a5c; --med: #e6b84d; --low: #5cc0e6; --info: #9aa4b2; --ok: #56d364;
+  }
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 system-ui, sans-serif; }
+header { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; padding: 10px 16px; background: var(--panel); border-bottom: 1px solid var(--line); }
+header h1 { font-size: 16px; margin: 0; }
+.spacer { flex: 1; }
+.muted { color: var(--muted); }
+main { padding: 16px; max-width: 1400px; margin: 0 auto; }
+nav { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 14px; }
+button, select, input { font: inherit; color: var(--text); background: var(--panel); border: 1px solid var(--line); border-radius: 4px; padding: 4px 10px; }
+button { cursor: pointer; }
+button.active { background: var(--accent); color: #ffffff; border-color: var(--accent); }
+button.danger { border-color: var(--crit); color: var(--crit); }
+.banner { padding: 8px 16px; font-weight: 600; }
+.banner.bad { background: var(--crit); color: #ffffff; }
+.banner.warn { background: var(--med); color: #ffffff; }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 12px; margin-bottom: 14px; overflow-x: auto; }
+.panel h2 { font-size: 14px; margin: 0 0 8px 0; }
+table { border-collapse: collapse; width: 100%; }
+th, td { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { color: var(--muted); font-weight: 600; white-space: nowrap; }
+tr.click { cursor: pointer; }
+tr.click:hover { background: var(--bg); }
+td.wrap { word-break: break-word; }
+.sev-crit { color: var(--crit); font-weight: 700; }
+.sev-high { color: var(--high); font-weight: 700; }
+.sev-med { color: var(--med); font-weight: 600; }
+.sev-low { color: var(--low); }
+.sev-info { color: var(--info); }
+.state-ok { color: var(--ok); }
+.state-bad { color: var(--crit); }
+.state-warn { color: var(--med); }
+pre, code { font-family: ui-monospace, monospace; font-size: 12px; }
+pre { white-space: pre-wrap; word-break: break-word; margin: 6px 0; padding: 8px; background: var(--bg); border-radius: 4px; max-height: 360px; overflow: auto; }
+.row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 8px; }
+.login { max-width: 420px; margin: 40px auto; }
+.login input { width: 100%; margin: 8px 0; }
+dl { display: grid; grid-template-columns: max-content 1fr; gap: 2px 14px; margin: 0; }
+dt { color: var(--muted); }
+dd { margin: 0; word-break: break-word; }
+</style>
+</head>
+<body>
+<header>
+  <h1>edr-hub</h1>
+  <span id="version" class="muted"></span>
+  <span class="spacer"></span>
+  <span id="failed" class="muted"></span>
+  <button id="logout" type="button" hidden>Log out</button>
+</header>
+<div id="banners"></div>
+<main>
+  <section id="login-view" class="panel login" hidden>
+    <h2>Log in</h2>
+    <p>On the hub run <code>sudo edr-hub ui-login</code> and open the link it prints, or paste the code from it here. A code works once and for 10 minutes.</p>
+    <input id="code" type="password" autocomplete="off" aria-label="login code">
+    <button id="login-go" type="button">Log in</button>
+    <p id="login-msg" class="muted"></p>
+  </section>
+  <div id="app-view" hidden>
+    <nav id="nav"></nav>
+    <div id="content"></div>
+  </div>
+</main>
+<script>
+(function () {
+  'use strict';
+
+  var PAGES = ['Fleet', 'Events', 'Incidents', 'Host', 'Enroll', 'Audit', 'Settings'];
+  var SEV_CLASS = { CRITICAL: 'sev-crit', HIGH: 'sev-high', MEDIUM: 'sev-med', LOW: 'sev-low', INFO: 'sev-info' };
+  var SEV_ORDER = ['INFO', 'LOW', 'MEDIUM', 'HIGH', 'CRITICAL'];
+  var SOURCES = ['tetragon', 'suricata', 'nginx', 'journal', 'kernel', 'inventory', 'agent', 'canary'];
+  var STATE_CLASS = { active: 'state-ok', pending: 'state-warn', orphan: 'state-bad', revoked: 'state-bad', moved: 'muted', retired: 'muted' };
+  var EXPOSURE_CLASS = { exposed: 'state-bad', unknown: 'state-warn', ok: 'state-ok' };
+  var ROW_CAP = 500;
+
+  var token = null;
+  var current = 'Fleet';
+  var selectedHost = null;
+  var hubDown = false;
+  var streamAbort = null;
+  var streamGen = 0;
+  var lastEventId = 0;
+  var live = { on: true, tbody: null, filters: null };
+  var statusTimer = null;
+
+  try { token = window.sessionStorage.getItem('edr_token'); } catch (e) { token = null; }
+
+  function $(id) { return document.getElementById(id); }
+  function el(tag, cls, text) {
+    var e = document.createElement(tag);
+    if (cls) { e.className = cls; }
+    if (text !== undefined && text !== null) { e.textContent = String(text); }
+    return e;
+  }
+  function clear(n) { while (n.firstChild) { n.removeChild(n.firstChild); } }
+  function fmtTime(ms) {
+    if (!ms) { return '-'; }
+    return new Date(ms).toISOString().replace('T', ' ').slice(0, 19) + 'Z';
+  }
+  function fmtAge(ms) {
+    if (!ms) { return 'never'; }
+    var s = Math.max(Math.floor((Date.now() - ms) / 1000), 0);
+    if (s < 90) { return s + 's ago'; }
+    if (s < 5400) { return Math.round(s / 60) + 'm ago'; }
+    if (s < 129600) { return Math.round(s / 3600) + 'h ago'; }
+    return Math.round(s / 86400) + 'd ago';
+  }
+  function sevSpan(sev) { return el('span', SEV_CLASS[sev] || '', sev); }
+  function panel(title) {
+    var p = el('section', 'panel');
+    if (title) { p.appendChild(el('h2', '', title)); }
+    return p;
+  }
+  function table(headers, rows, onclick) {
+    var t = el('table');
+    var thead = el('thead');
+    var hr = el('tr');
+    headers.forEach(function (h) { hr.appendChild(el('th', '', h)); });
+    thead.appendChild(hr);
+    t.appendChild(thead);
+    var tb = el('tbody');
+    rows.forEach(function (r, i) {
+      var tr = el('tr', onclick ? 'click' : '');
+      r.forEach(function (cell) {
+        var td = el('td', 'wrap');
+        if (cell && cell.nodeType) { td.appendChild(cell); } else { td.textContent = cell === null || cell === undefined ? '' : String(cell); }
+        tr.appendChild(td);
+      });
+      if (onclick) { tr.addEventListener('click', function () { onclick(i); }); }
+      tb.appendChild(tr);
+    });
+    t.appendChild(tb);
+    return t;
+  }
+  function facts(pairs) {
+    var dl = el('dl');
+    pairs.forEach(function (p) { dl.appendChild(el('dt', '', p[0])); dl.appendChild(el('dd', '', p[1])); });
+    return dl;
+  }
+  function jsonPre(value) { return el('pre', '', JSON.stringify(value, null, 2)); }
+
+  // ---- talking to the server -------------------------------------------------------------
+  function setHubDown(down) {
+    hubDown = down;
+    renderBanners();
+  }
+  var statusInfo = null;
+  function renderBanners() {
+    var b = $('banners');
+    clear(b);
+    if (hubDown) { b.appendChild(el('div', 'banner bad', 'Hub down: the dashboard cannot read the database or reach the hub. Retrying.')); }
+    if (statusInfo && statusInfo.alerts_failing) {
+      b.appendChild(el('div', 'banner bad', 'Alert delivery is failing: run "sudo edr-hub alert test" on the hub.'));
+    }
+    if (statusInfo && statusInfo.hub_down && !hubDown) {
+      b.appendChild(el('div', 'banner bad', 'The hub writer has not reported for over 30 seconds (hub down).'));
+    }
+  }
+  function api(method, path, body) {
+    var headers = { 'Authorization': 'Bearer ' + (token || '') };
+    var opts = { method: method, headers: headers };
+    if (body !== undefined) { headers['Content-Type'] = 'application/json'; opts.body = JSON.stringify(body); }
+    return fetch(path, opts).then(function (resp) {
+      return resp.json().catch(function () { return {}; }).then(function (data) {
+        if (resp.status === 401 && path !== '/api/login') { logout(false); }
+        if (resp.status === 503) { setHubDown(true); } else if (hubDown) { setHubDown(false); }
+        if (!resp.ok) { var err = new Error(data.error || 'error'); err.status = resp.status; throw err; }
+        return data;
+      });
+    });
+  }
+  function showError(container, err) {
+    container.appendChild(el('p', 'state-bad', 'Could not load: ' + (err && err.message ? err.message : 'error')));
+  }
+
+  // ---- login ---------------------------------------------------------------------------------
+  function showLogin(msg) {
+    $('login-view').hidden = false;
+    $('app-view').hidden = true;
+    $('logout').hidden = true;
+    $('login-msg').textContent = msg || '';
+  }
+  function showApp() {
+    $('login-view').hidden = true;
+    $('app-view').hidden = false;
+    $('logout').hidden = false;
+    buildNav();
+    show('Fleet');
+    pollStatus();
+  }
+  function redeem(code) {
+    $('login-msg').textContent = 'Logging in...';
+    return fetch('/api/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code: code }) })
+      .then(function (resp) {
+        return resp.json().catch(function () { return {}; }).then(function (data) {
+          if (resp.ok && data.token) {
+            token = data.token;
+            try { window.sessionStorage.setItem('edr_token', token); } catch (e) { /* storage may be off */ }
+            showApp();
+          } else if (resp.status === 429) {
+            showLogin('Too many failed logins. Wait a minute.');
+          } else if (resp.status === 503) {
+            showLogin('Hub down. Try again in a moment.');
+          } else {
+            showLogin('Login refused. Make a new code with: sudo edr-hub ui-login');
+          }
+        });
+      }).catch(function () { showLogin('Cannot reach the dashboard server.'); });
+  }
+  function logout(callServer) {
+    var old = token;
+    token = null;
+    try { window.sessionStorage.removeItem('edr_token'); } catch (e) { /* ignore */ }
+    stopStream();
+    if (statusTimer) { window.clearTimeout(statusTimer); statusTimer = null; }
+    if (callServer && old) {
+      fetch('/api/logout', { method: 'POST', headers: { 'Authorization': 'Bearer ' + old, 'Content-Type': 'application/json' }, body: '{}' }).catch(function () { return null; });
+    }
+    showLogin(callServer ? 'Logged out.' : 'Session ended. Log in again.');
+  }
+
+  // ---- status banners ---------------------------------------------------------------------
+  function pollStatus() {
+    if (!token) { return; }
+    api('GET', '/api/status').then(function (s) {
+      statusInfo = s;
+      $('version').textContent = 'v' + s.version;
+      $('failed').textContent = 'failed logins in the last minute: ' + s.failed_logins_last_minute;
+      renderBanners();
+    }).catch(function () { return null; }).then(function () {
+      if (token) { statusTimer = window.setTimeout(pollStatus, hubDown ? 5000 : 10000); }
+    });
+  }
+
+  // ---- navigation -----------------------------------------------------------------------------
+  function buildNav() {
+    var nav = $('nav');
+    clear(nav);
+    PAGES.forEach(function (name) {
+      var b = el('button', name === current ? 'active' : '', name);
+      b.type = 'button';
+      b.addEventListener('click', function () { show(name); });
+      nav.appendChild(b);
+    });
+  }
+  function show(name) {
+    current = name;
+    buildNav();
+    if (name !== 'Events') { stopStream(); }
+    var c = $('content');
+    clear(c);
+    var loader = { Fleet: pageFleet, Events: pageEvents, Incidents: pageIncidents, Host: pageHost, Enroll: pageEnroll, Audit: pageAudit, Settings: pageSettings }[name];
+    loader(c);
+  }
+
+  // ---- Fleet ----------------------------------------------------------------------------------
+  function healthText(h) {
+    var parts = [];
+    if (h.dns_lock && h.dns_lock.state) { parts.push('dns ' + h.dns_lock.state); }
+    if (Array.isArray(h.tetragon)) {
+      var modes = {};
+      h.tetragon.forEach(function (p) { if (p && p.mode) { modes[p.mode] = (modes[p.mode] || 0) + 1; } });
+      Object.keys(modes).forEach(function (m) { parts.push(modes[m] + ' ' + m); });
+    }
+    if (h.suricata_drops && typeof h.suricata_drops.drops === 'number') { parts.push('drops ' + h.suricata_drops.drops); }
+    if (h.disk && typeof h.disk.free_pct === 'number') { parts.push('disk ' + h.disk.free_pct + '% free'); }
+    return parts.join(', ');
+  }
+  function pageFleet(c) {
+    var p = panel('Fleet');
+    c.appendChild(p);
+    api('GET', '/api/fleet').then(function (d) {
+      var hosts = d.hosts;
+      p.appendChild(table(['Host', 'State', 'Last heartbeat', 'Agent', 'Address', 'Open incidents', 'Health', 'NGINX2Root exposure', 'Note'],
+        hosts.map(function (h) {
+          var notes = [];
+          if (h.maintenance_until) { notes.push('maintenance until ' + fmtTime(h.maintenance_until)); }
+          if (h.health && h.health.maintenance_until) { notes.push('host declares maintenance'); }
+          if (h.health && h.health.paused_until) { notes.push('paused'); }
+          return [h.name, el('span', STATE_CLASS[h.state] || '', h.state), fmtAge(h.last_seen), h.agent_version,
+            (h.peer_ips && h.peer_ips[0]) || '-', h.open_incidents, healthText(h.health || {}),
+            el('span', EXPOSURE_CLASS[h.exposure] || '', h.exposure + (h.exposure_checks && h.exposure_checks.length ? ' (' + h.exposure_checks.join(', ') + ')' : '')),
+            notes.join('; ')];
+        }),
+        function (i) { selectedHost = hosts[i].uuid; show('Host'); }));
+      if (!hosts.length) { p.appendChild(el('p', 'muted', 'No hosts yet. Make a token on the hub (see Enroll).')); }
+    }).catch(function (e) { showError(p, e); });
+  }
+
+  // ---- Events (with the live feed) ------------------------------------------------------------
+  function eventMatches(e, f) {
+    if (f.sev && SEV_ORDER.indexOf(e.hub_severity) < SEV_ORDER.indexOf(f.sev)) { return false; }
+    if (f.host && e.host_name !== f.host && e.host !== f.host) { return false; }
+    if (f.source && e.source !== f.source) { return false; }
+    if (f.kind) {
+      if (f.kind.charAt(f.kind.length - 1) === '*') {
+        if (String(e.kind).indexOf(f.kind.slice(0, -1)) !== 0) { return false; }
+      } else if (e.kind !== f.kind) { return false; }
+    }
+    return true;
+  }
+  function eventRow(e) {
+    var tr = el('tr', 'click');
+    tr.appendChild(el('td', '', fmtTime(e.received_at)));
+    var s = el('td'); s.appendChild(sevSpan(e.hub_severity)); tr.appendChild(s);
+    tr.appendChild(el('td', 'wrap', e.host_name || e.host));
+    tr.appendChild(el('td', 'wrap', e.kind));
+    tr.appendChild(el('td', 'wrap', e.summary + (e.count > 1 ? '  x' + e.count : '') + (e.replayed ? '  (late)' : '')));
+    tr.addEventListener('click', function () { openEvent(e.id); });
+    return tr;
+  }
+  var detailBox = null;
+  function openEvent(id) {
+    if (!detailBox) { return; }
+    clear(detailBox);
+    detailBox.appendChild(el('h2', '', 'Event ' + id));
+    api('GET', '/api/event/' + encodeURIComponent(String(id))).then(function (d) {
+      var e = d.event;
+      detailBox.appendChild(facts([
+        ['received', fmtTime(e.received_at)], ['event time', fmtTime(e.ts)], ['host', e.host_name || e.host],
+        ['source', e.source], ['client severity', e.severity], ['hub severity', e.hub_severity + (e.rated_by ? ' (rule ' + e.rated_by + ')' : '')],
+        ['kind', e.kind], ['summary', e.summary], ['source address', e.src_ip + ' (' + e.src_trust + ')'],
+        ['destination', e.dst_ip + (e.dst_port ? ':' + e.dst_port : '')], ['count', e.count], ['meaning', e.describe.meaning], ['next step', e.describe.next_step]]));
+      detailBox.appendChild(jsonPre(e.details));
+    }).catch(function (err) { showError(detailBox, err); });
+  }
+  function pageEvents(c) {
+    var p = panel('Events');
+    var bar = el('div', 'row');
+    var sev = el('select');
+    ['', 'LOW', 'MEDIUM', 'HIGH', 'CRITICAL'].forEach(function (s) { var o = el('option', '', s === '' ? 'any severity' : s + ' and up'); o.value = s; sev.appendChild(o); });
+    var host = el('input'); host.placeholder = 'host name';
+    var src = el('select');
+    [''].concat(SOURCES).forEach(function (s) { var o = el('option', '', s === '' ? 'any source' : s); o.value = s; src.appendChild(o); });
+    var kind = el('input'); kind.placeholder = 'kind (ssh.* ok)';
+    var apply = el('button', '', 'Apply'); apply.type = 'button';
+    var liveBtn = el('button', live.on ? 'active' : '', 'Live'); liveBtn.type = 'button';
+    [sev, host, src, kind, apply, liveBtn].forEach(function (x) { bar.appendChild(x); });
+    p.appendChild(bar);
+    var t = el('table');
+    var hr = el('tr');
+    ['Received', 'Severity', 'Host', 'Kind', 'Summary'].forEach(function (h) { hr.appendChild(el('th', '', h)); });
+    var th = el('thead'); th.appendChild(hr); t.appendChild(th);
+    var tb = el('tbody'); t.appendChild(tb);
+    p.appendChild(t);
+    c.appendChild(p);
+    detailBox = panel('');
+    detailBox.appendChild(el('p', 'muted', 'Click an event for its details.'));
+    c.appendChild(detailBox);
+    live.tbody = tb;
+    function filters() { return { sev: sev.value, host: host.value.trim(), source: src.value, kind: kind.value.trim() }; }
+    function load() {
+      var f = filters();
+      var q = [];
+      if (f.sev) { q.push('min_sev=' + encodeURIComponent(f.sev)); }
+      if (f.host) { q.push('host=' + encodeURIComponent(f.host)); }
+      if (f.source) { q.push('source=' + encodeURIComponent(f.source)); }
+      if (f.kind) { q.push('kind=' + encodeURIComponent(f.kind)); }
+      q.push('limit=200');
+      live.filters = f;
+      api('GET', '/api/events?' + q.join('&')).then(function (d) {
+        clear(tb);
+        d.events.forEach(function (e) { tb.appendChild(eventRow(e)); });
+        lastEventId = d.head_event_id;
+        if (live.on) { startStream(); }
+      }).catch(function (err) { clear(tb); var tr = el('tr'); var td = el('td', 'state-bad', 'Could not load: ' + err.message); td.colSpan = 5; tr.appendChild(td); tb.appendChild(tr); });
+    }
+    apply.addEventListener('click', load);
+    liveBtn.addEventListener('click', function () {
+      live.on = !live.on;
+      liveBtn.className = live.on ? 'active' : '';
+      if (live.on) { startStream(); } else { stopStream(); }
+    });
+    load();
+  }
+  function onLiveEvent(e) {
+    if (!live.tbody || current !== 'Events' || !live.filters || !eventMatches(e, live.filters)) { return; }
+    live.tbody.insertBefore(eventRow(e), live.tbody.firstChild);
+    while (live.tbody.childNodes.length > ROW_CAP) { live.tbody.removeChild(live.tbody.lastChild); }
+  }
+  function stopStream() {
+    streamGen += 1;
+    if (streamAbort) { streamAbort.abort(); streamAbort = null; }
+  }
+  // The feed is read with fetch() and a stream reader (not the browser's event-source object): the secret stays in a header.
+  function startStream() {
+    stopStream();
+    var gen = streamGen;
+    var ctl = new AbortController();
+    streamAbort = ctl;
+    function again(ms) { window.setTimeout(function () { if (gen === streamGen && token && current === 'Events' && live.on) { startStream(); } }, ms); }
+    fetch('/api/stream', { headers: { 'Authorization': 'Bearer ' + token, 'Last-Event-ID': String(lastEventId) }, signal: ctl.signal }).then(function (resp) {
+      if (resp.status === 401) { logout(false); return null; }
+      if (!resp.ok) { again(resp.status === 429 ? 15000 : 5000); return null; }
+      var reader = resp.body.getReader();
+      var decoder = new TextDecoder();
+      var buf = '';
+      function pump() {
+        return reader.read().then(function (r) {
+          if (r.done) { again(1000); return null; }
+          buf += decoder.decode(r.value, { stream: true });
+          var idx;
+          while ((idx = buf.indexOf('\n\n')) >= 0) {
+            var frame = buf.slice(0, idx);
+            buf = buf.slice(idx + 2);
+            handleFrame(frame, gen);
+          }
+          return pump();
+        });
+      }
+      return pump();
+    }).catch(function () { if (gen === streamGen) { again(5000); } });
+  }
+  function handleFrame(frame, gen) {
+    if (gen !== streamGen) { return; }
+    var name = 'message';
+    var data = '';
+    var id = null;
+    frame.split('\n').forEach(function (line) {
+      if (line.indexOf('event: ') === 0) { name = line.slice(7); }
+      else if (line.indexOf('data: ') === 0) { data += line.slice(6); }
+      else if (line.indexOf('id: ') === 0) { id = line.slice(4); }
+    });
+    var obj = null;
+    try { obj = JSON.parse(data); } catch (e) { obj = null; }
+    if (name === 'event' && obj) {
+      if (id) { lastEventId = Math.max(lastEventId, parseInt(id, 10) || 0); }
+      onLiveEvent(obj);
+    } else if (name === 'reset' && current === 'Events') {
+      show('Events');
+    } else if (name === 'ping' && obj) {
+      if (obj.hub_down && !hubDown) { setHubDown(true); }
+    }
+  }
+
+  // ---- Incidents ------------------------------------------------------------------------------
+  function pageIncidents(c) {
+    var p = panel('Incidents');
+    var detail = panel('');
+    detail.appendChild(el('p', 'muted', 'Click an incident for its timeline.'));
+    c.appendChild(p);
+    c.appendChild(detail);
+    api('GET', '/api/incidents').then(function (d) {
+      var list = d.incidents;
+      p.appendChild(table(['ID', 'State', 'Severity', 'Host', 'Updated', 'Signals', 'Title'],
+        list.map(function (i) { return [i.id, i.state, sevSpan(i.severity), i.host_name || i.host, fmtAge(i.updated), i.signals, i.title]; }),
+        function (n) { openIncident(list[n].id, detail); }));
+      if (!list.length) { p.appendChild(el('p', 'muted', 'No incidents.')); }
+    }).catch(function (e) { showError(p, e); });
+  }
+  function openIncident(id, box) {
+    clear(box);
+    box.appendChild(el('h2', '', 'Incident ' + id));
+    api('GET', '/api/incident/' + encodeURIComponent(String(id))).then(function (d) {
+      var i = d.incident;
+      box.appendChild(facts([['state', i.state], ['severity', i.severity], ['host', i.host_name || i.host], ['chain', i.chain],
+        ['opened', fmtTime(i.opened)], ['updated', fmtTime(i.updated)], ['signals', i.signals], ['kinds', (i.kinds || []).join(', ')],
+        ['resolve', 'sudo edr-hub resolve ' + i.id]]));
+      Object.keys(i.describe || {}).forEach(function (k) {
+        box.appendChild(el('p', '', k + ': ' + i.describe[k].meaning + ' Next: ' + i.describe[k].next_step));
+      });
+      box.appendChild(table(['Received', 'Severity', 'Kind', 'Summary'],
+        i.events.map(function (e) { return [fmtTime(e.received_at), sevSpan(e.hub_severity), e.kind, e.summary + (e.count > 1 ? '  x' + e.count : '')]; })));
+    }).catch(function (e) { showError(box, e); });
+  }
+
+  // ---- Host -----------------------------------------------------------------------------------
+  function pageHost(c) {
+    var p = panel('Host');
+    c.appendChild(p);
+    if (!selectedHost) { p.appendChild(el('p', 'muted', 'Choose a host on the Fleet page.')); return; }
+    api('GET', '/api/host/' + encodeURIComponent(selectedHost)).then(function (d) {
+      var h = d.host;
+      p.appendChild(el('h2', '', h.name));
+      p.appendChild(facts([
+        ['uuid', h.uuid], ['state', h.state + ' since ' + fmtTime(h.state_since)], ['reported name (untrusted)', h.reported_name],
+        ['os (untrusted)', h.os], ['addresses seen', (h.peer_ips || []).join(', ')], ['addresses claimed (untrusted)', (h.ips || []).join(', ')],
+        ['agent', (h.agent_version || '-') + ' schema ' + h.schema], ['kernel', h.kernel || '-'], ['last heartbeat', fmtTime(d.heartbeat_at)],
+        ['certificate expires', fmtTime(h.cert_not_after)], ['policy rev issued / applied', (h.policy_rev || '-') + ' / ' + (h.policy_rev_applied || '-')],
+        ['local.conf sha256', (d.health && d.health.local_conf_sha256) || '-'], ['ban.local events', d.ban_local_events],
+        ['maintenance', d.maintenance ? 'until ' + fmtTime(d.maintenance.until) + ', set by ' + d.maintenance.set_by : 'none']]));
+      var act = el('div', 'row');
+      var mm = el('button', 'danger', 'Mark moved'); mm.type = 'button';
+      mm.addEventListener('click', function () {
+        if (window.confirm('Mark ' + h.name + ' as moved? Its certificate is revoked.')) { act2('/api/host/mark-moved', { host: h.uuid }); }
+      });
+      var dur = el('select');
+      ['15m', '30m', '1h', '2h'].forEach(function (x) { var o = el('option', '', x); o.value = x; dur.appendChild(o); });
+      var set = el('button', '', 'Set maintenance'); set.type = 'button';
+      set.addEventListener('click', function () { act2('/api/host/maintenance', { host: h.uuid, 'for': dur.value }); });
+      var end = el('button', '', 'End maintenance'); end.type = 'button';
+      end.addEventListener('click', function () { act2('/api/host/maintenance', { host: h.uuid, end: true }); });
+      [mm, dur, set, end].forEach(function (x) { act.appendChild(x); });
+      p.appendChild(act);
+      var msg = el('p', 'muted');
+      p.appendChild(msg);
+      function act2(path, body) {
+        msg.textContent = 'Working...';
+        api('POST', path, body).then(function () { show('Host'); }).catch(function (e) { msg.textContent = 'Refused: ' + e.message; });
+      }
+      var hp = panel('Health (from the last heartbeat)'); hp.appendChild(jsonPre(d.health)); c.appendChild(hp);
+      var ep = panel('Inventory findings'); ep.appendChild(d.exposure.length ? table(['Check', 'Status'], d.exposure.map(function (x) { return [x.check, String(x.status)]; })) : el('p', 'muted', 'Nothing open.')); c.appendChild(ep);
+      var ip = panel('Incidents');
+      ip.appendChild(table(['ID', 'State', 'Severity', 'Updated', 'Title'], d.incidents.map(function (i) { return [i.id, i.state, sevSpan(i.severity), fmtAge(i.updated), i.title]; })));
+      c.appendChild(ip);
+      var tp = panel('Timeline (latest 100 events)');
+      tp.appendChild(table(['Received', 'Severity', 'Kind', 'Summary'],
+        d.events.map(function (e) { return [fmtTime(e.received_at), sevSpan(e.hub_severity), e.kind, e.summary + (e.count > 1 ? '  x' + e.count : '')]; })));
+      c.appendChild(tp);
+    }).catch(function (e) { showError(p, e); });
+  }
+
+  // ---- Enroll ---------------------------------------------------------------------------------
+  function pageEnroll(c) {
+    var p = panel('Enrollment tokens');
+    c.appendChild(p);
+    api('GET', '/api/tokens').then(function (d) {
+      p.appendChild(el('p', '', 'Tokens are made on the hub only, not from this page:'));
+      p.appendChild(el('pre', '', d.command));
+      p.appendChild(table(['Id', 'Name or host', 'Source', 'Expires', 'State'],
+        d.tokens.map(function (t) { return [t.id, t.name || ('for ' + t.for_host), t.source_cidr || '-', fmtTime(t.expires_at), t.state]; })));
+    }).catch(function (e) { showError(p, e); });
+  }
+
+  // ---- Audit ----------------------------------------------------------------------------------
+  function pageAudit(c) {
+    var p = panel('Audit');
+    c.appendChild(p);
+    var holder = el('div');
+    p.appendChild(holder);
+    var more = el('button', '', 'Older'); more.type = 'button';
+    p.appendChild(more);
+    var before = null;
+    var rows = [];
+    function load() {
+      api('GET', '/api/audit?limit=100' + (before ? '&before_id=' + before : '')).then(function (d) {
+        d.audit.forEach(function (a) { rows.push(a); });
+        if (d.audit.length) { before = d.audit[d.audit.length - 1].id; }
+        more.hidden = d.audit.length < 100;
+        clear(holder);
+        holder.appendChild(table(['Id', 'Time', 'Actor', 'Detail', 'Action', 'Target', 'Outcome'],
+          rows.map(function (a) { return [a.id, fmtTime(a.ts), a.actor_kind, a.actor_detail, a.action, a.target, a.outcome]; })));
+      }).catch(function (e) { showError(p, e); });
+    }
+    more.addEventListener('click', load);
+    load();
+  }
+
+  // ---- Settings (read only) ---------------------------------------------------------------------
+  function kv(obj) {
+    return table(['Key', 'Value'], Object.keys(obj).map(function (k) {
+      var v = obj[k];
+      return [k, typeof v === 'string' ? (v === '' ? '(empty)' : v) : JSON.stringify(v)];
+    }));
+  }
+  function pageSettings(c) {
+    api('GET', '/api/settings').then(function (d) {
+      var a = panel('Settings (change them on the hub with: sudo edr-hub settings set KEY VALUE)'); a.appendChild(kv(d.plain)); c.appendChild(a);
+      var b = panel('Installer-owned'); b.appendChild(kv(d.installer)); c.appendChild(b);
+      var s = panel('Secrets (host and last 4 characters only)');
+      var secrets = {};
+      Object.keys(d.secrets).forEach(function (k) { secrets[k] = d.secrets[k] || '(not set)'; });
+      s.appendChild(kv(secrets)); c.appendChild(s);
+      var n = panel('Never-ban list');
+      n.appendChild(table(['CIDR', 'Added', 'By', 'Reason'], d.never_ban.map(function (r) { return [r.cidr, fmtTime(r.ts), r.added_by, r.reason]; })));
+      c.appendChild(n);
+      var h = panel('Recent changes');
+      h.appendChild(table(['Time', 'Key', 'Old', 'New', 'Actor'], d.history.map(function (r) { return [fmtTime(r.ts), r.key, r.old, r.new, r.actor]; })));
+      c.appendChild(h);
+    }).catch(function (e) { var p = panel('Settings'); showError(p, e); c.appendChild(p); });
+  }
+
+  // ---- start ----------------------------------------------------------------------------------
+  $('logout').addEventListener('click', function () { logout(true); });
+  $('login-go').addEventListener('click', function () { var v = $('code').value.trim(); $('code').value = ''; if (v) { redeem(v); } });
+  $('code').addEventListener('keydown', function (ev) { if (ev.key === 'Enter') { $('login-go').click(); } });
+
+  (function init() {
+    var m = /(?:^#|&)code=([A-Za-z0-9_-]{8,128})/.exec(window.location.hash || '');
+    if (m) {
+      window.history.replaceState(null, '', window.location.pathname + window.location.search);   // at once: the code leaves the URL
+      redeem(m[1]);
+    } else if (token) {
+      api('GET', '/api/status').then(function () { showApp(); }).catch(function (e) { if (e.status === 503) { showApp(); } else { showLogin(''); } });
+    } else {
+      showLogin('');
+    }
+  }());
+}());
+</script>
+</body>
+</html>

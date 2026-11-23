@@ -1,0 +1,232 @@
+#!/usr/bin/env python3
+"""edr-notify: send local HIGH and CRITICAL alerts to ntfy or a Slack-compatible webhook (client PLAN section 4.7).
+
+A oneshot started by edr-notify.path (PathModified= on alerts.jsonl), running as the user
+`edr-notify` with three credentials: `url` (the webhook, root 0600), `alerts.jsonl` (a copy made by
+systemd as root: its inode is new at every start) and `min_severity` (rendered by apply-config).
+It keeps in its StateDirectory the `id` of the last alert it sent and sends only the lines after
+it, once each, at or above min_severity. If that id is not in the copy (the file rotated) the whole
+copy is sent once. It sends only kind, severity, host and a 200-character summary, escaped for the
+channel, never excerpts. It has its own copy of the payload templates: hub code is not shared.
+
+url line   `https://ntfy.example/topic` (host name contains "ntfy"), `ntfy+URL`, `slack+URL`, or any
+           other https URL (a Slack-compatible webhook).
+Usage    edr-notify [--cred-dir DIR] [--state-dir DIR] [--dry-run] [--max-send N]
+         The directories default to $CREDENTIALS_DIRECTORY and $STATE_DIRECTORY (set by systemd).
+         --dry-run  print the messages instead of sending them; the state is not changed.
+Python standard library only, run as: python3 -I edr-notify
+"""
+
+import hashlib
+import json
+import os
+import re
+import socket
+import stat
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+
+PROG = "edr-notify"
+VERSION = "0.1.0"
+SEV = ["INFO", "LOW", "MEDIUM", "HIGH", "CRITICAL"]
+MAX_LINES_BYTES = 8 * 1024 * 1024
+MAX_LINE = 64 * 1024
+MAX_SEND = 20
+SUMMARY = 200
+
+
+def clean(text, limit=200):
+    """Printable ASCII only (anything else becomes ?): the text came off the network or a process."""
+    return "".join(c if " " <= c <= "~" else "?" for c in str(text))[:limit]
+
+
+def read_cred(d, name, limit):
+    fd = os.open(os.path.join(d, name), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > limit:
+            raise ValueError("%s is not a small regular file" % name)
+        out = b""
+        while len(out) <= limit:
+            b = os.read(fd, 1 << 16)
+            if not b:
+                break
+            out += b
+        if len(out) > limit:
+            raise ValueError("%s is too large" % name)
+        return out
+    finally:
+        os.close(fd)
+
+
+def parse_url(line):
+    """(kind, url, topic) of the credential line. ntfy publishes JSON to the server root."""
+    line = line.strip()
+    kind = None
+    for pre in ("ntfy+", "slack+"):
+        if line.startswith(pre):
+            kind, line = pre[:-1], line[len(pre):]
+    u = urllib.parse.urlsplit(line)
+    if u.scheme not in ("https", "http") or not u.hostname:
+        raise ValueError("the url is not an http or https URL")
+    if kind is None:
+        kind = "ntfy" if "ntfy" in u.hostname.lower() else "slack"
+    if kind == "ntfy":
+        topic = u.path.strip("/")
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", topic):
+            raise ValueError("the ntfy URL needs a topic as its path")
+        root = urllib.parse.urlunsplit((u.scheme, u.netloc, "/", "", ""))
+        return "ntfy", root, topic
+    return "slack", line, ""
+
+
+def slack_escape(text):
+    """Slack-compatible: escape & < > first so nothing is read as markup, a link or a mention."""
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def build_message(kind, topic, ev, host):
+    sev = ev.get("sev") if ev.get("sev") in SEV else "HIGH"
+    kd = clean(ev.get("kind", "?"), 64)
+    summary = clean(ev.get("summary", ""), SUMMARY)
+    title = "EDR %s on %s: %s" % (sev, clean(host, 64), kd)
+    if kind == "ntfy":
+        # fixed titles, no Click or Actions, and the summary in a code span
+        body = {"topic": topic, "title": title, "message": "`%s`" % summary.replace("`", "'"),
+                "priority": {"INFO": 2, "LOW": 2, "MEDIUM": 3, "HIGH": 4, "CRITICAL": 5}[sev],
+                "tags": ["rotating_light" if sev == "CRITICAL" else "warning"]}
+    else:
+        body = {"text": slack_escape("%s\n`%s`" % (title, summary.replace("`", "'"))), "unfurl_links": False, "unfurl_media": False}
+    return json.dumps(body).encode("utf-8")
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **k):
+        return None
+
+
+def post(url, data, timeout=5):
+    req = urllib.request.Request(url, data=data, method="POST", headers={"Content-Type": "application/json", "User-Agent": "edr-notify/" + VERSION})
+    opener = urllib.request.build_opener(NoRedirect)
+    try:
+        with opener.open(req, timeout=timeout) as r:
+            r.read(4096)
+            return 200 <= r.status < 300
+    except (urllib.error.URLError, OSError, ValueError):
+        return False
+
+
+def line_id(line, ev):
+    i = ev.get("id") if isinstance(ev, dict) else None
+    return i if isinstance(i, str) and 0 < len(i) <= 80 else "h:" + hashlib.sha1(line).hexdigest()[:16]
+
+
+def pending(lines, last_id):
+    """(items after last_id, or all when last_id is absent) as [(id, event)]; bad lines are skipped."""
+    items = []
+    for raw in lines:
+        if not raw.strip() or len(raw) > MAX_LINE:
+            continue
+        try:
+            ev = json.loads(raw.decode("utf-8", "replace"))
+        except (ValueError, RecursionError):
+            continue
+        if isinstance(ev, dict):
+            items.append((line_id(raw, ev), ev))
+    if last_id is not None:
+        for idx in range(len(items) - 1, -1, -1):
+            if items[idx][0] == last_id:
+                return items[idx + 1:], items
+    return items, items
+
+
+def main(argv):
+    cred = os.environ.get("CREDENTIALS_DIRECTORY", "")
+    state_dir = os.environ.get("STATE_DIRECTORY", "")
+    dry, max_send, i = False, MAX_SEND, 0
+    while i < len(argv):
+        a = argv[i]
+        nxt = argv[i + 1] if i + 1 < len(argv) else None
+        if a == "--cred-dir" and nxt:
+            cred = nxt; i += 1
+        elif a == "--state-dir" and nxt:
+            state_dir = nxt; i += 1
+        elif a == "--dry-run":
+            dry = True
+        elif a == "--max-send" and nxt:
+            max_send = int(nxt); i += 1
+        else:
+            print("usage: edr-notify [--cred-dir DIR] [--state-dir DIR] [--dry-run]", file=sys.stderr)
+            return 2
+        i += 1
+    if not cred or not state_dir:
+        print("edr-notify: CREDENTIALS_DIRECTORY and STATE_DIRECTORY are not set", file=sys.stderr)
+        return 2
+    try:
+        kind, url, topic = parse_url(read_cred(cred, "url", 4096).decode("utf-8", "replace"))
+    except (OSError, ValueError) as e:
+        print("edr-notify: no usable url: %s" % clean(e, 100))
+        return 0                                    # off until notify.url exists
+    try:
+        raw = read_cred(cred, "min_severity", 64).decode("ascii", "replace").strip().upper()
+    except (OSError, ValueError):
+        raw = "HIGH"
+    min_idx = SEV.index(raw) if raw in SEV else SEV.index("HIGH")
+    try:
+        data = read_cred(cred, "alerts.jsonl", MAX_LINES_BYTES)
+    except (OSError, ValueError) as e:
+        print("edr-notify: cannot read the alerts: %s" % clean(e, 100))
+        return 0
+    state_path = os.path.join(state_dir, "last_id")
+    last_id = None
+    try:
+        with open(state_path, "r", encoding="ascii") as fh:
+            last_id = fh.read(128).strip() or None
+    except OSError:
+        pass
+    todo, everything = pending(data.split(b"\n"), last_id)
+    host = socket.gethostname()
+    wanted = [(lid, ev) for lid, ev in todo if ev.get("sev") in SEV and SEV.index(ev["sev"]) >= min_idx]
+    sent, failed = 0, False
+    advance_to = None
+    for n, (lid, ev) in enumerate(wanted):
+        if n >= max_send:
+            break
+        msg = build_message(kind, topic, ev, host)
+        if dry:
+            print(msg.decode())
+            sent += 1
+            continue
+        if post(url, msg):
+            sent += 1
+            advance_to = lid
+            _save(state_path, lid)
+        else:
+            failed = True
+            break
+    if not dry and not failed:
+        rest = len(wanted) - sent
+        if rest > 0:
+            summary = {"sev": "HIGH", "kind": "notify.suppressed", "summary": "%d more alert(s) not sent; see alerts.jsonl on the host" % rest}
+            post(url, build_message(kind, topic, summary, host))
+        if everything:
+            _save(state_path, everything[-1][0])           # everything up to the last line has been handled
+    print("edr-notify: sent %d of %d new alert(s)%s" % (sent, len(wanted), " (a send failed: will retry)" if failed else ""))
+    return 1 if failed else 0
+
+
+def _save(path, lid):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="ascii") as fh:
+        fh.write(lid + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.rename(tmp, path)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

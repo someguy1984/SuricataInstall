@@ -1,0 +1,585 @@
+#!/usr/bin/env python3
+"""edr-policy-check: are the Tetragon policies loaded, in the right mode, and does enforcement work?
+
+A root oneshot (client PLAN section 4.3). After a kernel upgrade a symbol, a resolve path or the
+BTF can stop one policy loading while Tetragon stays up; this helper notices, promotes a killing
+policy from monitor to enforce when its gate passes (only inside [tetragon] enforce), holds every
+enforcing policy in monitor mode during a pause (edr-canary excepted), and runs the daily canary.
+The agent cannot call tetra, so the result is a status file.
+
+Input    `tetra tracingpolicy list -o json`, /etc/tetragon/tetragon.tp.d/*.yaml (the rendered set),
+         /etc/edr-agent/local.conf ([tetragon] enforce, web_exec_allow; [sites] web_users),
+         /etc/edr-agent/pause.json, /var/lib/edr-policy-check/state.json
+Output   /run/edr-policy-check/status.json (root:edr-agent 0640):
+         {"written_at", "kernel", "btf", "policies": [{"name", "mode", "state", "want", "would_be_kills", "gate"}],
+          "canary": {"at", "ok", "detail"}, "enforcement_gone": [...]}
+         Actions: `tetra tracingpolicy set-mode NAME enforce|monitor`, the canary through setpriv.
+
+Usage    edr-policy-check [--root DIR] [--dry-run] [--now EPOCH] [--exec-fixtures FILE] [--no-canary]
+         --dry-run  calls no program (so every policy is "missing"); with --root files are still written
+Python standard library only, run as: python3 -I edr-policy-check
+"""
+
+import configparser
+import json
+import os
+import re
+import stat
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+
+PROG = "edr-policy-check"
+VERSION = "0.1.0"
+TETRA_SOCK = "unix:///var/run/tetragon/tetragon.sock"
+TP_DIR = "/etc/tetragon/tetragon.tp.d"
+STATE_DIR = "/var/lib/edr-policy-check"
+STATUS = "/run/edr-policy-check/status.json"
+CANARY = "/usr/libexec/edr/canary"
+CANDIDATES = ("nginx-exec", "sctp-socket", "web-exec")     # killing policies that can be promoted
+ALWAYS_ENFORCE = ("edr-canary",)
+CAP_SYS_ADMIN = 21
+DAY = 86400
+MONITOR_HOURS = 24
+EXEC_BAD = re.compile(r"\b(exec_push|exec_static|perl_modules|perl_require|perl_set|content_by_lua\w*|access_by_lua\w*|"
+                      r"init_by_lua\w*|rewrite_by_lua\w*|js_import|js_content|js_set|passenger_enabled|passenger_root)\b")
+LOAD_BAD = re.compile(r"load_module\s+\S*(lua|perl|njs|rtmp|passenger|_js_module)", re.I)
+
+# ---- Small helpers shared (copied, not imported) by the root helpers --------------------------------
+class Env:
+    """Paths under --root, programs run (or faked), the clock. Used by every root helper."""
+
+    def __init__(self, root="", dry=False, fixtures=None, now=None):
+        self.root = root.rstrip("/")
+        self.dry = dry
+        self.fixtures = fixtures
+        self.now = int(now if now is not None else time.time())
+        self.writes = bool(root) or not dry          # a dry run on the real paths writes nothing
+        self.log_lines = []
+
+    def p(self, path):
+        return self.root + path
+
+    def run(self, argv, timeout=20, stdin=None):
+        """(rc, stdout, stderr), or None when the program cannot run (dry run, missing, timeout)."""
+        if self.fixtures is not None:
+            f = self.fixtures.get(" ".join(argv))
+            return (f.get("rc", 0), f.get("out", ""), f.get("err", "")) if isinstance(f, dict) else None
+        if self.dry:
+            return None
+        try:
+            r = subprocess.run(argv, capture_output=True, timeout=timeout, check=False, input=stdin, text=True,
+                               env={"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C", "LC_ALL": "C"})
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        return r.returncode, r.stdout, r.stderr
+
+    def log(self, msg):
+        print("%s: %s" % (PROG, clean(msg, 300)), flush=True)
+
+
+def clean(text, limit=200):
+    """Printable ASCII only: this ends up in files and logs other programs read."""
+    return "".join(c if " " <= c <= "~" else "?" for c in str(text))[:limit]
+
+
+def read_file(path, max_bytes=65536, one_link=True, owners=None):
+    """Read a file another user may control: no symlink, no FIFO, bounded. Returns bytes; raises OSError or ValueError."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise ValueError("not a regular file")
+        if one_link and st.st_nlink != 1:
+            raise ValueError("more than one link")
+        if owners is not None and st.st_uid not in owners:
+            raise ValueError("unexpected owner")
+        if st.st_size > max_bytes:
+            raise ValueError("file too large")
+        out, total = [], 0
+        while True:
+            b = os.read(fd, 1 << 16)
+            if not b:
+                break
+            total += len(b)
+            if total > max_bytes:
+                raise ValueError("file too large")
+            out.append(b)
+        return b"".join(out)
+    finally:
+        os.close(fd)
+
+
+def read_text(env, path, max_bytes=65536, one_link=True, owners=None):
+    try:
+        return read_file(env.p(path), max_bytes, one_link, owners).decode("utf-8", "replace")
+    except (OSError, ValueError):
+        return None
+
+
+def atomic_write(path, text, mode=0o640):
+    """Write to .tmp, fsync, rename."""
+    os.makedirs(os.path.dirname(path), mode=0o755, exist_ok=True)
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC, mode)
+    try:
+        os.write(fd, text.encode("utf-8"))
+        os.fchmod(fd, mode)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.rename(tmp, path)
+
+
+def load_json(env, path, max_bytes=1 << 20, owners=None):
+    t = read_text(env, path, max_bytes, True, owners)
+    if t is None:
+        return None
+    try:
+        return json.loads(t)
+    except (ValueError, RecursionError):
+        return None
+
+
+def pause_until(env):
+    """The end of a valid pause (epoch s), or 0. An expired or odd file is ignored."""
+    doc = load_json(env, "/etc/edr-agent/pause.json", 4096)
+    u = doc.get("until") if isinstance(doc, dict) else None
+    return u if isinstance(u, int) and not isinstance(u, bool) and u > env.now else 0
+
+
+def read_conf(env, files_dir=""):
+    """local.conf over defaults.conf. Returns a ConfigParser; trouble means the defaults."""
+    cp = configparser.ConfigParser(interpolation=None, strict=False)
+    here = os.path.dirname(os.path.realpath(__file__))
+    for c in ([os.path.join(files_dir, "defaults.conf")] if files_dir else []) + [
+            os.path.join(here, "defaults.conf"), os.path.join(here, "files", "defaults.conf"),
+            os.path.join(here, "..", "files", "defaults.conf")]:
+        try:
+            with open(c, encoding="utf-8") as fh:
+                cp.read_string(fh.read(262144))
+            break
+        except (OSError, configparser.Error):
+            continue
+    t = read_text(env, "/etc/edr-agent/local.conf", 262144)
+    if t is not None:
+        try:
+            cp.read_string(t)
+        except configparser.Error:
+            pass
+    return cp
+
+
+def parse_common(argv, extra=None):
+    """Parse --root, --dry-run, --now, --exec-fixtures, --files-dir. Returns (Env, files_dir, rest, options)."""
+    root = os.environ.get("EDR_AGENT_ROOT", "")
+    dry, fixtures, now, files_dir, rest = False, None, None, "", []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        nxt = argv[i + 1] if i + 1 < len(argv) else None
+        if a == "--root" and nxt is not None:
+            root = nxt; i += 1
+        elif a == "--dry-run":
+            dry = True
+        elif a == "--now" and nxt is not None:
+            now = int(nxt); i += 1
+        elif a == "--exec-fixtures" and nxt is not None:
+            with open(nxt, encoding="utf-8") as fh:
+                fixtures = json.load(fh)
+            i += 1
+        elif a == "--files-dir" and nxt is not None:
+            files_dir = nxt; i += 1
+        elif a in ("-h", "--help"):
+            print(__doc__)
+            sys.exit(0)
+        else:
+            rest.append(a)
+        i += 1
+    return Env(root, dry, fixtures, now), files_dir, rest
+
+
+
+def tetra(env, *args, timeout=20):
+    return env.run(["tetra", "--server-address", TETRA_SOCK] + list(args), timeout=timeout)
+
+
+def norm_mode(v):
+    s = str(v).lower()
+    if "monitor" in s:
+        return "monitor"
+    if "enforce" in s:
+        return "enforce"
+    return "unknown"
+
+
+def norm_state(v):
+    s = str(v).lower()
+    if "error" in s or "fail" in s:
+        return "error"
+    if s in ("", "none"):
+        return "loaded"
+    if "enable" in s or "load" in s:
+        return "loaded"
+    return "error"
+
+
+def loaded_policies(env):
+    """{name: {"mode", "state", "kills"}} from tetra, or None when tetra cannot answer."""
+    r = tetra(env, "tracingpolicy", "list", "-o", "json")
+    if r is None or r[0] != 0:
+        return None
+    try:
+        doc = json.loads(r[1])
+    except (ValueError, RecursionError):
+        return None
+    items = doc.get("policies", []) if isinstance(doc, dict) else doc if isinstance(doc, list) else []
+    out = {}
+    for it in items[:200]:
+        if not isinstance(it, dict) or not isinstance(it.get("name"), str):
+            continue
+        name = it["name"]
+        if not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", name):
+            continue
+        kills = 0
+        for k, v in it.items():
+            if re.fullmatch(r"(n_?monitor|would_?be_?kills|monitor_?count)", k.lower()) and isinstance(v, int) and not isinstance(v, bool):
+                kills = max(kills, v)
+        out[name] = {"mode": norm_mode(it.get("mode", "")), "state": norm_state(it.get("state", "")), "kills": kills}
+    return out
+
+
+def rendered_names(env):
+    names = []
+    try:
+        files = sorted(os.listdir(env.p(TP_DIR)))[:200]
+    except OSError:
+        return None
+    for fn in files:
+        if not fn.endswith(".yaml"):
+            continue
+        t = read_text(env, TP_DIR + "/" + fn, 1 << 20, one_link=False)
+        m = re.search(r'^\s{2}name:\s*"?([A-Za-z0-9_.-]+)"?\s*$', t or "", re.M)
+        if m:
+            names.append(m.group(1))
+    return names
+
+
+def proc_status(env, pid):
+    t = read_text(env, "/proc/%d/status" % pid, 8192, one_link=False)
+    if not t:
+        return None
+    d = {}
+    for line in t.splitlines():
+        k, _, v = line.partition(":")
+        d[k] = v.strip()
+    return d
+
+
+def nginx_master(env):
+    t = read_text(env, "/run/nginx.pid", 64, one_link=False)
+    try:
+        pid = int((t or "").strip())
+    except ValueError:
+        return None
+    st = proc_status(env, pid)
+    return (pid, st) if st else None
+
+
+def nginx_gate(env, want_cache):
+    """Pre-flight part of the nginx-exec gate. Returns "" when it passes, else the reason."""
+    m = nginx_master(env)
+    if m is None:
+        return "no running nginx master"
+    pid, st = m
+    try:
+        if int(st.get("Uid", "x").split()[1]) != 0:
+            return "nginx master is not euid 0"
+        if not int(st.get("CapBnd", "0"), 16) >> CAP_SYS_ADMIN & 1:
+            return "nginx unit drops CAP_SYS_ADMIN (the master could not upgrade itself)"
+    except (ValueError, IndexError):
+        return "cannot read the nginx master's credentials"
+    r = env.run(["systemd-detect-virt", "--container"])
+    if r is not None and r[0] == 0:
+        return "running in a container"
+    r = env.run(["nginx", "-V"])
+    text = (r[2] + r[1]) if r else ""
+    if re.search(r"--add(-dynamic)?-module=\S*(lua|perl|njs|rtmp|passenger)", text, re.I) or "--with-http_perl_module" in text:
+        return "nginx has lua, perl, rtmp, passenger or njs built in"
+    # the configuration: a bounded read of /etc/nginx
+    total, files = 0, 0
+    for dirpath, dirs, names in os.walk(env.p("/etc/nginx"), followlinks=False):
+        for n in names:
+            files += 1
+            if files > 500:
+                return "too many files in /etc/nginx to check"
+            try:
+                data = read_file(os.path.join(dirpath, n), 1 << 20, one_link=False)
+            except (OSError, ValueError):
+                continue
+            total += len(data)
+            if total > 4 << 20:
+                return "too much configuration to check"
+            t = data.decode("utf-8", "replace")
+            if EXEC_BAD.search(t) or LOAD_BAD.search(t):
+                return "nginx configuration uses lua, perl, rtmp exec, passenger or njs"
+    return ""
+
+
+def php_master_start_after(env, loaded_at):
+    """True when every php-fpm master started after the policy was loaded."""
+    try:
+        pids = [int(n) for n in os.listdir(env.p("/proc")) if n.isdigit()]
+    except OSError:
+        return False
+    btime = 0
+    t = read_text(env, "/proc/stat", 1 << 20, one_link=False) or ""
+    m = re.search(r"^btime\s+(\d+)", t, re.M)
+    if m:
+        btime = int(m.group(1))
+    found = False
+    hz = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
+    for pid in pids:
+        try:
+            exe = os.readlink(env.p("/proc/%d/exe" % pid))
+        except OSError:
+            continue
+        if not re.fullmatch(r"php-fpm[0-9.]*", os.path.basename(exe.replace(" (deleted)", ""))):
+            continue
+        cmd = read_text(env, "/proc/%d/cmdline" % pid, 4096, one_link=False) or ""
+        if "master process" not in cmd:
+            continue
+        st = read_text(env, "/proc/%d/stat" % pid, 4096, one_link=False) or ""
+        try:
+            ticks = int(st.rsplit(")", 1)[1].split()[19])
+        except (IndexError, ValueError):
+            return False
+        found = True
+        if btime + ticks / hz <= loaded_at:
+            return False
+    return found
+
+
+def web_user(env, cp):
+    """(uid, gid) to run the canary as: the first web user, else nobody."""
+    import pwd
+    names = [x.strip() for x in cp.get("sites", "web_users", fallback="").split(",") if x.strip()]
+    for n in names + ["nobody"]:
+        try:
+            p = pwd.getpwnam(n)
+            if p.pw_uid != 0:
+                return p.pw_uid, p.pw_gid
+        except KeyError:
+            continue
+    return 65534, 65534
+
+
+def run_canary(env, cp, state):
+    """Run the enforcement canary as the web user: it must die by SIGKILL. Returns {"at","ok","detail"}."""
+    if not os.path.exists(env.p(CANARY)) and env.fixtures is None:
+        return {"at": env.now, "ok": False, "detail": "the canary binary is missing"}
+    uid, gid = web_user(env, cp)
+    r = env.run(["setpriv", "--reuid", str(uid), "--regid", str(gid), "--clear-groups", CANARY, "-c", "exec /bin/true"], timeout=15)
+    if r is None:
+        return {"at": env.now, "ok": False, "detail": "the canary could not run"}
+    rc = r[0]
+    if rc in (-9, 137):
+        return {"at": env.now, "ok": True, "detail": "killed by SIGKILL as uid %d" % uid}
+    return {"at": env.now, "ok": False, "detail": "the canary was not killed (exit %d)" % rc}
+
+
+def sctp_gate(env):
+    r = env.run(["ss", "-H", "--sctp", "-a"])
+    if r is None or r[0] != 0:
+        return "cannot list SCTP sockets"
+    if r[1].strip():
+        return "an SCTP socket exists (something uses SCTP)"
+    return ""
+
+
+def main(argv):
+    env, files_dir, rest = parse_common(argv)
+    skip_canary = "--no-canary" in rest
+    if rest and rest != ["--no-canary"]:
+        print("usage: edr-policy-check [--root DIR] [--dry-run] [--now EPOCH] [--no-canary]", file=sys.stderr)
+        return 2
+    if not env.root and os.geteuid() != 0 and not env.dry:
+        print("edr-policy-check: must run as root", file=sys.stderr)
+        return 2
+    now = env.now
+    cp = read_conf(env, files_dir)
+    state = load_json(env, STATE_DIR + "/state.json", 1 << 20, owners={0, os.geteuid()})
+    if not isinstance(state, dict):
+        state = {}
+    pol_state = state.setdefault("policies", {})
+    paused = pause_until(env)
+    enforce_list = [x.strip() for x in cp.get("tetragon", "enforce", fallback="nginx-exec,sctp-socket").split(",") if x.strip()]
+    kernel = (read_text(env, "/proc/sys/kernel/osrelease", 128, one_link=False) or "").strip()
+    btf = os.path.exists(env.p("/sys/kernel/btf/vmlinux"))
+
+    loaded = loaded_policies(env)
+    rendered = rendered_names(env) or []
+    have_tetra = loaded is not None
+    loaded = loaded or {}
+
+    # the daily canary: also after a kernel change and after a Tetragon restart
+    canary = state.get("canary") if isinstance(state.get("canary"), dict) else {"at": 0, "ok": False, "detail": "not run yet"}
+    kernel_changed = state.get("kernel") not in (None, kernel)
+    tetragon_new = have_tetra and not state.get("tetragon_seen")
+    need_canary = (now - int(canary.get("at", 0) or 0) >= DAY or kernel_changed or tetragon_new or not canary.get("ok"))
+    if have_tetra and "edr-canary" in loaded and not skip_canary and need_canary and (env.fixtures is not None or not env.dry):
+        canary = run_canary(env, cp, state)
+        if canary["ok"] or kernel_changed:
+            state["canary_ok_kernel"] = kernel if canary["ok"] else state.get("canary_ok_kernel")
+    state["canary"] = canary
+    state["tetragon_seen"] = have_tetra
+    state["kernel"] = kernel
+
+    # The SCTP socket canary, once, while sctp-socket is in monitor mode: the hook must raise NMONITOR.
+    sp = pol_state.setdefault("sctp-socket", {})
+    if (have_tetra and loaded.get("sctp-socket", {}).get("mode") == "monitor" and not sp.get("hook_seen")
+            and not skip_canary and (env.fixtures is not None or not env.dry)):
+        before = loaded["sctp-socket"]["kills"]
+        uid, gid = web_user(env, cp)
+        env.run(["setpriv", "--reuid", str(uid), "--regid", str(gid), "--clear-groups", "/usr/bin/python3", "-I", "-c",
+                 "import socket; socket.socket(socket.AF_INET, socket.SOCK_SEQPACKET, 132)"], timeout=15)
+        again = loaded_policies(env) or {}
+        if again.get("sctp-socket", {}).get("kills", 0) > before:
+            sp["hook_seen"] = True
+            loaded["sctp-socket"]["kills"] = again["sctp-socket"]["kills"]
+
+    canary_fresh = bool(canary.get("ok")) and now - int(canary.get("at", 0) or 0) < 26 * 3600
+
+    def gate_for(name):
+        if name not in CANDIDATES:
+            return ""
+        if name not in enforce_list:
+            return "not in [tetragon] enforce"
+        if name == "nginx-exec":
+            g = nginx_gate(env, None)
+            if g:
+                return g
+        elif name == "sctp-socket":
+            g = sctp_gate(env)
+            if g:
+                return g
+        elif name == "web-exec":
+            local = read_text(env, "/etc/edr-agent/local.conf", 262144) or ""
+            lc = configparser.ConfigParser(interpolation=None, strict=False)
+            try:
+                lc.read_string(local)
+            except configparser.Error:
+                pass
+            if not lc.has_option("tetragon", "web_exec_allow"):
+                return "learning not accepted (edr-agent learn --accept)"
+            # the agent's learning store: accepted_at is set by `learn --accept`; a tuple first seen
+            # in the last 72 hours means the web tree still does something new
+            learn = load_json(env, "/var/lib/edr-agent/learn.json", 8 << 20)
+            if not isinstance(learn, dict) or not isinstance(learn.get("accepted_at"), int):
+                return "learning not accepted (edr-agent learn --accept)"
+            firsts = [t.get("first") for t in (learn.get("tuples") or {}).values()
+                      if isinstance(t, dict) and t.get("policy") == "web-exec" and isinstance(t.get("first"), int)]
+            if firsts and now - max(firsts) < 72 * 3600:
+                return "a new tuple appeared within 72 hours"
+            ps = pol_state.get(name, {})
+            if not ps.get("loaded_at") or not php_master_start_after(env, ps["loaded_at"]):
+                return "php-fpm was not restarted after the policy loaded"
+        # common: time in monitor mode with no would-be kill, and a fresh canary
+        ps = pol_state.get(name, {})
+        if name in ("nginx-exec", "web-exec") and loaded.get(name, {}).get("kills", 0) > 0:
+            return "NMONITOR is not 0"
+        if name in ("nginx-exec",):
+            since = ps.get("monitor_since")
+            if not since or now - since < MONITOR_HOURS * 3600:
+                return "monitor period not over (24 h with no would-be kill)"
+        if name == "sctp-socket" and not ps.get("hook_seen"):
+            return "the monitor canary has not raised NMONITOR yet"
+        if not canary_fresh:
+            return "the canary has not passed in the last 26 hours"
+        return ""
+
+    policies, gone, actions = [], [], []
+    names = sorted(set(rendered) | set(loaded))
+    for name in names:
+        info = loaded.get(name)
+        ps = pol_state.setdefault(name, {})
+        if info is None:
+            st_name = "missing" if have_tetra else "missing"
+            mode = "monitor"
+        else:
+            st_name, mode = info["state"], info["mode"] if info["mode"] != "unknown" else "monitor"
+        kills = info["kills"] if info else 0
+        killing = name in CANDIDATES or name in ALWAYS_ENFORCE or name == "fork-watch"
+        gate = ""
+        if name in ALWAYS_ENFORCE:
+            want = "enforce"
+        elif name in CANDIDATES:
+            gate = gate_for(name)
+            want = "enforce" if (not gate and not paused) else "monitor"
+            if paused and name in enforce_list and not gate:
+                gate = "paused"
+        else:
+            want = mode                        # observation policies have nothing to promote
+        if info is not None and st_name == "loaded":
+            ps.setdefault("loaded_at", now)
+            if mode == "monitor":
+                if kills > 0:
+                    ps["hook_seen"] = True
+                    if name in ("nginx-exec", "web-exec"):
+                        ps["monitor_since"] = now            # a would-be kill restarts the 24 h clock
+                ps.setdefault("monitor_since", now)
+        else:
+            ps.pop("loaded_at", None)
+            ps.pop("monitor_since", None)
+        if info is not None and st_name == "loaded" and killing and mode != want:
+            actions.append((name, want))
+        entry = {"name": name, "mode": mode, "state": st_name, "want": want, "would_be_kills": int(kills), "gate": clean(gate, 120)}
+        policies.append(entry)
+        if st_name != "loaded" and (name in ALWAYS_ENFORCE or (name in CANDIDATES and name in enforce_list)) and name in rendered:
+            gone.append(name)
+    # a canary that did not die (after a kernel change, or on any day) means enforcement cannot be trusted
+    uptime_s = 0
+    ut = read_text(env, "/proc/uptime", 64, one_link=False)
+    try:
+        uptime_s = int(float((ut or "0").split()[0]))
+    except (ValueError, IndexError):
+        pass
+    if uptime_s < 300:
+        gone = []                              # Tetragon is still starting after a boot
+    elif have_tetra and "edr-canary" in loaded and not skip_canary and not canary.get("ok") and "edr-canary" not in gone:
+        gone.append("edr-canary")
+
+    # act: demote at once, promote only when the gate passed (want was computed with it)
+    done = []
+    for name, want in actions:
+        r = tetra(env, "tracingpolicy", "set-mode", name, want)
+        ok = r is not None and r[0] == 0
+        done.append("%s -> %s %s" % (name, want, "ok" if ok else "failed"))
+        if ok:
+            for p in policies:
+                if p["name"] == name:
+                    p["mode"] = want
+                    pol_state[name]["monitor_since"] = now if want == "monitor" else pol_state[name].get("monitor_since")
+    for d in done:
+        env.log(d)
+
+    doc = {"written_at": now, "kernel": clean(kernel, 64), "btf": btf, "policies": policies,
+           "canary": {"at": int(canary.get("at", 0) or 0), "ok": bool(canary.get("ok")), "detail": clean(canary.get("detail", ""), 120)},
+           "enforcement_gone": sorted(set(gone))}
+    if env.writes:
+        try:
+            atomic_write(env.p(STATUS), json.dumps(doc, sort_keys=True), 0o640)
+            os.makedirs(env.p(STATE_DIR), mode=0o700, exist_ok=True)
+            atomic_write(env.p(STATE_DIR + "/state.json"), json.dumps(state, sort_keys=True), 0o600)
+        except OSError as e:
+            env.log("cannot write: %s" % e)
+            return 1
+    if env.dry:
+        print(json.dumps(doc, indent=1, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

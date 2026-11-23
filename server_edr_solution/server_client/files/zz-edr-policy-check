@@ -1,0 +1,4 @@
+// Installed as /etc/apt/apt.conf.d/zz-edr-policy-check (client PLAN section 4.3). A kernel or package
+// change can stop one Tetragon policy loading: check the set after every dpkg run. It never waits
+// and cannot fail apt.
+DPkg::Post-Invoke { "[ -d /run/systemd/system ] && timeout 10 systemctl start --no-block edr-policy-check.service >/dev/null 2>&1 || true"; };

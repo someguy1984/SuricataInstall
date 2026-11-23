@@ -1,0 +1,65 @@
+[Unit]
+Description=EDR hub: fleet ingest, enrollment, correlation and the SQLite writer
+After=edr-hub-nft.service network.target
+OnFailure=edr-hub-failed.service
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=notify
+NotifyAccess=main
+WatchdogSec=60
+Restart=on-failure
+RestartSec=5
+User=edr-hub
+Group=edr-hub
+UMask=0027
+ExecStart=/usr/bin/python3 -I /usr/local/lib/edr-hub/edr_hub.py
+
+# /run/edr-hub holds three sockets of three groups: the directory is traversable by all, and each socket gets its
+# group and mode once it is bound. These steps run as root (the + prefix) because the process itself must never
+# chown: @privileged contains @chown.
+RuntimeDirectory=edr-hub
+RuntimeDirectoryMode=0711
+ExecStartPre=+/usr/bin/chmod 0711 /run/edr-hub
+ExecStartPost=+/usr/bin/chmod 0600 /run/edr-hub/ctl.sock
+ExecStartPost=+/usr/bin/chgrp edr-hub-ui /run/edr-hub/ui.sock
+ExecStartPost=+/usr/bin/chmod 0660 /run/edr-hub/ui.sock
+ExecStartPost=+/usr/bin/chgrp edr-hub-out /run/edr-hub/out.sock
+ExecStartPost=+/usr/bin/chmod 0660 /run/edr-hub/out.sock
+
+# Inbound only: the nft table drops new outbound connections of this user (hub PLAN section 8, step 5)
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+MemoryHigh=400M
+MemoryMax=512M
+TasksMax=200
+ReadWritePaths=/var/lib/edr-hub
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+DevicePolicy=closed
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+RemoveIPC=yes
+KeyringMode=private
+LogNamespace=edr-hub
+
+[Install]
+WantedBy=multi-user.target

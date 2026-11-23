@@ -1,0 +1,56 @@
+# Server policy: any program started in the php-fpm or nginx process tree except the allowlist
+# (client PLAN section 4.3). The test is inverted on purpose: a list of bad names is evaded by a
+# renamed copy, "env", "awk" or "php -r".
+#
+# Placeholders (a line that holds one is repeated per value, and left out without a value):
+#   @NGINX_BIN@, @PHPFPM_BIN@   the binaries, both spellings. followChildren follows what they
+#                               fork, so php-fpm must be RESTARTED (not reloaded) after this
+#                               policy loads: the gate compares the master's start time.
+#   @WEB_EXEC_ALLOW@            allowlist: the php-fpm and nginx binaries (a reload re-execs them),
+#                               /usr/sbin/sendmail, and [tetragon] web_exec_allow written by
+#                               `edr-agent learn --accept`. Matched as a suffix of the exec path.
+#
+# Selector 1 lets the allowlist through without an event; selector 2 kills the rest. Off by
+# default: it enforces only when [tetragon] enforce names it AND learning was accepted AND no new
+# tuple appeared for 72 hours. No rateLimit.
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "web-exec"
+spec:
+  options:
+  - name: "policy-mode"
+    value: "monitor"
+  kprobes:
+  - call: "security_bprm_check"
+    syscall: false
+    message: "A program was started in the web process tree"
+    args:
+    - index: 0
+      type: "linux_binprm"
+    selectors:
+    - matchBinaries:
+      - operator: "In"
+        followChildren: true
+        values:
+        - "@PHPFPM_BIN@"
+        - "@PHPFPM_BIN@ (deleted)"
+        - "@NGINX_BIN@"
+        - "@NGINX_BIN@ (deleted)"
+      matchArgs:
+      - index: 0
+        operator: "Postfix"
+        values:
+        - "@WEB_EXEC_ALLOW@"
+      matchActions:
+      - action: NoPost
+    - matchBinaries:
+      - operator: "In"
+        followChildren: true
+        values:
+        - "@PHPFPM_BIN@"
+        - "@PHPFPM_BIN@ (deleted)"
+        - "@NGINX_BIN@"
+        - "@NGINX_BIN@ (deleted)"
+      matchActions:
+      - action: Sigkill

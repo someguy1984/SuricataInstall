@@ -1,0 +1,49 @@
+# Sends HIGH and CRITICAL local alerts to ntfy or a Slack-compatible webhook (client PLAN section 4.7).
+# Off until /etc/edr-agent/notify.url exists (root 0600). The unit reads alerts.jsonl through a
+# credential copy, whose inode is new at every start; the sender keeps the id of the last alert
+# it sent in its StateDirectory. It cannot read local.conf, so apply-config renders min_severity
+# into /etc/edr-agent/notify.min_severity (root 0600), loaded as a second credential.
+[Unit]
+Description=Send local alerts to ntfy or a webhook
+ConditionPathExists=/etc/edr-agent/notify.url
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I /usr/local/lib/edr-agent/edr-notify
+User=edr-notify
+LoadCredential=url:/etc/edr-agent/notify.url
+LoadCredential=alerts.jsonl:/var/lib/edr-agent/alerts.jsonl
+LoadCredential=min_severity:/etc/edr-agent/notify.min_severity
+StateDirectory=edr-notify
+StateDirectoryMode=0700
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+IPAddressDeny=any
+# apply-config writes the webhook addresses into a drop-in; localhost is the resolver stub
+IPAddressAllow=localhost
+ProtectHome=yes
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+MemoryMax=64M
+Nice=10
+TimeoutStartSec=60
+TasksMax=16
+NoNewPrivileges=yes
+ProtectSystem=strict
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+LimitCORE=0
+LogNamespace=edr

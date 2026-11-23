@@ -1,0 +1,5 @@
+# Python bytecode from running the tests
+__pycache__/
+*.pyc
+# Release tarballs built by `make dist`
+/dist/

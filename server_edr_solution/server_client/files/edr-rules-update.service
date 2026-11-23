@@ -1,0 +1,45 @@
+# Daily Suricata rule update, server variant of the laptop suricata-rules-update.service
+# (client PLAN section 4.1). It runs at the lowest priority, skips the run when memory is short,
+# tests the candidate rules under a 900 MB limit and keeps the old rules if that fails.
+[Unit]
+Description=Update Suricata rules (candidate, test under a memory limit, then reload)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Nice=19
+CPUWeight=20
+IOSchedulingClass=idle
+TimeoutStartSec=30min
+ExecCondition=/usr/local/lib/edr-agent/files/edr-rules-update guard
+ExecStart=/usr/local/lib/edr-agent/files/edr-rules-update run
+# "+" runs this one step outside the sandbox below, which has no right to manage services
+ExecStartPost=+/usr/local/lib/edr-agent/files/edr-rules-update apply
+LogNamespace=edr
+
+# Sandboxing: this downloads and unpacks archives from the internet as root every day. It may only
+# write the Suricata state directory, and keeps just the capabilities needed to write into
+# /var/lib/suricata (owned by suricata:suricata) as root. systemd-run talks to the manager over
+# AF_UNIX, and the test runs in a transient unit outside this sandbox.
+ProtectSystem=strict
+ReadWritePaths=/var/lib/suricata
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_FOWNER CAP_CHOWN
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+# Not used: RestrictSUIDSGID. /var/lib/suricata/rules is setgid (so the suricata group can read
+# what root writes there), and suricata-update backs the directory up with its modes before every
+# run; with RestrictSUIDSGID that copy fails with EPERM and the update aborts before it downloads.
+LockPersonality=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6

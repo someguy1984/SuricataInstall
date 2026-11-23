@@ -1,0 +1,47 @@
+# What is installed, exposed and drifting on this host (client PLAN section 4.5.1). A root oneshot
+# with a fixed output file, hourly and after each apt run (zz-edr-inventory). It reads files a web
+# user may control, so the parser opens them with O_NOFOLLOW and caps them. Sandbox: no
+# ProtectKernelModules (modprobe -n -v reads /lib/modules), no ProtectProc, no hidepid.
+[Unit]
+Description=Collect the host inventory (packages, nginx exposure, posture)
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I /usr/local/lib/edr-agent/edr-inventory
+User=root
+Group=edr-agent
+UMask=0027
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH CAP_SYS_PTRACE
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+IPAddressDeny=any
+ProtectHome=read-only
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+RuntimeDirectory=edr-inventory
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+StateDirectory=edr-inventory
+StateDirectoryMode=0700
+Nice=19
+IOSchedulingClass=idle
+TimeoutStartSec=120
+MemoryMax=128M
+TasksMax=64
+NoNewPrivileges=yes
+ProtectSystem=strict
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+LimitCORE=0
+LogNamespace=edr

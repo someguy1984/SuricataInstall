@@ -1,0 +1,63 @@
+# Server variant of the laptop policy (client PLAN section 4.3). Observe-only: a program started
+# listening for TCP connections on an address other machines can reach. The services that are
+# expected to listen on a web server are ignored by binary (selector 1, NoPost): nginx, php-fpm,
+# sshd, the database servers, redis and valkey, and PostgreSQL by directory. Octane, Reverb or any
+# other listener per host is added to the first selector by the operator (never remotely).
+# Listening on loopback only is not logged. One event per process and minute.
+#
+# Placeholders: @NGINX_BIN@, @PHPFPM_BIN@ (both spellings).
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "tcp-listen"
+spec:
+  kprobes:
+  - call: "inet_csk_listen_start"
+    syscall: false
+    message: "Program started listening for network connections"
+    args:
+    - index: 0
+      type: "sock"
+    selectors:
+    - matchBinaries:
+      - operator: "In"
+        values:
+        - "@NGINX_BIN@"
+        - "@NGINX_BIN@ (deleted)"
+        - "@PHPFPM_BIN@"
+        - "@PHPFPM_BIN@ (deleted)"
+        - "/usr/sbin/sshd"
+        - "/usr/sbin/mysqld"
+        - "/usr/sbin/mariadbd"
+        - "/usr/bin/redis-server"
+        - "/usr/bin/valkey-server"
+      matchArgs:
+      - index: 0
+        operator: "NotSAddr"
+        values:
+        - "127.0.0.0/8"
+        - "::1/128"
+      matchActions:
+      - action: NoPost
+    - matchBinaries:
+      - operator: "Prefix"
+        values:
+        - "/usr/lib/postgresql/"
+      matchArgs:
+      - index: 0
+        operator: "NotSAddr"
+        values:
+        - "127.0.0.0/8"
+        - "::1/128"
+      matchActions:
+      - action: NoPost
+    - matchArgs:
+      - index: 0
+        operator: "NotSAddr"
+        values:
+        - "127.0.0.0/8"
+        - "::1/128"
+      matchActions:
+      - action: Post
+        rateLimit: "1m"
+        rateLimitScope: "process"

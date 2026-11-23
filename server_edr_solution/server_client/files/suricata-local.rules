@@ -1,0 +1,6 @@
+# This server's own rules. Installed as /etc/suricata/local.rules, where suricata-update leaves
+# them alone. SIDs 9000000-9099999 are reserved for local use. Alerts only: Suricata is an IDS here.
+# An inbound connection from outside to a service that should listen on loopback or the VPC
+# (client PLAN section 4.7, "Metadata and Redis probes"): Redis and php-fpm's default port.
+alert tcp $EXTERNAL_NET any -> $HOME_NET 6379 (msg:"EDR inbound connection to Redis (6379) from outside"; flow:to_server; classtype:attempted-recon; priority:2; sid:9000301; rev:1;)
+alert tcp $EXTERNAL_NET any -> $HOME_NET 9000 (msg:"EDR inbound connection to php-fpm (9000) from outside"; flow:to_server; classtype:attempted-recon; priority:2; sid:9000302; rev:1;)

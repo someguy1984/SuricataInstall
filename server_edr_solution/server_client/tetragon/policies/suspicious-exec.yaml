@@ -1,0 +1,31 @@
+# Server variant of the laptop policy (client PLAN section 4.3). Observe-only: programs started
+# from places that only hold a program when someone is trying not to leave one on disk.
+#
+#   /dev/shm/   shared memory, in RAM, world-writable. Nothing on a server runs programs from it.
+#   /tmp/, /var/tmp/   added on a server: build tools run from them on a laptop, a web exploit
+#               stages its tool there. On a server a legitimate exec from here is rare;
+#               deploys that unpack there will show up and can be read against the deploy.
+#
+# A program with no file at all (memfd_create, or a binary deleted while it runs) has no path to
+# match here. The agent treats exec paths that start /memfd: or end " (deleted)" as signals, and
+# Tetragon marks them on the exec event (inode links = 0).
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "suspicious-exec"
+spec:
+  kprobes:
+  - call: "security_bprm_check"
+    syscall: false
+    message: "Program executed from shared memory or a temporary directory"
+    args:
+    - index: 0
+      type: "linux_binprm"
+    selectors:
+    - matchArgs:
+      - index: 0
+        operator: "Prefix"
+        values:
+        - "/dev/shm/"
+        - "/tmp/"
+        - "/var/tmp/"

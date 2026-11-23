@@ -1,0 +1,12 @@
+# Repairs a flushed table, loads the state after boot and writes counters.json.
+[Unit]
+Description=Re-apply the ban state every minute (repairs a flushed table, writes counters)
+
+[Timer]
+OnBootSec=20s
+OnUnitActiveSec=60s
+AccuracySec=1s
+Unit=edr-bans.service
+
+[Install]
+WantedBy=timers.target

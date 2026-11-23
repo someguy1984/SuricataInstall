@@ -1,0 +1,56 @@
+# dnscrypt-proxy configuration for the kit (client PLAN section 4.4), series 2.0.45 (Ubuntu 24.04).
+# Installed as /etc/edr-dns/dnscrypt-proxy.toml; the packaged toml is never edited. Unknown keys are
+# fatal in dnscrypt-proxy, so each series has its own file with only keys that series accepts. The
+# installer runs `dnscrypt-proxy -check -config /etc/edr-dns/dnscrypt-proxy.toml` before any restart.
+#
+# Two operators (Quad9 and Cloudflare), as static stamps that carry the resolver IP and no
+# certificate hashes (they rot when a provider changes CA). With an IP in each stamp the proxy
+# never resolves a name, so no plain DNS is ever needed. There is no [sources] section.
+# DNSSEC is not validated on the box: the two resolvers validate upstream and are trusted to.
+#
+# The socket unit dnscrypt-proxy.socket owns 127.0.2.1:53, so listen_addresses stays empty: the
+# service user cannot bind port 53.
+
+listen_addresses = []
+server_names = ['quad9-doh-1', 'quad9-doh-2', 'cloudflare-doh-1', 'cloudflare-doh-2']
+max_clients = 250
+ipv4_servers = true
+ipv6_servers = false
+dnscrypt_servers = false
+doh_servers = true
+require_dnssec = false
+require_nolog = false
+require_nofilter = false
+force_tcp = false
+timeout = 5000
+keepalive = 30
+log_level = 2
+use_syslog = false
+cert_refresh_delay = 240
+fallback_resolvers = ['9.9.9.9:53']
+ignore_system_dns = true
+netprobe_timeout = 0
+cache = true
+cache_size = 4096
+cache_min_ttl = 2400
+cache_max_ttl = 86400
+cache_neg_min_ttl = 60
+cache_neg_max_ttl = 600
+block_undelegated = true
+# Private zones that only the VPC resolver answers: `install.sh --vpc-dns auto` adds
+#   forwarding_rules = '/etc/edr-dns/forwarding-rules.txt'
+# here (confirm that the key is accepted by `dnscrypt-proxy -check` on this series).
+
+[static]
+
+  [static.'quad9-doh-1']
+  stamp = 'sdns://AgMAAAAAAAAABzkuOS45LjkADWRucy5xdWFkOS5uZXQKL2Rucy1xdWVyeQ'
+
+  [static.'quad9-doh-2']
+  stamp = 'sdns://AgMAAAAAAAAADzE0OS4xMTIuMTEyLjExMgANZG5zLnF1YWQ5Lm5ldAovZG5zLXF1ZXJ5'
+
+  [static.'cloudflare-doh-1']
+  stamp = 'sdns://AgcAAAAAAAAABzEuMS4xLjEAEmNsb3VkZmxhcmUtZG5zLmNvbQovZG5zLXF1ZXJ5'
+
+  [static.'cloudflare-doh-2']
+  stamp = 'sdns://AgcAAAAAAAAABzEuMC4wLjEAEmNsb3VkZmxhcmUtZG5zLmNvbQovZG5zLXF1ZXJ5'

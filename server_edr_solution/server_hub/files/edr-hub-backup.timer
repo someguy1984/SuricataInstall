@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily EDR hub backup at 02:15 UTC
+
+[Timer]
+OnCalendar=*-*-* 02:15:00 UTC
+Persistent=yes
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,351 @@
+#!/usr/bin/env python3
+"""edr-home-net: keep Suricata's HOME_NET equal to this machine's own addresses (client PLAN section 4.1).
+
+A stale HOME_NET silently disables every `-> $HOME_NET` and outbound C2 rule. It runs at each
+Suricata start (ExecStartPre, with --no-reload) and on a 15-minute timer that reloads the rules,
+through the memory guard, only when the value changed.
+
+HOME_NET is the union of
+  - loopback (127.0.0.0/8, ::1/128)
+  - every address of every interface, as an exact /32 or /128 (a droplet has 16 IPv6 addresses
+    in a /64 shared with other customers: never the on-link prefix)
+  - [sites] vpc_cidr, and [sites] extra_addresses (a Reserved IP or public IPv6 that is on no interface)
+  - /etc/suricata/home-net.extra, which this helper writes from those two keys
+[suricata] home_net, when set, replaces the whole value (the VPC range stays [sites] vpc_cidr).
+
+Output   /etc/suricata/edr-home-net.yaml  (HOME_NET only; included by the server's suricata.yaml)
+         /etc/suricata/home-net.extra     (vpc_cidr and extra_addresses, one per line)
+Usage    edr-home-net [--no-reload | --check | --print] [--root DIR] [--dry-run] [--exec-fixtures FILE]
+         --no-reload  write the files, do not touch the running Suricata
+         --check      print the expected value; exit 1 if the file differs; change nothing
+         --print      print the expected value
+Python standard library only, run as: python3 -I edr-home-net
+"""
+
+import configparser
+import fcntl
+import ipaddress
+import json
+import os
+import re
+import stat
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+
+PROG = "edr-home-net"
+VERSION = "0.1.0"
+OUT = "/etc/suricata/edr-home-net.yaml"
+EXTRA = "/etc/suricata/home-net.extra"
+LOCK = "/etc/suricata/.edr-home-net.lock"
+MIN_AVAIL_KB = 700 * 1024
+
+# ---- Small helpers shared (copied, not imported) by the root helpers --------------------------------
+class Env:
+    """Paths under --root, programs run (or faked), the clock. Used by every root helper."""
+
+    def __init__(self, root="", dry=False, fixtures=None, now=None):
+        self.root = root.rstrip("/")
+        self.dry = dry
+        self.fixtures = fixtures
+        self.now = int(now if now is not None else time.time())
+        self.writes = bool(root) or not dry          # a dry run on the real paths writes nothing
+        self.log_lines = []
+
+    def p(self, path):
+        return self.root + path
+
+    def run(self, argv, timeout=20, stdin=None):
+        """(rc, stdout, stderr), or None when the program cannot run (dry run, missing, timeout)."""
+        if self.fixtures is not None:
+            f = self.fixtures.get(" ".join(argv))
+            return (f.get("rc", 0), f.get("out", ""), f.get("err", "")) if isinstance(f, dict) else None
+        if self.dry:
+            return None
+        try:
+            r = subprocess.run(argv, capture_output=True, timeout=timeout, check=False, input=stdin, text=True,
+                               env={"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C", "LC_ALL": "C"})
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        return r.returncode, r.stdout, r.stderr
+
+    def log(self, msg):
+        print("%s: %s" % (PROG, clean(msg, 300)), flush=True)
+
+
+def clean(text, limit=200):
+    """Printable ASCII only: this ends up in files and logs other programs read."""
+    return "".join(c if " " <= c <= "~" else "?" for c in str(text))[:limit]
+
+
+def read_file(path, max_bytes=65536, one_link=True, owners=None):
+    """Read a file another user may control: no symlink, no FIFO, bounded. Returns bytes; raises OSError or ValueError."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise ValueError("not a regular file")
+        if one_link and st.st_nlink != 1:
+            raise ValueError("more than one link")
+        if owners is not None and st.st_uid not in owners:
+            raise ValueError("unexpected owner")
+        if st.st_size > max_bytes:
+            raise ValueError("file too large")
+        out, total = [], 0
+        while True:
+            b = os.read(fd, 1 << 16)
+            if not b:
+                break
+            total += len(b)
+            if total > max_bytes:
+                raise ValueError("file too large")
+            out.append(b)
+        return b"".join(out)
+    finally:
+        os.close(fd)
+
+
+def read_text(env, path, max_bytes=65536, one_link=True, owners=None):
+    try:
+        return read_file(env.p(path), max_bytes, one_link, owners).decode("utf-8", "replace")
+    except (OSError, ValueError):
+        return None
+
+
+def atomic_write(path, text, mode=0o640):
+    """Write to .tmp, fsync, rename."""
+    os.makedirs(os.path.dirname(path), mode=0o755, exist_ok=True)
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC, mode)
+    try:
+        os.write(fd, text.encode("utf-8"))
+        os.fchmod(fd, mode)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.rename(tmp, path)
+
+
+def load_json(env, path, max_bytes=1 << 20, owners=None):
+    t = read_text(env, path, max_bytes, True, owners)
+    if t is None:
+        return None
+    try:
+        return json.loads(t)
+    except (ValueError, RecursionError):
+        return None
+
+
+def pause_until(env):
+    """The end of a valid pause (epoch s), or 0. An expired or odd file is ignored."""
+    doc = load_json(env, "/etc/edr-agent/pause.json", 4096)
+    u = doc.get("until") if isinstance(doc, dict) else None
+    return u if isinstance(u, int) and not isinstance(u, bool) and u > env.now else 0
+
+
+def read_conf(env, files_dir=""):
+    """local.conf over defaults.conf. Returns a ConfigParser; trouble means the defaults."""
+    cp = configparser.ConfigParser(interpolation=None, strict=False)
+    here = os.path.dirname(os.path.realpath(__file__))
+    for c in ([os.path.join(files_dir, "defaults.conf")] if files_dir else []) + [
+            os.path.join(here, "defaults.conf"), os.path.join(here, "files", "defaults.conf"),
+            os.path.join(here, "..", "files", "defaults.conf")]:
+        try:
+            with open(c, encoding="utf-8") as fh:
+                cp.read_string(fh.read(262144))
+            break
+        except (OSError, configparser.Error):
+            continue
+    t = read_text(env, "/etc/edr-agent/local.conf", 262144)
+    if t is not None:
+        try:
+            cp.read_string(t)
+        except configparser.Error:
+            pass
+    return cp
+
+
+def parse_common(argv, extra=None):
+    """Parse --root, --dry-run, --now, --exec-fixtures, --files-dir. Returns (Env, files_dir, rest, options)."""
+    root = os.environ.get("EDR_AGENT_ROOT", "")
+    dry, fixtures, now, files_dir, rest = False, None, None, "", []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        nxt = argv[i + 1] if i + 1 < len(argv) else None
+        if a == "--root" and nxt is not None:
+            root = nxt; i += 1
+        elif a == "--dry-run":
+            dry = True
+        elif a == "--now" and nxt is not None:
+            now = int(nxt); i += 1
+        elif a == "--exec-fixtures" and nxt is not None:
+            with open(nxt, encoding="utf-8") as fh:
+                fixtures = json.load(fh)
+            i += 1
+        elif a == "--files-dir" and nxt is not None:
+            files_dir = nxt; i += 1
+        elif a in ("-h", "--help"):
+            print(__doc__)
+            sys.exit(0)
+        else:
+            rest.append(a)
+        i += 1
+    return Env(root, dry, fixtures, now), files_dir, rest
+
+
+
+def parse_nets(items, strict_host=False):
+    """Valid networks from text items; the rest is reported and skipped."""
+    nets, bad = set(), []
+    for it in items:
+        it = it.strip()
+        if not it:
+            continue
+        try:
+            nets.add(ipaddress.ip_network(it, strict=False))
+        except ValueError:
+            bad.append(it[:64])
+    return nets, bad
+
+
+def interface_nets(env):
+    """Each interface address as /32 or /128, from `ip -o addr show`. None when ip cannot run."""
+    r = env.run(["ip", "-o", "addr", "show"])
+    if r is None or r[0] != 0:
+        return None
+    out = set()
+    for line in r[1].splitlines():
+        f = line.split()
+        if len(f) < 4 or f[2] not in ("inet", "inet6"):
+            continue
+        try:
+            a = ipaddress.ip_interface(f[3].split("%")[0]).ip
+        except ValueError:
+            continue
+        if a.is_loopback:
+            continue
+        out.add(ipaddress.ip_network("%s/%d" % (a, 32 if a.version == 4 else 128)))
+    return out
+
+
+def conf_list(cp, section, key):
+    return [x for x in re.split(r"[,\s]+", cp.get(section, key, fallback="")) if x]
+
+
+def expected(env, cp):
+    """(value string, problems). The value is a sorted, comma separated list."""
+    problems = []
+    override = conf_list(cp, "suricata", "home_net")
+    if override and override != ["auto"]:
+        nets, bad = parse_nets(override)
+        if bad:
+            problems.append("[suricata] home_net has invalid entries: %s" % ", ".join(bad))
+        if nets:
+            return fmt(nets), problems
+    nets = {ipaddress.ip_network("127.0.0.0/8"), ipaddress.ip_network("::1/128")}
+    own = interface_nets(env)
+    if own is None:
+        problems.append("`ip -o addr` did not run")
+    else:
+        nets |= own
+    extra = conf_list(cp, "sites", "vpc_cidr") + conf_list(cp, "sites", "extra_addresses")
+    en, bad = parse_nets(extra)
+    if bad:
+        problems.append("[sites] has invalid entries: %s" % ", ".join(bad))
+    nets |= en
+    return fmt(nets), problems, sorted(str(n) for n in en)
+
+
+def fmt(nets):
+    nets = list(nets)
+    return ",".join(str(n) for n in sorted(nets, key=lambda n: (n.version, n.network_address, n.prefixlen)))
+
+
+def render(value):
+    return ("%%YAML 1.1\n---\n# Generated by edr-home-net. Do not edit: the value comes from the interface addresses,\n"
+            "# [sites] vpc_cidr and extra_addresses, and [suricata] home_net in /etc/edr-agent/local.conf.\n"
+            "vars:\n  address-groups:\n    HOME_NET: \"[%s]\"\n" % value)
+
+
+def mem_guard(env):
+    """True when a live rule reload (which builds a second engine) fits in memory."""
+    mi = read_text(env, "/proc/meminfo", 8192, one_link=False) or ""
+    m = re.search(r"^MemAvailable:\s+(\d+) kB", mi, re.M)
+    if not m:
+        return False
+    avail = int(m.group(1))
+    rss = 0
+    try:
+        pid = int((read_text(env, "/run/suricata.pid", 32, one_link=False) or "").strip())
+        st = read_text(env, "/proc/%d/status" % pid, 8192, one_link=False) or ""
+        r = re.search(r"^VmRSS:\s+(\d+) kB", st, re.M)
+        rss = int(r.group(1)) if r else 0
+    except ValueError:
+        pass
+    return avail >= max(MIN_AVAIL_KB, int(1.5 * rss))
+
+
+def main(argv):
+    env, files_dir, rest = parse_common(argv)
+    mode = "update"
+    for a in rest:
+        if a in ("--no-reload", "--check", "--print"):
+            mode = a[2:]
+        else:
+            print("usage: edr-home-net [--no-reload | --check | --print] [--root DIR] [--dry-run]", file=sys.stderr)
+            return 2
+    if not env.root and os.geteuid() != 0 and not env.dry:
+        print("edr-home-net: must run as root", file=sys.stderr)
+        return 2
+    cp = read_conf(env, files_dir)
+    res = expected(env, cp)
+    value, problems = res[0], res[1]
+    for p in problems:
+        env.log(p)
+    if mode == "print":
+        print(value)
+        return 0
+    text = render(value)
+    cur = read_text(env, OUT, 1 << 20, one_link=False)
+    if mode == "check":
+        print(value)
+        return 0 if cur == text else 1
+    if cur == text:
+        return 0
+    if not env.writes:
+        sys.stdout.write(text)
+        return 0
+    lock = None
+    try:
+        os.makedirs(os.path.dirname(env.p(OUT)), exist_ok=True)
+        lock = os.open(env.p(LOCK), os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        cur = read_text(env, OUT, 1 << 20, one_link=False)          # read again once we hold the lock
+        if cur == text:
+            return 0
+        extra = res[2] if len(res) > 2 else []
+        atomic_write(env.p(EXTRA), "# Generated by edr-home-net from [sites] vpc_cidr and extra_addresses.\n" + "".join(e + "\n" for e in extra), 0o644)
+        atomic_write(env.p(OUT), text, 0o644)
+    except OSError as e:
+        env.log("cannot write: %s" % clean(e, 100))
+        return 1
+    finally:
+        if lock is not None:
+            os.close(lock)
+    env.log("HOME_NET is now [%s]" % value)
+    if mode == "update":
+        active = env.run(["systemctl", "is-active", "--quiet", "suricata.service"])
+        if active is not None and active[0] == 0:
+            if mem_guard(env):
+                r = env.run(["systemctl", "reload", "suricata.service"], timeout=30)
+                env.log("reloaded Suricata's rules" if r is not None and r[0] == 0 else "the rule reload failed")
+            else:
+                env.log("not reloading: too little memory for a second engine; the next start picks the value up")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,702 @@
+#!/usr/bin/env python3
+"""edr-dns-watch: the DNS lock's watchdog and loader (client PLAN section 4.4).
+
+The lock is the nftables table `inet edr_dns` (output hook, priority -150). It refuses plain DNS
+(53, 853) from the box, except from the dnscrypt-proxy service user to the DoH resolver addresses.
+A lock that outlives its proxy would take this machine's DNS away, so this root oneshot (timer:
+every 15 s) probes the proxy and opens the lock when DoH fails, and closes it when it is healthy.
+
+  probe (default)  one UDP query for a random label under example.com to the proxy
+                   NOERROR or NXDOMAIN is healthy; a timeout, SERVFAIL or REFUSED is a failure
+        2 failures in a row   restart dnscrypt-proxy
+        4 failures            delete the table, write /run/systemd/resolved.conf.d/zzz-edr-failopen.conf,
+                              restart systemd-resolved, log FAILOPEN at crit
+        6 good probes and open for at least 5 minutes
+                              reload the lock file; only if it loads: remove the drop-in, restart resolved, log RELOCK
+        3 re-locks in an hour stay open, log FLAPPING; fix the cause, then `edr-dns-watch relock`
+  boot             edr-dnslock.service: load the lock file after nft -c (not while a pause is valid)
+  relock           load the lock file now, after a good probe; clears the flap guard
+  render           write /etc/edr-dns/edr-dns.nft and doh-resolvers.filtered.conf from doh-self.conf,
+                   doh-resolvers.conf and local.conf; the kit's own resolvers can never be blocked
+  decode-stamps F  print the IPs and host names inside the `sdns://` stamps of a dnscrypt-proxy toml file
+
+While /etc/edr-agent/pause.json is valid the table is deleted, never re-locked, never FLAPPING; the
+probe still runs and the state is `paused`. Status: /run/edr-dns-watch/status.json (root:edr-agent 0640)
+{"written_at", "state": "locked|open|paused|flapping", "since", "relocks"}.
+
+Usage    edr-dns-watch [probe|boot|relock|render|decode-stamps FILE] [--root DIR] [--dry-run] [--now EPOCH]
+                       [--exec-fixtures FILE] [--resolver ADDR:PORT] [--proxy-user NAME] [--out-dir DIR]
+         --dry-run  runs no nft, systemctl or resolved command; with --root files are still written
+Python standard library only, run as: python3 -I edr-dns-watch
+"""
+
+import base64
+import configparser
+import ipaddress
+import json
+import os
+import random
+import re
+import socket
+import stat
+import string
+import struct
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+
+PROG = "edr-dns-watch"
+VERSION = "0.1.0"
+DNS_DIR = "/etc/edr-dns"
+LOCK_FILE = DNS_DIR + "/edr-dns.nft"
+STATUS = "/run/edr-dns-watch/status.json"
+STATE = "/var/lib/edr-dns-watch/state.json"
+FAILOPEN_DROPIN = "/run/systemd/resolved.conf.d/zzz-edr-failopen.conf"
+PROXY_UNIT = "dnscrypt-proxy.service"
+DEFAULT_PROXY_USER = "_dnscrypt-proxy"
+PROBE_TIMEOUT = 2.0
+FAILS_RESTART, FAILS_OPEN = 2, 4
+GOOD_RELOCK, OPEN_MIN_S = 6, 300
+FLAP_MAX, FLAP_WINDOW = 3, 3600
+
+# ---- Small helpers shared (copied, not imported) by the root helpers --------------------------------
+class Env:
+    """Paths under --root, programs run (or faked), the clock. Used by every root helper."""
+
+    def __init__(self, root="", dry=False, fixtures=None, now=None):
+        self.root = root.rstrip("/")
+        self.dry = dry
+        self.fixtures = fixtures
+        self.now = int(now if now is not None else time.time())
+        self.writes = bool(root) or not dry          # a dry run on the real paths writes nothing
+        self.log_lines = []
+
+    def p(self, path):
+        return self.root + path
+
+    def run(self, argv, timeout=20, stdin=None):
+        """(rc, stdout, stderr), or None when the program cannot run (dry run, missing, timeout)."""
+        if self.fixtures is not None:
+            f = self.fixtures.get(" ".join(argv))
+            return (f.get("rc", 0), f.get("out", ""), f.get("err", "")) if isinstance(f, dict) else None
+        if self.dry:
+            return None
+        try:
+            r = subprocess.run(argv, capture_output=True, timeout=timeout, check=False, input=stdin, text=True,
+                               env={"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C", "LC_ALL": "C"})
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        return r.returncode, r.stdout, r.stderr
+
+    def log(self, msg):
+        print("%s: %s" % (PROG, clean(msg, 300)), flush=True)
+
+
+def clean(text, limit=200):
+    """Printable ASCII only: this ends up in files and logs other programs read."""
+    return "".join(c if " " <= c <= "~" else "?" for c in str(text))[:limit]
+
+
+def read_file(path, max_bytes=65536, one_link=True, owners=None):
+    """Read a file another user may control: no symlink, no FIFO, bounded. Returns bytes; raises OSError or ValueError."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise ValueError("not a regular file")
+        if one_link and st.st_nlink != 1:
+            raise ValueError("more than one link")
+        if owners is not None and st.st_uid not in owners:
+            raise ValueError("unexpected owner")
+        if st.st_size > max_bytes:
+            raise ValueError("file too large")
+        out, total = [], 0
+        while True:
+            b = os.read(fd, 1 << 16)
+            if not b:
+                break
+            total += len(b)
+            if total > max_bytes:
+                raise ValueError("file too large")
+            out.append(b)
+        return b"".join(out)
+    finally:
+        os.close(fd)
+
+
+def read_text(env, path, max_bytes=65536, one_link=True, owners=None):
+    try:
+        return read_file(env.p(path), max_bytes, one_link, owners).decode("utf-8", "replace")
+    except (OSError, ValueError):
+        return None
+
+
+def atomic_write(path, text, mode=0o640):
+    """Write to .tmp, fsync, rename."""
+    os.makedirs(os.path.dirname(path), mode=0o755, exist_ok=True)
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC, mode)
+    try:
+        os.write(fd, text.encode("utf-8"))
+        os.fchmod(fd, mode)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.rename(tmp, path)
+
+
+def load_json(env, path, max_bytes=1 << 20, owners=None):
+    t = read_text(env, path, max_bytes, True, owners)
+    if t is None:
+        return None
+    try:
+        return json.loads(t)
+    except (ValueError, RecursionError):
+        return None
+
+
+def pause_until(env):
+    """The end of a valid pause (epoch s), or 0. An expired or odd file is ignored."""
+    doc = load_json(env, "/etc/edr-agent/pause.json", 4096)
+    u = doc.get("until") if isinstance(doc, dict) else None
+    return u if isinstance(u, int) and not isinstance(u, bool) and u > env.now else 0
+
+
+def read_conf(env, files_dir=""):
+    """local.conf over defaults.conf. Returns a ConfigParser; trouble means the defaults."""
+    cp = configparser.ConfigParser(interpolation=None, strict=False)
+    here = os.path.dirname(os.path.realpath(__file__))
+    for c in ([os.path.join(files_dir, "defaults.conf")] if files_dir else []) + [
+            os.path.join(here, "defaults.conf"), os.path.join(here, "files", "defaults.conf"),
+            os.path.join(here, "..", "files", "defaults.conf")]:
+        try:
+            with open(c, encoding="utf-8") as fh:
+                cp.read_string(fh.read(262144))
+            break
+        except (OSError, configparser.Error):
+            continue
+    t = read_text(env, "/etc/edr-agent/local.conf", 262144)
+    if t is not None:
+        try:
+            cp.read_string(t)
+        except configparser.Error:
+            pass
+    return cp
+
+
+def parse_common(argv, extra=None):
+    """Parse --root, --dry-run, --now, --exec-fixtures, --files-dir. Returns (Env, files_dir, rest, options)."""
+    root = os.environ.get("EDR_AGENT_ROOT", "")
+    dry, fixtures, now, files_dir, rest = False, None, None, "", []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        nxt = argv[i + 1] if i + 1 < len(argv) else None
+        if a == "--root" and nxt is not None:
+            root = nxt; i += 1
+        elif a == "--dry-run":
+            dry = True
+        elif a == "--now" and nxt is not None:
+            now = int(nxt); i += 1
+        elif a == "--exec-fixtures" and nxt is not None:
+            with open(nxt, encoding="utf-8") as fh:
+                fixtures = json.load(fh)
+            i += 1
+        elif a == "--files-dir" and nxt is not None:
+            files_dir = nxt; i += 1
+        elif a in ("-h", "--help"):
+            print(__doc__)
+            sys.exit(0)
+        else:
+            rest.append(a)
+        i += 1
+    return Env(root, dry, fixtures, now), files_dir, rest
+
+
+
+# ---- DNS probe -----------------------------------------------------------------------------------------
+def build_query(name):
+    qid = random.randrange(1, 65535)
+    labels = name.rstrip(".").split(".")
+    q = b"".join(bytes([len(l)]) + l.encode("ascii") for l in labels) + b"\x00"
+    return qid, struct.pack("!HHHHHH", qid, 0x0100, 1, 0, 0, 0) + q + struct.pack("!HH", 1, 1)
+
+
+def probe(addr, port, name, timeout=PROBE_TIMEOUT, strict=False):
+    """True when the resolver answered NOERROR or NXDOMAIN for `name` (a fresh name defeats the cache).
+    strict: only NOERROR counts, for names the site needs."""
+    try:
+        qid, pkt = build_query(name)
+    except (UnicodeError, ValueError):
+        return False
+    fam = socket.AF_INET6 if ":" in addr else socket.AF_INET
+    s = socket.socket(fam, socket.SOCK_DGRAM)
+    try:
+        s.settimeout(timeout)
+        s.sendto(pkt, (addr, port))
+        data, _ = s.recvfrom(4096)
+    except (OSError, socket.timeout):
+        return False
+    finally:
+        s.close()
+    if len(data) < 12:
+        return False
+    rid, flags = struct.unpack("!HH", data[:4])
+    return rid == qid and bool(flags & 0x8000) and (flags & 0x000F) in ((0,) if strict else (0, 3))
+
+
+def fresh_name():
+    return "edr-" + "".join(random.choice(string.ascii_lowercase + string.digits) for _ in range(12)) + ".example.com"
+
+
+# ---- Stamps, the lock file ----------------------------------------------------------------------------
+def decode_stamp(stamp):
+    """(ip or "", hostname) of a DoH stamp (sdns://, protocol 0x02), or None."""
+    if not stamp.startswith("sdns://"):
+        return None
+    b = stamp[7:]
+    try:
+        raw = base64.urlsafe_b64decode(b + "=" * (-len(b) % 4))
+    except (ValueError, TypeError):
+        return None
+    if not raw or raw[0] != 0x02 or len(raw) < 10:
+        return None
+    i = 9
+
+    def lp():
+        nonlocal i
+        n = raw[i]
+        v = raw[i + 1:i + 1 + n]
+        i += 1 + n
+        return v
+
+    try:
+        addr = lp().decode("ascii")
+        while True:                                   # hashes: variable-length list
+            n = raw[i]
+            i += 1 + (n & 0x7F)
+            if not n & 0x80:
+                break
+        host = lp().decode("ascii")
+    except (IndexError, UnicodeDecodeError):
+        return None
+    if addr.startswith("["):
+        ip = addr[1:addr.find("]")] if "]" in addr else ""
+    elif addr.count(":") == 1:
+        ip = addr.split(":")[0]
+    else:
+        ip = addr
+    try:
+        ipaddress.ip_address(ip)
+    except ValueError:
+        ip = ""
+    return ip, host.split(":")[0]
+
+
+def stamps_in(text):
+    return re.findall(r"sdns://[A-Za-z0-9_-]+", text)
+
+
+def read_list(env, path):
+    """Lines of a list file with comments and spaces removed."""
+    t = read_text(env, path, 262144, one_link=False)
+    if t is None:
+        return []
+    out = []
+    for line in t.splitlines():
+        s = re.sub(r"\s+", "", line.split("#", 1)[0])
+        if s:
+            out.append(s)
+    return out
+
+
+def split_list(items):
+    ips4, ips6, hosts = [], [], []
+    for it in items:
+        try:
+            a = ipaddress.ip_address(it)
+        except ValueError:
+            if re.fullmatch(r"[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?", it):
+                hosts.append(it.lower())
+            continue
+        (ips4 if a.version == 4 else ips6).append(str(a))
+    return sorted(set(ips4), key=lambda x: ipaddress.ip_address(x)), sorted(set(ips6), key=lambda x: ipaddress.ip_address(x)), sorted(set(hosts))
+
+
+def filter_list(resolvers, selfitems):
+    """The resolver list minus the kit's own: every IP in the stamps and every name that is a suffix of a stamp host name."""
+    s4, s6, sh = split_list(selfitems)
+    r4, r6, rh = split_list(resolvers)
+    own = set(s4) | set(s6)
+    keep4 = [a for a in r4 if a not in own]
+    keep6 = [a for a in r6 if a not in own]
+    keeph = [h for h in rh if not any(x == h or x.endswith("." + h) for x in sh)]
+    return keep4, keep6, keeph
+
+
+def elements(addrs):
+    return " elements = { %s }" % ", ".join(addrs) if addrs else ""
+
+
+def render_lock(stamp_ip4, stamp_ip6, doh4, doh6, proxy_user, vpc_resolver="", block_doh=False, lock_forwarded=False):
+    u = proxy_user
+    lines = [
+        "# Generated by edr-dns-watch render. Do not edit: change the inputs in /etc/edr-dns and run it again.",
+        "# Table inet edr_dns: the lock on plain DNS (client PLAN section 4.4). Removal: nft delete table inet edr_dns",
+        "table inet edr_dns",
+        "delete table inet edr_dns",
+        "",
+        "table inet edr_dns {",
+        "  set stamp4 { type ipv4_addr; flags interval;%s }" % elements(stamp_ip4),
+        "  set stamp6 { type ipv6_addr; flags interval;%s }" % elements(stamp_ip6),
+        "  set doh4 { type ipv4_addr; flags interval;%s }" % elements(doh4),
+        "  set doh6 { type ipv6_addr; flags interval;%s }" % elements(doh6),
+        "  set noisy { typeof meta skuid; flags dynamic,timeout; timeout 10m; size 256; }",
+        "  set noisy_doh { typeof meta skuid; flags dynamic,timeout; timeout 10m; size 256; }",
+        "  chain out {",
+        "    type filter hook output priority -150; policy accept;",
+        '    oifname "lo" return',
+        '    meta skuid "%s" tcp dport 443 ip daddr @stamp4 accept' % u,
+        '    meta skuid "%s" tcp dport 443 ip6 daddr @stamp6 accept' % u,
+    ]
+    if vpc_resolver:
+        a = ipaddress.ip_address(vpc_resolver)
+        lines.append('    meta skuid "%s" %s daddr %s th dport 53 accept' % (u, "ip" if a.version == 4 else "ip6", a))
+    lines += [
+        '    meta skuid "%s" counter log prefix "edr-dnslock: self " flags skuid reject' % u,
+        "    meta l4proto { tcp, udp } th dport { 53, 853, 5353, 5355 } update @noisy { meta skuid limit rate 3/minute burst 2 packets } log prefix \"edr-dnslock: plain \" flags skuid",
+        "    meta l4proto tcp th dport { 53, 853 } reject with tcp reset",
+        "    meta l4proto udp th dport { 53, 853 } reject",
+        "    tcp dport 443 ip daddr @doh4 update @noisy_doh { meta skuid limit rate 3/minute burst 2 packets } log prefix \"edr-dnslock: doh \" flags skuid",
+        "    tcp dport 443 ip6 daddr @doh6 update @noisy_doh { meta skuid limit rate 3/minute burst 2 packets } log prefix \"edr-dnslock: doh \" flags skuid",
+    ]
+    if block_doh:
+        lines += ["    tcp dport 443 ip daddr @doh4 reject with tcp reset", "    tcp dport 443 ip6 daddr @doh6 reject with tcp reset"]
+    lines.append("  }")
+    if lock_forwarded:
+        lines += [
+            "  chain fwd_dns {",
+            "    type filter hook forward priority -150; policy accept;",
+            "    meta l4proto tcp th dport { 53, 853 } reject with tcp reset",
+            "    meta l4proto udp th dport { 53, 853 } reject",
+            "  }",
+        ]
+    lines.append("}")
+    return "\n".join(lines) + "\n"
+
+
+def render_dropin(files_dir, addrs):
+    """The sandbox drop-in of dnscrypt-proxy with an IPAddressAllow= line for each resolver address."""
+    here = os.path.dirname(os.path.realpath(__file__))
+    for c in ([os.path.join(files_dir, "dnscrypt-proxy-50-edr.conf")] if files_dir else []) + [
+            os.path.join(here, "files", "dnscrypt-proxy-50-edr.conf"), os.path.join(here, "..", "files", "dnscrypt-proxy-50-edr.conf")]:
+        try:
+            with open(c, encoding="utf-8") as fh:
+                t = fh.read(65536)
+        except OSError:
+            continue
+        marker = "# @IPADDRESSALLOW@"
+        if marker not in t:
+            return None
+        return t.replace(marker, "\n".join("IPAddressAllow=%s" % a for a in addrs))
+    return None
+
+
+def cmd_render(env, cp, opts, files_dir=""):
+    selfitems = read_list(env, DNS_DIR + "/doh-self.conf")
+    resolvers = read_list(env, DNS_DIR + "/doh-resolvers.conf")
+    if not selfitems:
+        env.log("render: %s/doh-self.conf is empty or missing: refusing to build a lock with no resolver" % DNS_DIR)
+        return 3
+    s4, s6, _ = split_list(selfitems)
+    if not s4 and not s6:
+        env.log("render: no resolver address in doh-self.conf")
+        return 3
+    k4, k6, kh = filter_list(resolvers, selfitems)
+    vpc = ""
+    if cp.get("dns", "vpc_dns", fallback="off").strip().lower() in ("auto", "on"):
+        t = (read_list(env, DNS_DIR + "/vpc-resolver") or [""])[0]
+        try:
+            vpc = str(ipaddress.ip_address(t)) if t else ""
+        except ValueError:
+            vpc = ""
+    flag = lambda k: cp.get("dns", k, fallback="off").strip().lower() == "on"
+    text = render_lock(s4, s6, k4, k6, opts.get("proxy_user", DEFAULT_PROXY_USER), vpc, flag("block_doh_ips"), flag("lock_forwarded"))
+    # the self test of PLAN 4.4: the sets must not intersect
+    assert not (set(s4) & set(k4)) and not (set(s6) & set(k6))
+    filtered = ["# Generated by edr-dns-watch render: the resolver list minus the kit's own resolvers."] + k4 + k6 + kh
+    outdir = opts.get("out_dir")
+    if outdir:
+        os.makedirs(outdir, exist_ok=True)
+        targets = (os.path.join(outdir, "edr-dns.nft"), os.path.join(outdir, "doh-resolvers.filtered.conf"),
+                   os.path.join(outdir, "50-edr.conf"))
+    else:
+        targets = (env.p(LOCK_FILE), env.p(DNS_DIR + "/doh-resolvers.filtered.conf"),
+                   env.p("/etc/systemd/system/dnscrypt-proxy.service.d/50-edr.conf"))
+    dropin = render_dropin(files_dir, s4 + s6 + ([vpc] if vpc else []))
+    if env.writes or outdir:
+        atomic_write(targets[0], text, 0o644)
+        atomic_write(targets[1], "\n".join(filtered) + "\n", 0o644)
+        if dropin:
+            atomic_write(targets[2], dropin, 0o644)
+        else:
+            env.log("render: the dnscrypt-proxy drop-in template was not found; its IPAddressAllow= lines are not written")
+    if env.dry and not outdir:
+        sys.stdout.write(text)
+    return 0
+
+
+def cmd_decode(env, path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read(1 << 20)
+    except OSError as e:
+        env.log("cannot read %s" % clean(e, 80))
+        return 2
+    n = 0
+    for st in stamps_in(text):
+        d = decode_stamp(st)
+        if d:
+            n += 1
+            if d[0]:
+                print(d[0])
+            if d[1]:
+                print(d[1])
+    return 0 if n else 1
+
+
+# ---- State machine ----------------------------------------------------------------------------------------
+def table_present(env):
+    r = env.run(["nft", "-t", "list", "table", "inet", "edr_dns"])
+    return None if r is None else r[0] == 0
+
+
+def load_lock(env):
+    """nft -c then nft -f on the lock file. True only when it loaded."""
+    path = env.p(LOCK_FILE)
+    if not os.path.isfile(path):
+        env.log("the lock file %s is missing" % LOCK_FILE)
+        return False
+    r = env.run(["nft", "-c", "-f", path], timeout=20)
+    if r is None or r[0] != 0:
+        env.log("the lock file does not check: %s" % clean((r[2] if r else "nft did not run"), 120))
+        return False
+    r = env.run(["nft", "-f", path], timeout=20)
+    return r is not None and r[0] == 0
+
+
+def delete_lock(env):
+    r = env.run(["nft", "delete", "table", "inet", "edr_dns"])
+    return r is not None and r[0] == 0
+
+
+def write_failopen(env):
+    if env.dry:
+        return
+    path = env.p(FAILOPEN_DROPIN)
+    try:
+        os.makedirs(os.path.dirname(path), mode=0o755, exist_ok=True)
+        atomic_write(path, "[Resolve]\nDNS=\nDomains=\n", 0o644)
+    except OSError as e:
+        env.log("cannot write the fail-open drop-in: %s" % clean(e, 80))
+
+
+def remove_failopen(env):
+    try:
+        os.unlink(env.p(FAILOPEN_DROPIN))
+    except OSError:
+        pass
+
+
+def restart(env, unit):
+    r = env.run(["systemctl", "restart", unit], timeout=30)
+    return r is not None and r[0] == 0
+
+
+def save(env, state, doc):
+    if not env.writes:
+        return
+    try:
+        atomic_write(env.p(STATUS), json.dumps(doc, sort_keys=True), 0o640)
+        atomic_write(env.p(STATE), json.dumps(state, sort_keys=True), 0o600)
+    except OSError as e:
+        env.log("cannot write state: %s" % clean(e, 80))
+
+
+def load_state(env):
+    st = load_json(env, STATE, 65536, owners={0, os.geteuid()})
+    return st if isinstance(st, dict) else {}
+
+
+def status_doc(env, state):
+    recent = [t for t in state.get("relocks", []) if env.now - t < FLAP_WINDOW]
+    return {"written_at": env.now, "state": state.get("mode", "open"), "since": int(state.get("since", env.now)), "relocks": len(recent)}
+
+
+def set_mode(env, state, mode):
+    if state.get("mode") != mode:
+        state["mode"] = mode
+        state["since"] = env.now
+
+
+def cmd_boot(env, cp):
+    state = load_state(env)
+    paused = pause_until(env)
+    if cp.get("dns", "lockdown", fallback="on").strip().lower() == "off":
+        set_mode(env, state, "open")
+        save(env, state, status_doc(env, state))
+        return 0
+    if paused:
+        set_mode(env, state, "paused")
+    elif load_lock(env):
+        set_mode(env, state, "locked")
+        state["fails"] = state["goods"] = 0
+    else:
+        set_mode(env, state, "open")             # a failed or timed-out load leaves the box unlocked
+        state["open_since"] = env.now
+    save(env, state, status_doc(env, state))
+    return 0
+
+
+def cmd_relock(env, cp, opts):
+    state = load_state(env)
+    host, _, port = opts.get("resolver", "127.0.2.1:53").rpartition(":")
+    if not env.dry and not probe(host, int(port), fresh_name()):
+        env.log("relock: the proxy does not answer; not locking")
+        return 2
+    state["relocks"] = []
+    if load_lock(env):
+        remove_failopen(env)
+        restart(env, "systemd-resolved.service")
+        set_mode(env, state, "locked")
+        state["fails"] = state["goods"] = 0
+        env.log("RELOCK (by hand)")
+        save(env, state, status_doc(env, state))
+        return 0
+    env.log("relock: the lock file did not load")
+    return 1
+
+
+def cmd_probe(env, cp, opts):
+    state = load_state(env)
+    state.setdefault("mode", "locked")
+    state.setdefault("since", env.now)
+    for k in ("fails", "goods"):
+        state[k] = int(state.get(k, 0) or 0)
+    state.setdefault("relocks", [])
+    state["relocks"] = [t for t in state["relocks"] if isinstance(t, int) and env.now - t < FLAP_WINDOW][-10:]
+    paused = pause_until(env)
+    host, _, port = opts.get("resolver", "127.0.2.1:53").rpartition(":")
+    ok = probe(host, int(port), fresh_name()) if not env.dry or env.fixtures is not None else True
+    if ok:
+        for name in [x.strip() for x in cp.get("dns", "resolve_check", fallback="").split(",") if x.strip()][:8]:
+            if re.fullmatch(r"[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?", name):
+                # a site name must resolve: NXDOMAIN counts as a failure for these
+                if not probe(host, int(port), name, strict=True):
+                    ok = False
+                    break
+    mode = state["mode"]
+    present = table_present(env)
+
+    if paused:
+        if present:
+            delete_lock(env)
+        set_mode(env, state, "paused")
+        state["fails"] = state["goods"] = 0
+        save(env, state, status_doc(env, state))
+        return 0
+    if mode == "paused":                           # the pause is over: lock again, after the same health check
+        if ok and load_lock(env):
+            remove_failopen(env)
+            set_mode(env, state, "locked")
+            env.log("RELOCK (pause ended)")
+        else:
+            set_mode(env, state, "open")
+            state["open_since"] = env.now
+        save(env, state, status_doc(env, state))
+        return 0
+    if mode == "locked" and present is False:       # someone removed the table: it is open, not locked
+        set_mode(env, state, "open")
+        state["open_since"] = env.now
+        mode = "open"
+        env.log("the table inet edr_dns is gone: state open")
+
+    if mode == "locked":
+        if ok:
+            state["fails"] = 0
+        else:
+            state["fails"] += 1
+            state["goods"] = 0
+            if state["fails"] == FAILS_RESTART:
+                env.log("%d failures in a row: restarting %s" % (state["fails"], PROXY_UNIT))
+                restart(env, PROXY_UNIT)
+            if state["fails"] >= FAILS_OPEN:
+                delete_lock(env)
+                write_failopen(env)
+                restart(env, "systemd-resolved.service")
+                set_mode(env, state, "open")
+                state["open_since"] = env.now
+                state["goods"] = 0
+                print("<2>%s: FAILOPEN: DoH has failed %d times; plain DNS is allowed again until it recovers" % (PROG, state["fails"]), flush=True)
+    else:                                           # open or flapping
+        if ok:
+            state["goods"] += 1
+        else:
+            state["goods"] = 0
+        if mode == "open" and state["goods"] >= GOOD_RELOCK and env.now - int(state.get("open_since", env.now)) >= OPEN_MIN_S:
+            if len(state["relocks"]) >= FLAP_MAX:
+                set_mode(env, state, "flapping")
+                print("<3>%s: FLAPPING: %d re-locks in an hour; staying open. Fix the cause, then run: edr-dns-watch relock" % (PROG, len(state["relocks"])), flush=True)
+            elif load_lock(env):
+                remove_failopen(env)
+                restart(env, "systemd-resolved.service")
+                set_mode(env, state, "locked")
+                state["fails"] = state["goods"] = 0
+                state["relocks"].append(env.now)
+                env.log("RELOCK")
+    save(env, state, status_doc(env, state))
+    return 0
+
+
+def main(argv):
+    env, files_dir, rest = parse_common(argv)
+    opts, cmd, i, args = {}, "probe", 0, []
+    while i < len(rest):
+        a = rest[i]
+        nxt = rest[i + 1] if i + 1 < len(rest) else None
+        if a == "--resolver" and nxt:
+            opts["resolver"] = nxt; i += 1
+        elif a == "--proxy-user" and nxt:
+            opts["proxy_user"] = nxt; i += 1
+        elif a == "--out-dir" and nxt:
+            opts["out_dir"] = nxt; i += 1
+        elif a in ("probe", "boot", "relock", "render", "decode-stamps"):
+            cmd = a
+        elif not a.startswith("-"):
+            args.append(a)
+        else:
+            print("usage: edr-dns-watch [probe|boot|relock|render|decode-stamps FILE] [--root DIR] [--dry-run]", file=sys.stderr)
+            return 2
+        i += 1
+    if cmd == "decode-stamps":
+        return cmd_decode(env, args[0]) if args else 2
+    if not env.root and os.geteuid() != 0 and not env.dry:
+        print("edr-dns-watch: must run as root", file=sys.stderr)
+        return 2
+    cp = read_conf(env, files_dir)
+    if "proxy_user" not in opts:
+        t = (read_list(env, DNS_DIR + "/proxy-user") or [DEFAULT_PROXY_USER])[0]
+        opts["proxy_user"] = t if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]{0,31}", t) else DEFAULT_PROXY_USER
+    if cmd == "render":
+        return cmd_render(env, cp, opts, files_dir)
+    if cmd == "boot":
+        return cmd_boot(env, cp)
+    if cmd == "relock":
+        return cmd_relock(env, cp, opts)
+    return cmd_probe(env, cp, opts)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

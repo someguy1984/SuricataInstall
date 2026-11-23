@@ -1,0 +1,47 @@
+# Reads the DigitalOcean droplet id and writes /run/edr-droplet-id for the agent (client PLAN
+# section 4.6). It may reach the metadata address and nothing else, so the sandboxed agent never
+# gets metadata access. Started before edr-agent.service at every boot and every start of the agent
+# (no RemainAfterExit). A write to /run is needed for the one file; the unit has no capability.
+[Unit]
+Description=Write the droplet id for the agent
+Before=edr-agent.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I /usr/local/lib/edr-agent/edr-droplet-id
+User=root
+Group=edr-agent
+UMask=0027
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_INET AF_UNIX
+IPAddressDeny=any
+IPAddressAllow=169.254.169.254
+ProtectHome=yes
+SystemCallFilter=@system-service
+ReadWritePaths=/run
+MemoryMax=64M
+Nice=19
+TimeoutStartSec=10
+TasksMax=16
+NoNewPrivileges=yes
+ProtectSystem=strict
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+LimitCORE=0
+LogNamespace=edr
+
+[Install]
+WantedBy=multi-user.target

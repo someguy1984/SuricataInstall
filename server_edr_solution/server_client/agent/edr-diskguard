@@ -1,0 +1,568 @@
+#!/usr/bin/env python3
+"""edr-diskguard: keep the kit's logs and caches from filling the site's disk (client PLAN section 9).
+
+A root oneshot on a timer (every 2 minutes). The agent cannot rotate, signal or reconfigure
+anything, so this helper does the work, with fixed actions only and never a restart of Suricata:
+
+  every run   logrotate of the kit's own configuration, write status.json
+  below 10%   delete the MPM cache; logrotate -f; delete rotated copies beyond the first;
+              truncate eve-bulk.json, then HUP Suricata
+  below  5%   delete all rotated kit logs and Tetragon backups; point eve-bulk.json at /dev/null, HUP
+  below  3%   SIGTERM Suricata (a clean stop; Restart=on-failure leaves it down), unless
+              [diskguard] stop_suricata = off
+  above 15%   restore a real eve-bulk.json, HUP
+
+The guard is root working in directories owned by `suricata`: it opens directories and files with
+O_NOFOLLOW, acts only on regular files owned by the expected user, deletes with unlinkat on a
+directory descriptor and never follows a link.
+
+Output   /run/edr-diskguard/status.json (root:edr-agent 0640): {"written_at", "free_pct", "stage", "freed_mb"}
+State    /var/lib/edr-diskguard/ (logrotate.state, state.json)
+Usage    edr-diskguard [--root DIR] [--dry-run] [--now EPOCH] [--exec-fixtures FILE] [--free-pct N] [--print-logrotate]
+         --free-pct N      pretend the disk has N percent free (tests)
+         --dry-run         delete, truncate and signal nothing; with --root the status file is still written
+Python standard library only, run as: python3 -I edr-diskguard
+"""
+
+import configparser
+import json
+import os
+import pwd
+import re
+import signal
+import stat
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+
+PROG = "edr-diskguard"
+VERSION = "0.1.0"
+SURICATA_LOG = "/var/log/suricata"
+SURICATA_CACHE = "/var/lib/suricata/cache"
+TETRAGON_LOG = "/var/log/tetragon"
+STATUS = "/run/edr-diskguard/status.json"
+STATE_DIR = "/var/lib/edr-diskguard"
+LOGROTATE_BASE = "/etc/edr-agent/logrotate.conf"
+LOGROTATE_RUN = "/run/edr-diskguard/logrotate.conf"
+STAGE_FREE = ((3.0, 3), (5.0, 2), (10.0, 1))
+RESTORE_ABOVE = 15.0
+MAX_DELETE = 5000
+
+NGINX_STANZA = """
+# Opt-in nginx info log ([agent] nginx_info_log = on); the nginx master reopens it on USR1
+/var/log/nginx/edr.log {
+    size 20M
+    rotate 2
+    compress
+    delaycompress
+    missingok
+    notifempty
+    sharedscripts
+    postrotate
+        /bin/kill -USR1 "$(cat /run/nginx.pid 2>/dev/null)" 2>/dev/null || true
+    endscript
+}
+"""
+
+# ---- Small helpers shared (copied, not imported) by the root helpers --------------------------------
+class Env:
+    """Paths under --root, programs run (or faked), the clock. Used by every root helper."""
+
+    def __init__(self, root="", dry=False, fixtures=None, now=None):
+        self.root = root.rstrip("/")
+        self.dry = dry
+        self.fixtures = fixtures
+        self.now = int(now if now is not None else time.time())
+        self.writes = bool(root) or not dry          # a dry run on the real paths writes nothing
+        self.log_lines = []
+
+    def p(self, path):
+        return self.root + path
+
+    def run(self, argv, timeout=20, stdin=None):
+        """(rc, stdout, stderr), or None when the program cannot run (dry run, missing, timeout)."""
+        if self.fixtures is not None:
+            f = self.fixtures.get(" ".join(argv))
+            return (f.get("rc", 0), f.get("out", ""), f.get("err", "")) if isinstance(f, dict) else None
+        if self.dry:
+            return None
+        try:
+            r = subprocess.run(argv, capture_output=True, timeout=timeout, check=False, input=stdin, text=True,
+                               env={"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C", "LC_ALL": "C"})
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        return r.returncode, r.stdout, r.stderr
+
+    def log(self, msg):
+        print("%s: %s" % (PROG, clean(msg, 300)), flush=True)
+
+
+def clean(text, limit=200):
+    """Printable ASCII only: this ends up in files and logs other programs read."""
+    return "".join(c if " " <= c <= "~" else "?" for c in str(text))[:limit]
+
+
+def read_file(path, max_bytes=65536, one_link=True, owners=None):
+    """Read a file another user may control: no symlink, no FIFO, bounded. Returns bytes; raises OSError or ValueError."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise ValueError("not a regular file")
+        if one_link and st.st_nlink != 1:
+            raise ValueError("more than one link")
+        if owners is not None and st.st_uid not in owners:
+            raise ValueError("unexpected owner")
+        if st.st_size > max_bytes:
+            raise ValueError("file too large")
+        out, total = [], 0
+        while True:
+            b = os.read(fd, 1 << 16)
+            if not b:
+                break
+            total += len(b)
+            if total > max_bytes:
+                raise ValueError("file too large")
+            out.append(b)
+        return b"".join(out)
+    finally:
+        os.close(fd)
+
+
+def read_text(env, path, max_bytes=65536, one_link=True, owners=None):
+    try:
+        return read_file(env.p(path), max_bytes, one_link, owners).decode("utf-8", "replace")
+    except (OSError, ValueError):
+        return None
+
+
+def atomic_write(path, text, mode=0o640):
+    """Write to .tmp, fsync, rename."""
+    os.makedirs(os.path.dirname(path), mode=0o755, exist_ok=True)
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC, mode)
+    try:
+        os.write(fd, text.encode("utf-8"))
+        os.fchmod(fd, mode)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.rename(tmp, path)
+
+
+def load_json(env, path, max_bytes=1 << 20, owners=None):
+    t = read_text(env, path, max_bytes, True, owners)
+    if t is None:
+        return None
+    try:
+        return json.loads(t)
+    except (ValueError, RecursionError):
+        return None
+
+
+def pause_until(env):
+    """The end of a valid pause (epoch s), or 0. An expired or odd file is ignored."""
+    doc = load_json(env, "/etc/edr-agent/pause.json", 4096)
+    u = doc.get("until") if isinstance(doc, dict) else None
+    return u if isinstance(u, int) and not isinstance(u, bool) and u > env.now else 0
+
+
+def read_conf(env, files_dir=""):
+    """local.conf over defaults.conf. Returns a ConfigParser; trouble means the defaults."""
+    cp = configparser.ConfigParser(interpolation=None, strict=False)
+    here = os.path.dirname(os.path.realpath(__file__))
+    for c in ([os.path.join(files_dir, "defaults.conf")] if files_dir else []) + [
+            os.path.join(here, "defaults.conf"), os.path.join(here, "files", "defaults.conf"),
+            os.path.join(here, "..", "files", "defaults.conf")]:
+        try:
+            with open(c, encoding="utf-8") as fh:
+                cp.read_string(fh.read(262144))
+            break
+        except (OSError, configparser.Error):
+            continue
+    t = read_text(env, "/etc/edr-agent/local.conf", 262144)
+    if t is not None:
+        try:
+            cp.read_string(t)
+        except configparser.Error:
+            pass
+    return cp
+
+
+def parse_common(argv, extra=None):
+    """Parse --root, --dry-run, --now, --exec-fixtures, --files-dir. Returns (Env, files_dir, rest, options)."""
+    root = os.environ.get("EDR_AGENT_ROOT", "")
+    dry, fixtures, now, files_dir, rest = False, None, None, "", []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        nxt = argv[i + 1] if i + 1 < len(argv) else None
+        if a == "--root" and nxt is not None:
+            root = nxt; i += 1
+        elif a == "--dry-run":
+            dry = True
+        elif a == "--now" and nxt is not None:
+            now = int(nxt); i += 1
+        elif a == "--exec-fixtures" and nxt is not None:
+            with open(nxt, encoding="utf-8") as fh:
+                fixtures = json.load(fh)
+            i += 1
+        elif a == "--files-dir" and nxt is not None:
+            files_dir = nxt; i += 1
+        elif a in ("-h", "--help"):
+            print(__doc__)
+            sys.exit(0)
+        else:
+            rest.append(a)
+        i += 1
+    return Env(root, dry, fixtures, now), files_dir, rest
+
+
+
+def uid_of(name):
+    try:
+        return pwd.getpwnam(name).pw_uid
+    except KeyError:
+        return None
+
+
+def free_percent(env):
+    """The smallest percentage of free space (for unprivileged users) on the filesystems the kit writes to."""
+    lows = []
+    for p in ("/var/log", "/var/lib"):
+        try:
+            sv = os.statvfs(env.p(p))
+        except OSError:
+            continue
+        if sv.f_blocks:
+            lows.append(100.0 * sv.f_bavail / sv.f_blocks)
+    return min(lows) if lows else None
+
+
+def open_dir(path):
+    return os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+
+
+class Cleaner:
+    """Deletes and truncates only regular files owned by `owner_uid`, by name under a directory descriptor."""
+
+    def __init__(self, env, owner_uid):
+        self.env, self.owner, self.freed, self.count = env, owner_uid, 0, 0
+
+    def regular(self, dfd, name):
+        try:
+            st = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+        except OSError:
+            return None
+        if not stat.S_ISREG(st.st_mode) or (self.owner is not None and st.st_uid != self.owner):
+            return None
+        return st
+
+    def delete(self, dfd, name):
+        st = self.regular(dfd, name)
+        if st is None or self.count >= MAX_DELETE:
+            return False
+        if self.env.dry:
+            self.env.log("would delete %s" % clean(name, 80))
+            return False
+        try:
+            os.unlink(name, dir_fd=dfd)
+        except OSError:
+            return False
+        self.freed += st.st_blocks * 512
+        self.count += 1
+        return True
+
+    def wipe_tree(self, path, depth=0):
+        """Delete the regular files below `path` (flat or a few levels deep). Never follows a link."""
+        try:
+            dfd = open_dir(path)
+        except OSError:
+            return
+        try:
+            for name in os.listdir(dfd):
+                try:
+                    st = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+                except OSError:
+                    continue
+                if stat.S_ISDIR(st.st_mode) and depth < 3 and (self.owner is None or st.st_uid == self.owner):
+                    self.wipe_tree_fd(dfd, name, depth + 1)
+                else:
+                    self.delete(dfd, name)
+        finally:
+            os.close(dfd)
+
+    def wipe_tree_fd(self, parent, name, depth):
+        try:
+            fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent)
+        except OSError:
+            return
+        try:
+            for n in os.listdir(fd):
+                try:
+                    st = os.stat(n, dir_fd=fd, follow_symlinks=False)
+                except OSError:
+                    continue
+                if stat.S_ISDIR(st.st_mode) and depth < 3 and (self.owner is None or st.st_uid == self.owner):
+                    self.wipe_tree_fd(fd, n, depth + 1)
+                else:
+                    self.delete(fd, n)
+        finally:
+            os.close(fd)
+
+    def truncate(self, dirpath, name):
+        try:
+            dfd = open_dir(dirpath)
+        except OSError:
+            return False
+        try:
+            st = self.regular(dfd, name)
+            if st is None:
+                return False
+            if self.env.dry:
+                self.env.log("would truncate %s" % clean(name, 80))
+                return False
+            fd = os.open(name, os.O_WRONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dfd)
+            try:
+                if not stat.S_ISREG(os.fstat(fd).st_mode):
+                    return False
+                os.ftruncate(fd, 0)
+            finally:
+                os.close(fd)
+            self.freed += st.st_blocks * 512
+            return True
+        finally:
+            os.close(dfd)
+
+    def rotated(self, dirpath, keep_first):
+        """Delete rotated copies of the kit's logs: eve.json.1, eve.json.2.gz, suricata.log.1 ...
+        With keep_first the newest copy (.1) stays."""
+        try:
+            dfd = open_dir(dirpath)
+        except OSError:
+            return
+        try:
+            for name in sorted(os.listdir(dfd)):
+                m = re.fullmatch(r"(.+\.(?:json|log))\.(\d+)(?:\.gz)?", name)
+                if m and not (keep_first and m.group(2) == "1"):
+                    self.delete(dfd, name)
+        finally:
+            os.close(dfd)
+
+    def tetragon_backups(self, dirpath, keep_newest):
+        try:
+            dfd = open_dir(dirpath)
+        except OSError:
+            return
+        try:
+            names = [n for n in os.listdir(dfd) if n.startswith("tetragon") and n != "tetragon.log" and re.search(r"\.log(\.gz)?$|\.gz$", n)]
+            def mtime(n):
+                try:
+                    return os.stat(n, dir_fd=dfd, follow_symlinks=False).st_mtime
+                except OSError:
+                    return 0
+            names.sort(key=mtime, reverse=True)
+            for n in names[1 if keep_newest else 0:]:
+                self.delete(dfd, n)
+        finally:
+            os.close(dfd)
+
+
+def hup_suricata(env):
+    """HUP through systemd, with the pid file as the fallback. Returns True when a signal was sent."""
+    if env.dry:
+        env.log("would HUP suricata")
+        return False
+    r = env.run(["systemctl", "kill", "-s", "HUP", "suricata.service"], timeout=10)
+    if r is not None and r[0] == 0:
+        return True
+    return signal_pid(env, signal.SIGHUP)
+
+
+def signal_pid(env, sig):
+    t = read_text(env, "/run/suricata.pid", 32, one_link=False)
+    try:
+        pid = int((t or "").strip())
+    except ValueError:
+        return False
+    comm = (read_text(env, "/proc/%d/comm" % pid, 64, one_link=False) or "").strip().lower()
+    if pid < 2 or not comm.startswith("suricata"):
+        return False
+    try:
+        os.kill(pid, sig)
+    except OSError:
+        return False
+    return True
+
+
+def stop_suricata(env):
+    if env.dry:
+        env.log("would stop suricata")
+        return False
+    r = env.run(["systemctl", "stop", "suricata.service"], timeout=60)
+    if r is not None and r[0] == 0:
+        return True
+    return signal_pid(env, signal.SIGTERM)
+
+
+def divert_bulk(env, c):
+    """Point eve-bulk.json at /dev/null (a symlink put in place by rename). Returns True when done."""
+    if env.dry:
+        env.log("would point eve-bulk.json at /dev/null")
+        return False
+    try:
+        dfd = open_dir(env.p(SURICATA_LOG))
+    except OSError:
+        return False
+    try:
+        st = c.regular(dfd, "eve-bulk.json")
+        if st is not None:
+            c.freed += st.st_blocks * 512
+        os.symlink("/dev/null", "eve-bulk.json.edr-null", dir_fd=dfd)
+        os.rename("eve-bulk.json.edr-null", "eve-bulk.json", src_dir_fd=dfd, dst_dir_fd=dfd)
+        return True
+    except OSError:
+        try:
+            os.unlink("eve-bulk.json.edr-null", dir_fd=dfd)
+        except OSError:
+            pass
+        return c.truncate(env.p(SURICATA_LOG), "eve-bulk.json")     # if the symlink fails, keep truncating
+    finally:
+        os.close(dfd)
+
+
+def restore_bulk(env, suri_uid):
+    """Replace the /dev/null symlink by a real, empty file owned by suricata. Returns True when restored."""
+    if env.dry:
+        return False
+    try:
+        dfd = open_dir(env.p(SURICATA_LOG))
+    except OSError:
+        return False
+    try:
+        try:
+            st = os.stat("eve-bulk.json", dir_fd=dfd, follow_symlinks=False)
+        except OSError:
+            st = None
+        if st is not None and not stat.S_ISLNK(st.st_mode):
+            return True
+        fd = os.open("eve-bulk.json.edr-new", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o640, dir_fd=dfd)
+        try:
+            if suri_uid is not None:
+                os.fchown(fd, suri_uid, -1)
+        finally:
+            os.close(fd)
+        os.rename("eve-bulk.json.edr-new", "eve-bulk.json", src_dir_fd=dfd, dst_dir_fd=dfd)
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(dfd)
+
+
+def logrotate_config(env, cp):
+    base = read_text(env, LOGROTATE_BASE, 65536) or ""
+    if not base:
+        here = os.path.dirname(os.path.realpath(__file__))
+        for c in (os.path.join(here, "logrotate.conf"), os.path.join(here, "files", "edr-logrotate.conf"),
+                  os.path.join(here, "..", "files", "edr-logrotate.conf")):
+            try:
+                with open(c, encoding="utf-8") as fh:
+                    base = fh.read(65536)
+                break
+            except OSError:
+                continue
+    if cp.get("agent", "nginx_info_log", fallback="off").strip().lower() == "on":
+        base = base.rstrip("\n") + "\n" + NGINX_STANZA
+    return base
+
+
+def main(argv):
+    env, files_dir, rest = parse_common(argv)
+    free_override, print_lr = None, False
+    i = 0
+    while i < len(rest):
+        if rest[i] == "--free-pct" and i + 1 < len(rest):
+            free_override = float(rest[i + 1]); i += 2
+        elif rest[i] == "--print-logrotate":
+            print_lr = True; i += 1
+        else:
+            print("usage: edr-diskguard [--root DIR] [--dry-run] [--free-pct N] [--print-logrotate]", file=sys.stderr)
+            return 2
+    if not env.root and os.geteuid() != 0 and not env.dry:
+        print("edr-diskguard: must run as root", file=sys.stderr)
+        return 2
+    cp = read_conf(env, files_dir)
+    if print_lr:
+        sys.stdout.write(logrotate_config(env, cp))
+        return 0
+    now = env.now
+    suri = uid_of("suricata")
+    state = load_json(env, STATE_DIR + "/state.json", 65536, owners={0, os.geteuid()})
+    if not isinstance(state, dict):
+        state = {}
+    free = free_override if free_override is not None else free_percent(env)
+    if free is None:
+        env.log("cannot read the free space")
+        return 1
+    stop_ok = cp.get("diskguard", "stop_suricata", fallback="on").strip().lower() != "off"
+
+    # logrotate of the kit's own configuration, with its own state file
+    conf_text = logrotate_config(env, cp)
+    rotated_ok = None
+    if conf_text and env.writes:
+        try:
+            atomic_write(env.p(LOGROTATE_RUN), conf_text, 0o640)
+            os.makedirs(env.p(STATE_DIR), mode=0o700, exist_ok=True)
+        except OSError:
+            pass
+    if conf_text and not env.dry:
+        r = env.run(["logrotate", "-s", env.p(STATE_DIR + "/logrotate.state"), env.p(LOGROTATE_RUN)], timeout=60)
+        rotated_ok = r is not None and r[0] == 0
+
+    stage = 0
+    for limit, st in STAGE_FREE:
+        if free < limit:
+            stage = st
+            break
+    # the expected owners: suricata for Suricata's files, root for Tetragon's; a test root belongs to whoever runs the test
+    s_clean = Cleaner(env, os.geteuid() if env.root else suri)
+    t_clean = Cleaner(env, os.geteuid() if env.root else 0)
+    if stage >= 1:
+        if not env.dry:
+            env.run(["logrotate", "-f", "-s", env.p(STATE_DIR + "/logrotate.state"), env.p(LOGROTATE_RUN)], timeout=60)
+        s_clean.wipe_tree(env.p(SURICATA_CACHE + "/sgh"))
+        s_clean.rotated(env.p(SURICATA_LOG), keep_first=stage < 2)
+        t_clean.tetragon_backups(env.p(TETRAGON_LOG), keep_newest=stage < 2)
+        if stage >= 2:
+            if divert_bulk(env, s_clean):
+                state["bulk_diverted"] = True
+        else:
+            s_clean.truncate(env.p(SURICATA_LOG), "eve-bulk.json")
+        hup_suricata(env)
+    if stage >= 3 and stop_ok:
+        stop_suricata(env)
+        state["suricata_stopped_at"] = now
+    # Above 15% again: put a real eve-bulk.json back (between 10% and 15% nothing is restored yet)
+    if free > RESTORE_ABOVE and state.get("bulk_diverted") and restore_bulk(env, None if env.root else suri):
+        state.pop("bulk_diverted", None)
+        hup_suricata(env)
+    freed = s_clean.freed + t_clean.freed
+    state["stage"] = stage
+    doc = {"written_at": now, "free_pct": round(free, 1), "stage": stage, "freed_mb": int(freed / (1024 * 1024))}
+    if env.writes:
+        try:
+            atomic_write(env.p(STATUS), json.dumps(doc, sort_keys=True), 0o640)
+            os.makedirs(env.p(STATE_DIR), mode=0o700, exist_ok=True)
+            atomic_write(env.p(STATE_DIR + "/state.json"), json.dumps(state, sort_keys=True), 0o600)
+        except OSError as e:
+            env.log("cannot write: %s" % e)
+            return 1
+    env.log("%d%% free%s, stage %d, freed %d MB" % (round(free), "" if rotated_ok is not False else " (logrotate failed)", stage, doc["freed_mb"]))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

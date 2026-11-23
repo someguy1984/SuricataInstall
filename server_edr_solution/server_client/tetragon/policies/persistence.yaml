@@ -1,0 +1,329 @@
+# Server variant of the laptop policy (client PLAN section 4.3). Observe-only: changes to places
+# where malware installs itself to survive a reboot or a new login (cron, systemd units, shell
+# start-up files, preload, udev and module autoloading, apt hooks, PAM, accounts and sudoers).
+# Autostart entries are dropped, and no home-directory placeholder is used: authorized_keys of any user is matched
+# by the end of the path ("/.ssh/authorized_keys").
+#
+# Hooks: security_file_permission (a write into a file; rate limited because every write()
+# reaches the hook), security_path_symlink (what "systemctl enable" does), security_path_link,
+# security_path_rename (how an editor or installer replaces a single file), and the exec of the
+# account tools useradd, usermod and adduser.
+# Directories are matched by prefix; single files by their directory plus name. The single-file
+# selector is "one of these directories AND one of these names", so an odd combination such as
+# /etc/config also matches. That is deliberate: Tetragon allows 8 exact-match lists and 8 prefix
+# lists in a policy, and one selector per directory would need far more.
+#
+# DigitalOcean's droplet-agent rewrites authorized_keys for each Console session: a write by that
+# binary is let through by selector 1 of the first hook (NoPost). Confirm the path with
+# `dpkg -L droplet-agent`. Any other writer stays visible. Package upgrades also show up here.
+#
+# When adding a location, add it to every hook: the directory list appears four times (once per
+# hook) and the single-file list three times.
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "persistence"
+spec:
+  kprobes:
+  - call: "security_file_permission"
+    syscall: false
+    return: true
+    message: "Write to an autostart / persistence location"
+    args:
+    - index: 0
+      type: "file"
+    - index: 1
+      type: "int" # 0x04 is MAY_READ, 0x02 is MAY_WRITE
+    returnArg:
+      index: 0
+      type: "int"
+    selectors:
+    - matchBinaries:
+      - operator: "In"
+        values:
+        - "/opt/digitalocean/bin/droplet-agent"
+      matchArgs:
+      - index: 0
+        operator: "Postfix"
+        values:
+        - "/.ssh/authorized_keys"
+      matchActions:
+      - action: NoPost
+    - matchArgs:
+      - index: 0
+        operator: "Prefix"
+        values:
+        # scheduled jobs
+        - "/etc/cron"
+        - "/etc/anacrontab"
+        - "/var/spool/cron/"
+        # services
+        - "/etc/systemd/system/"
+        - "/etc/rc.local"
+        # shell startup files, preload, device and module hooks
+        - "/etc/profile"
+        - "/etc/bash.bashrc"
+        - "/etc/environment"
+        - "/root/.bashrc"
+        - "/root/.profile"
+        - "/etc/ld.so.preload"
+        - "/etc/ld.so.conf"
+        - "/etc/udev/rules.d/"
+        - "/etc/modules-load.d/"
+        - "/etc/modprobe.d/"
+        # remote login keys of root, and ssh options that run commands
+        - "/root/.ssh/authorized_keys"
+        - "/root/.ssh/config"
+        - "/root/.ssh/rc"
+        # package sources and signing keys
+        - "/etc/apt/sources.list"
+        - "/etc/apt/trusted.gpg"
+        - "/etc/apt/keyrings/"
+        # hooks that run as root automatically
+        - "/etc/apt/apt.conf.d/"
+        - "/etc/update-motd.d/"
+        - "/etc/init.d/"
+        - "/etc/systemd/system-generators/"
+        - "/usr/lib/systemd/system/"
+        # authentication stack (PAM backdoors), policy overrides, accounts and sudo
+        - "/etc/pam.d/"
+        - "/etc/security/"
+        - "/etc/polkit-1/rules.d/"
+        - "/etc/passwd"
+        - "/etc/group"
+        - "/etc/sudoers.d/"
+      - index: 1
+        operator: "Mask"
+        values:
+        - "2" # MAY_WRITE
+      matchActions:
+      - action: Post
+        rateLimit: "1m"
+    - matchArgs:
+      - index: 0
+        operator: "Postfix"
+        values:
+        - "/.ssh/authorized_keys"
+        - "/.ssh/authorized_keys2"
+        - "/.ssh/rc"
+      - index: 1
+        operator: "Mask"
+        values:
+        - "2" # MAY_WRITE
+      matchActions:
+      - action: Post
+        rateLimit: "1m"
+
+  - call: "security_path_symlink"
+    syscall: false
+    message: "Symlink created in an autostart / persistence location"
+    args:
+    - index: 0 # const struct path *dir: where the link is created
+      type: "path"
+    - index: 1 # struct dentry *dentry: the link itself
+      type: "string"
+      resolve: "d_name.name"
+      label: "link"
+    - index: 2 # const char *old_name: what it points to
+      type: "string"
+      label: "target"
+    selectors:
+    - matchArgs:
+      - args: [0]
+        operator: "Prefix"
+        values:
+        - "/etc/cron"
+        - "/var/spool/cron"
+        - "/etc/systemd/system"             # includes the *.wants directories
+        - "/etc/profile.d"
+        - "/etc/ld.so.conf.d"
+        - "/etc/udev/rules.d"
+        - "/etc/modules-load.d"
+        - "/etc/modprobe.d"
+        - "/etc/apt/sources.list.d"
+        - "/etc/apt/trusted.gpg.d"
+        - "/etc/apt/keyrings"
+        - "/etc/apt/apt.conf.d"
+        - "/etc/update-motd.d"
+        - "/etc/init.d"
+        - "/etc/systemd/system-generators"
+        - "/usr/lib/systemd/system"
+        - "/etc/pam.d"
+        - "/etc/security"
+        - "/etc/polkit-1/rules.d"
+        - "/etc/sudoers.d"
+    - matchArgs:
+      - args: [0]
+        operator: "Equal"
+        values:
+        - "/etc"
+        - "/root"
+        - "/root/.ssh"
+      - args: [1]
+        operator: "Equal"
+        values:
+        - ".bashrc"
+        - ".profile"
+        - "authorized_keys"
+        - "config"
+        - "rc"
+        - "ld.so.preload"
+        - "ld.so.conf"
+        - "rc.local"
+        - "environment"
+        - "anacrontab"
+        - "crontab"
+        - "profile"
+        - "bash.bashrc"
+        - "passwd"
+        - "group"
+        - "sudoers"
+
+  - call: "security_path_link"
+    syscall: false
+    message: "Hard link created in an autostart / persistence location"
+    args:
+    - index: 1 # const struct path *new_dir: where the link is created
+      type: "path"
+    - index: 2 # struct dentry *new_dentry: the link itself
+      type: "string"
+      resolve: "d_name.name"
+      label: "link"
+    selectors:
+    - matchArgs:
+      - args: [0]
+        operator: "Prefix"
+        values:
+        - "/etc/cron"
+        - "/var/spool/cron"
+        - "/etc/systemd/system"
+        - "/etc/profile.d"
+        - "/etc/ld.so.conf.d"
+        - "/etc/udev/rules.d"
+        - "/etc/modules-load.d"
+        - "/etc/modprobe.d"
+        - "/etc/apt/sources.list.d"
+        - "/etc/apt/trusted.gpg.d"
+        - "/etc/apt/keyrings"
+        - "/etc/apt/apt.conf.d"
+        - "/etc/update-motd.d"
+        - "/etc/init.d"
+        - "/etc/systemd/system-generators"
+        - "/usr/lib/systemd/system"
+        - "/etc/pam.d"
+        - "/etc/security"
+        - "/etc/polkit-1/rules.d"
+        - "/etc/sudoers.d"
+    - matchArgs:
+      - args: [0]
+        operator: "Equal"
+        values:
+        - "/etc"
+        - "/root"
+        - "/root/.ssh"
+      - args: [1]
+        operator: "Equal"
+        values:
+        - ".bashrc"
+        - ".profile"
+        - "authorized_keys"
+        - "config"
+        - "rc"
+        - "ld.so.preload"
+        - "ld.so.conf"
+        - "rc.local"
+        - "environment"
+        - "anacrontab"
+        - "crontab"
+        - "profile"
+        - "bash.bashrc"
+        - "passwd"
+        - "group"
+        - "sudoers"
+
+  - call: "security_path_rename"
+    syscall: false
+    message: "File moved into an autostart / persistence location"
+    args:
+    - index: 0 # const struct path *old_dir
+      type: "path"
+      label: "from_dir"
+    - index: 1 # struct dentry *old_dentry
+      type: "string"
+      resolve: "d_name.name"
+      label: "from"
+    - index: 2 # const struct path *new_dir
+      type: "path"
+      label: "to_dir"
+    - index: 3 # struct dentry *new_dentry
+      type: "string"
+      resolve: "d_name.name"
+      label: "to"
+    selectors:
+    - matchArgs:
+      - args: [2]
+        operator: "Prefix"
+        values:
+        - "/etc/cron"
+        - "/var/spool/cron"
+        - "/etc/systemd/system"
+        - "/etc/profile.d"
+        - "/etc/ld.so.conf.d"
+        - "/etc/udev/rules.d"
+        - "/etc/modules-load.d"
+        - "/etc/modprobe.d"
+        - "/etc/apt/sources.list.d"
+        - "/etc/apt/trusted.gpg.d"
+        - "/etc/apt/keyrings"
+        - "/etc/apt/apt.conf.d"
+        - "/etc/update-motd.d"
+        - "/etc/init.d"
+        - "/etc/systemd/system-generators"
+        - "/usr/lib/systemd/system"
+        - "/etc/pam.d"
+        - "/etc/security"
+        - "/etc/polkit-1/rules.d"
+        - "/etc/sudoers.d"
+    - matchArgs:
+      - args: [2]
+        operator: "Equal"
+        values:
+        - "/etc"
+        - "/root"
+        - "/root/.ssh"
+      - args: [3]
+        operator: "Equal"
+        values:
+        - ".bashrc"
+        - ".profile"
+        - "authorized_keys"
+        - "config"
+        - "rc"
+        - "ld.so.preload"
+        - "ld.so.conf"
+        - "rc.local"
+        - "environment"
+        - "anacrontab"
+        - "crontab"
+        - "profile"
+        - "bash.bashrc"
+        - "passwd"
+        - "group"
+        - "sudoers"
+
+  - call: "security_bprm_check"
+    syscall: false
+    message: "An account tool was started"
+    args:
+    - index: 0
+      type: "linux_binprm"
+    selectors:
+    - matchArgs:
+      - index: 0
+        operator: "Postfix"
+        values:
+        - "/useradd"
+        - "/usermod"
+        - "/adduser"
+        - "/groupadd"
+        - "/userdel"

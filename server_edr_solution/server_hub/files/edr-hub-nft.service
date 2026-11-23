@@ -1,0 +1,19 @@
+[Unit]
+Description=EDR hub firewall table (inet edr_hub)
+DefaultDependencies=no
+Wants=network-pre.target
+Before=network-pre.target
+After=local-fs.target
+Before=shutdown.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# The file starts with `delete table inet edr_hub`, so loading it again replaces the table. A file that does not
+# check stops the unit before anything changes. Uninstall deletes the table by hand, after the services stop.
+ExecStartPre=/usr/sbin/nft -c -f /etc/edr-hub/edr-hub.nft
+ExecStart=/usr/sbin/nft -f /etc/edr-hub/edr-hub.nft
+
+[Install]
+WantedBy=sysinit.target

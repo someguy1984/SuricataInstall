@@ -1,0 +1,14 @@
+# Hourly, and edr-inventory.service is also started after each apt run (zz-edr-inventory) and,
+# once, 15 minutes after the first sighting of a stale nginx binary (PLAN section 4.5.1).
+[Unit]
+Description=Collect the host inventory every hour
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=1h
+RandomizedDelaySec=2min
+AccuracySec=30s
+Unit=edr-inventory.service
+
+[Install]
+WantedBy=timers.target

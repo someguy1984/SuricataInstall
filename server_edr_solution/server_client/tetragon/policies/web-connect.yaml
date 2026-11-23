@@ -1,0 +1,63 @@
+# Server policy, log only: php-fpm or nginx (and what they fork) connecting to a port outside the
+# list, at an address that is not local or in the VPC (client PLAN section 4.3). tcp_connect is
+# the hook because security_socket_connect cannot match a destination port. IPv4-mapped IPv6
+# connects, UDP and ICMP are not seen.
+#
+# Placeholders (a line that holds one is repeated per value, and left out without a value):
+#   @NGINX_BIN@, @PHPFPM_BIN@   the binaries, both spellings
+#   @EGRESS_PORTS_EXTRA@        [tetragon] egress_ports (--allow-egress-port)
+#   @VPC_CIDR@                  [sites] vpc_cidr. Never all of 10/8.
+# Default ports: 80, 443, 3306, 5432, 6379, 11211, 25, 465, 587, plus 25060, 25061 (DigitalOcean
+# managed databases and Redis), 2525, 6380. Loopback upstreams are excluded by address.
+#
+# rateLimit 10s with scope "thread": one event per thread and 10 seconds.
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "web-connect"
+spec:
+  kprobes:
+  - call: "tcp_connect"
+    syscall: false
+    message: "The web tree connected to an unexpected destination"
+    args:
+    - index: 0
+      type: "sock"
+    selectors:
+    - matchBinaries:
+      - operator: "In"
+        followChildren: true
+        values:
+        - "@PHPFPM_BIN@"
+        - "@PHPFPM_BIN@ (deleted)"
+        - "@NGINX_BIN@"
+        - "@NGINX_BIN@ (deleted)"
+      matchArgs:
+      - index: 0
+        operator: "NotDPort"
+        values:
+        - "80"
+        - "443"
+        - "3306"
+        - "5432"
+        - "6379"
+        - "11211"
+        - "25"
+        - "465"
+        - "587"
+        - "25060"
+        - "25061"
+        - "2525"
+        - "6380"
+        - "@EGRESS_PORTS_EXTRA@"
+      - index: 0
+        operator: "NotDAddr"
+        values:
+        - "127.0.0.0/8"
+        - "::1/128"
+        - "fe80::/10"
+        - "@VPC_CIDR@"
+      matchActions:
+      - action: Post
+        rateLimit: "10s"
+        rateLimitScope: "thread"

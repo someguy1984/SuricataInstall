@@ -1,0 +1,926 @@
+#!/usr/bin/python3 -I
+"""edr-hub: the command line of the hub (PLAN.md section 6).
+
+Reads open the database read-only. Everything that changes state goes to the running hub over
+ctl.sock (the hub validates, applies and audits it), except the root-only file operations (backup,
+restore, ca-export, and writing a secret), which this program does itself and records in
+pending-audit.jsonl. Exit codes are those of PLAN section 17.
+"""
+
+import argparse
+import getpass
+import json
+import os
+import socket
+import sqlite3
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+
+import hub_audit  # noqa: E402
+import hub_common  # noqa: E402
+from hub_common import clean  # noqa: E402
+
+USAGE = """usage: edr-hub COMMAND ...
+
+  status
+  host list [--all] | host HOST show | host HOST revoke|retire|mark-moved | host UUID adopt
+  host HOST maintenance (--for 30m | --end)
+  events [--host H] [--since 1h] [--min-sev high] [--limit N] [--json]
+  incidents [--open] | incident ID | resolve ID
+  token create (--name N | --names A,B | --for HOST[,HOST]) [--ttl 1h] [--source CIDR] | token list | token revoke ID
+  ui-login
+  never-ban add CIDR [--reason TEXT] | never-ban remove CIDR | never-ban list
+  settings get [KEY] | settings set KEY VALUE | settings set KEY -
+  alert test [--channel NAME]
+  audit [--since 1d] | audit verify
+  backup [--out FILE] | restore FILE [--ca-key FILE] [--drill] [--public-ip IP] | ca-export [--out FILE]
+  reissue-cert
+  health
+  agent-hash add SHA [--note TEXT]
+"""
+
+SOCKET_TIMEOUT_S = 20
+COLORS = {"CRITICAL": "1;31", "HIGH": "31", "MEDIUM": "33", "LOW": "36", "INFO": "2"}
+
+
+class CliError(Exception):
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+class Parser(argparse.ArgumentParser):
+    """argparse that exits 64 on a usage error, as PLAN section 17 says."""
+
+    def error(self, message):
+        sys.stderr.write("edr-hub: %s\n" % message)
+        sys.stderr.write(USAGE)
+        sys.exit(hub_common.EXIT_USAGE)
+
+
+PATHS = hub_common.Paths()
+INSTALLED = not any(os.environ.get(k) for k in ("EDR_HUB_STATE_DIR", "EDR_HUB_RUN_DIR", "EDR_HUB_ETC_DIR"))
+COLOR = sys.stdout.isatty() and "NO_COLOR" not in os.environ
+
+
+# ---- output -------------------------------------------------------------------------------------
+def out(line=""):
+    sys.stdout.write(line + "\n")
+
+
+def c(text, limit=200):
+    """Terminal-safe text: every attacker-influenced value goes through this."""
+    return clean("" if text is None else text, limit)
+
+
+def paint(text, sev):
+    if COLOR and sev in COLORS:
+        return "\x1b[%sm%s\x1b[0m" % (COLORS[sev], text)
+    return text
+
+
+def jprint(obj):
+    out(json.dumps(obj, ensure_ascii=True, sort_keys=True))
+
+
+def fmt_ts(ms):
+    return "-" if not ms else hub_common.ms_to_rfc3339(int(ms))[:19].replace("T", " ") + "Z"
+
+
+def fmt_age(ms):
+    if not ms:
+        return "never"
+    s = max(int((hub_common.now_ms() - int(ms)) / 1000), 0)
+    for limit, unit, div in ((90, "s", 1), (5400, "m", 60), (129600, "h", 3600)):
+        if s < limit:
+            return "%d%s ago" % (s // div, unit)
+    return "%dd ago" % (s // 86400)
+
+
+def table(headers, rows):
+    rows = [[str(x) for x in r] for r in rows]
+    widths = [max(len(h), *(len(r[i]) for r in rows)) if rows else len(h) for i, h in enumerate(headers)]
+    out("  ".join(h.ljust(w) for h, w in zip(headers, widths)).rstrip())
+    for r in rows:
+        out("  ".join(x.ljust(w) for x, w in zip(r, widths)).rstrip())
+
+
+# ---- plumbing -----------------------------------------------------------------------------------
+def need_root():
+    if INSTALLED and os.geteuid() != 0:
+        raise CliError(hub_common.EXIT_REFUSED, "this command must be run as root (use sudo)")
+
+
+def open_db():
+    uri = "file:%s?mode=ro" % PATHS.db.replace("?", "%3f")
+    try:
+        conn = sqlite3.connect(uri, uri=True, timeout=5)
+        conn.row_factory = sqlite3.Row
+        conn.execute("SELECT 1 FROM meta LIMIT 1")
+        return conn
+    except sqlite3.Error as exc:
+        raise CliError(hub_common.EXIT_FAIL, "cannot open the database %s: %s" % (PATHS.db, c(exc, 100)))
+
+
+def meta(conn, key, default=None):
+    try:
+        row = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+    except sqlite3.Error:
+        return default
+    return default if row is None else row[0]
+
+
+def actor():
+    loginuid = "unknown"
+    try:
+        with open("/proc/self/loginuid") as f:
+            value = f.read().strip()
+        if value.isdigit() and int(value) != 4294967295:
+            loginuid = value
+    except OSError:
+        pass
+    return {"loginuid": loginuid, "sudo_user": os.environ.get("SUDO_USER", "")}
+
+
+def call(cmd, args=None, timeout=SOCKET_TIMEOUT_S):
+    """Send one request to ctl.sock; return the result or raise CliError with the hub's exit number."""
+    need_root()
+    request = json.dumps({"cmd": cmd, "args": args or {}, "actor": actor()}).encode("utf-8") + b"\n"
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect(PATHS.ctl_sock)
+        s.sendall(request)
+        buf = bytearray()
+        while not buf.endswith(b"\n"):
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+            if len(buf) > 4 * 1024 * 1024:
+                break
+    except (FileNotFoundError, ConnectionRefusedError):
+        raise CliError(hub_common.EXIT_FAIL, "the hub is not running (nothing answers on %s)" % PATHS.ctl_sock)
+    except PermissionError:
+        raise CliError(hub_common.EXIT_FAIL, "no permission to use %s (run as root)" % PATHS.ctl_sock)
+    except OSError as exc:
+        raise CliError(hub_common.EXIT_FAIL, "the hub did not answer: %s" % (exc.strerror or type(exc).__name__))
+    finally:
+        s.close()
+    try:
+        reply = json.loads(bytes(buf).decode("utf-8"))
+    except ValueError:
+        raise CliError(hub_common.EXIT_FAIL, "the hub sent an unreadable reply")
+    if reply.get("ok"):
+        return reply.get("result")
+    raise CliError(int(reply.get("exit", 2)), c(reply.get("error", "refused"), 200))
+
+
+def read_passphrase(args, prompt, confirm=False):
+    if getattr(args, "passphrase_file", None):
+        try:
+            with open(args.passphrase_file, encoding="utf-8") as f:
+                return f.readline().rstrip("\n")
+        except OSError:
+            raise CliError(hub_common.EXIT_REFUSED, "cannot read the passphrase file")
+    if sys.stdin.isatty():
+        first = getpass.getpass(prompt)
+        if confirm and getpass.getpass("Again: ") != first:
+            raise CliError(hub_common.EXIT_REFUSED, "the two passphrases differ")
+        return first
+    return sys.stdin.readline().rstrip("\n")
+
+
+def host_row(conn, ref):
+    return conn.execute("SELECT * FROM hosts WHERE name=? OR uuid=?", (ref, ref)).fetchone()
+
+
+def jloads(text, default):
+    try:
+        return json.loads(text)
+    except (TypeError, ValueError):
+        return default
+
+
+# ---- read commands ------------------------------------------------------------------------------
+def cmd_status(argv):
+    Parser(prog="edr-hub status").parse_args(argv)
+    warn = False
+    fail = False
+    now = hub_common.now_ms()
+    try:
+        info = call("status")
+        out("hub:        running, version %s, pid %s, up %ss" % (c(info.get("version")), info.get("pid"), info.get("uptime_s")))
+    except CliError as exc:
+        fail = True
+        out("hub:        NOT RUNNING (%s)" % c(exc.message, 120))
+    conn = open_db()
+    try:
+        settings = hub_common.load_settings(PATHS)
+        pages = conn.execute("PRAGMA page_count").fetchone()[0] - conn.execute("PRAGMA freelist_count").fetchone()[0]
+        size = pages * conn.execute("PRAGMA page_size").fetchone()[0]
+        wal = 0
+        try:
+            wal = os.path.getsize(PATHS.db + "-wal")
+        except OSError:
+            pass
+        cap = hub_common.parse_size(settings.get("max_db_size", "2G"))
+        pct = 100 * (size + wal) // cap if cap else 0
+        out("database:   %d MiB of %d MiB (%d%%), WAL %d MiB" % (size >> 20, cap >> 20, pct, wal >> 20))
+        if pct >= 80:
+            warn = True
+            out("             WARNING: over 80% of the cap")
+        states = dict(conn.execute("SELECT state, COUNT(*) FROM hosts GROUP BY state").fetchall())
+        up = conn.execute("SELECT COUNT(*) FROM hosts WHERE state IN ('active','pending') AND last_seen > ?",
+                          (now - 5 * 60 * 1000,)).fetchone()[0]
+        live = states.get("active", 0) + states.get("pending", 0)
+        out("hosts:      %d up, %d silent; %s" % (up, live - up, ", ".join("%d %s" % (n, s) for s, n in sorted(states.items())) or "none"))
+        if states.get("orphan"):
+            warn = True
+            out("             WARNING: %d orphan host(s): check, then `edr-hub host UUID adopt`" % states["orphan"])
+        sev = conn.execute("SELECT severity, COUNT(*) FROM incidents WHERE state!='resolved' GROUP BY severity").fetchall()
+        out("incidents:  %s" % (", ".join("%d %s" % (n, s) for s, n in sev) + " open" if sev else "none open"))
+        pending = conn.execute("SELECT COUNT(*) FROM outbox WHERE state IN ('pending','sending','failed') AND channel!='none'").fetchone()[0]
+        stuck = conn.execute("SELECT COUNT(*) FROM outbox WHERE state IN ('pending','sending','failed') AND channel!='none' AND created < ?",
+                             (now - 3600 * 1000,)).fetchone()[0]
+        dead = conn.execute("SELECT COUNT(*) FROM outbox WHERE state='dead' AND channel!='none' AND created > ?",
+                            (now - 86400 * 1000,)).fetchone()[0]
+        chans = hub_common.enabled_channels(settings)
+        out("alerts:     channels %s; %d waiting, %d undeliverable in 24 h" % (", ".join(chans) or "NONE", pending, dead))
+        if stuck or dead:
+            warn = True
+            out("             WARNING: alert delivery is failing; run `edr-hub alert test`")
+        if not chans:
+            warn = True
+        last = meta(conn, "last_backup")
+        try:
+            with open(PATHS.last_backup) as f:
+                last = f.read().strip() or last
+        except OSError:
+            pass
+        last_ms = int(last) if last and last.isdigit() else None
+        out("backup:     %s" % ("never" if not last_ms else fmt_age(last_ms)))
+        if not last_ms or now - last_ms > 7 * 86400 * 1000:
+            warn = True
+            out("             WARNING: no good backup in 7 days; run `sudo edr-hub backup`")
+        rows = conn.execute("SELECT COUNT(*) FROM audit").fetchone()[0]
+        out("audit:      %d rows, head %s" % (rows, hub_audit.head(conn)[:12]))
+        out("quick_check:%s" % (" last run " + fmt_age(int(meta(conn, "last_quick_check"))) if str(meta(conn, "last_quick_check", "")).isdigit() else " not yet"))
+    finally:
+        conn.close()
+    out("")
+    out("next:       sudo edr-hub ui-login        (dashboard link)")
+    out("            sudo edr-hub incidents --open")
+    return hub_common.EXIT_FAIL if fail else hub_common.EXIT_WARN if warn else hub_common.EXIT_OK
+
+
+def host_dict(r):
+    d = {k: r[k] for k in r.keys()}
+    for key in ("ips", "peer_ips"):
+        d[key] = jloads(d.get(key), [])
+    return d
+
+
+def cmd_host(argv):
+    if not argv:
+        raise CliError(hub_common.EXIT_USAGE, "host: missing arguments")
+    if argv[0] == "list":
+        p = Parser(prog="edr-hub host list")
+        p.add_argument("--all", action="store_true")
+        p.add_argument("--json", action="store_true")
+        a = p.parse_args(argv[1:])
+        conn = open_db()
+        try:
+            sql = "SELECT * FROM hosts" + ("" if a.all else " WHERE state!='retired'") + " ORDER BY name"
+            maint = {r[0]: r[1] for r in conn.execute("SELECT host, until FROM maintenance WHERE until > ?", (hub_common.now_ms(),))}
+            rows = [host_dict(r) for r in conn.execute(sql)]
+        finally:
+            conn.close()
+        if a.json:
+            for r in rows:
+                r["maintenance_until"] = maint.get(r["uuid"])
+                jprint(r)
+            return 0
+        table(["NAME", "STATE", "SEEN", "AGENT", "ADDRESS", "NOTE"],
+              [[c(r["name"], 63), r["state"], fmt_age(r["last_seen"]), c(r["agent_version"] or "-", 20),
+                c((r["peer_ips"] or ["-"])[0], 45),
+                "maintenance until " + fmt_ts(maint[r["uuid"]]) if r["uuid"] in maint else ""] for r in rows])
+        return 0
+    ref = argv[0]
+    if len(argv) < 2:
+        raise CliError(hub_common.EXIT_USAGE, "host %s: missing action" % c(ref, 40))
+    action, rest = argv[1], argv[2:]
+    if action == "show":
+        p = Parser(prog="edr-hub host HOST show")
+        p.add_argument("--json", action="store_true")
+        a = p.parse_args(rest)
+        return host_show(ref, a.json)
+    if action in ("revoke", "retire", "mark-moved", "adopt"):
+        Parser(prog="edr-hub host HOST " + action).parse_args(rest)
+        res = call("host." + action, {"host": ref})
+        out("host %s (%s): now %s" % (c(res["host"], 63), res["uuid"], res["state"]))
+        return 0
+    if action == "maintenance":
+        p = Parser(prog="edr-hub host HOST maintenance")
+        g = p.add_mutually_exclusive_group(required=True)
+        g.add_argument("--for", dest="for_")
+        g.add_argument("--end", action="store_true")
+        a = p.parse_args(rest)
+        res = call("host.maintenance", {"host": ref, "end": True} if a.end else {"host": ref, "for": a.for_})
+        out("maintenance ended for %s" % c(res["host"], 63) if a.end else
+            "maintenance for %s until %s" % (c(res["host"], 63), fmt_ts(res["until"])))
+        return 0
+    raise CliError(hub_common.EXIT_USAGE, "host: unknown action " + c(action, 40))
+
+
+def host_show(ref, as_json):
+    conn = open_db()
+    try:
+        r = host_row(conn, ref)
+        if r is None:
+            raise CliError(hub_common.EXIT_REFUSED, "no such host")
+        d = host_dict(r)
+        d["maintenance"] = [dict(zip(("until", "set_by"), tuple(m))) for m in conn.execute(
+            "SELECT until, set_by FROM maintenance WHERE host=?", (d["uuid"],))]
+        d["open_incidents"] = conn.execute("SELECT COUNT(*) FROM incidents WHERE host=? AND state!='resolved'", (d["uuid"],)).fetchone()[0]
+    finally:
+        conn.close()
+    if as_json:
+        jprint(d)
+        return 0
+    out("name:            %s" % c(d["name"], 63))
+    out("uuid:            %s" % d["uuid"])
+    out("state:           %s (since %s)" % (d["state"], fmt_ts(d["state_since"])))
+    out("reported (untrusted): %s" % c(d["reported_name"], 63))
+    out("os (untrusted):  %s" % c(d["os"], 80))
+    out("addresses seen:  %s" % c(", ".join(map(str, d["peer_ips"])), 120))
+    out("addresses claimed: %s" % c(", ".join(map(str, d["ips"])), 120))
+    out("agent:           %s (sha256 %s)" % (c(d["agent_version"] or "-", 20), c((d["agent_sha256"] or "-")[:16], 16)))
+    out("kernel:          %s" % c(d["kernel"] or "-", 60))
+    out("last seen:       %s (%s)" % (fmt_ts(d["last_seen"]), fmt_age(d["last_seen"])))
+    out("enrolled:        %s from %s" % (fmt_ts(d["enrolled_at"]), c(d["enrolled_from"], 45)))
+    out("certificate:     serial %s, expires %s" % (c(d["cert_serial"] or "-", 40), fmt_ts(d["cert_not_after"])))
+    out("policy rev:      issued %s, applied %s" % (d["policy_rev"] or "-", d["policy_rev_applied"] or "-"))
+    out("open incidents:  %d" % d["open_incidents"])
+    for m in d["maintenance"]:
+        out("maintenance:     until %s, set by %s" % (fmt_ts(m["until"]), c(m["set_by"], 80)))
+    return 0
+
+
+def cmd_events(argv):
+    p = Parser(prog="edr-hub events")
+    p.add_argument("--host")
+    p.add_argument("--since")
+    p.add_argument("--min-sev")
+    p.add_argument("--limit", type=int, default=100)
+    p.add_argument("--json", action="store_true")
+    a = p.parse_args(argv)
+    where, params = [], []
+    conn = open_db()
+    try:
+        if a.host:
+            h = host_row(conn, a.host)
+            if h is None:
+                raise CliError(hub_common.EXIT_REFUSED, "no such host")
+            where.append("e.host=?")
+            params.append(h["uuid"])
+        if a.since:
+            try:
+                where.append("e.received_at>=?")
+                params.append(hub_common.now_ms() - hub_common.parse_duration(a.since) * 1000)
+            except ValueError as exc:
+                raise CliError(hub_common.EXIT_REFUSED, str(exc))
+        if a.min_sev:
+            sev = a.min_sev.upper()
+            if sev not in hub_common.SEVERITIES:
+                raise CliError(hub_common.EXIT_REFUSED, "--min-sev is one of " + ", ".join(s.lower() for s in hub_common.SEVERITIES))
+            allowed = hub_common.SEVERITIES[hub_common.sev_rank(sev):]
+            where.append("e.hub_severity IN (%s)" % ",".join("?" * len(allowed)))
+            params += allowed
+        limit = min(max(a.limit, 1), 10000)
+        rows = conn.execute(
+            "SELECT e.*, h.name AS host_name FROM events e LEFT JOIN hosts h ON h.uuid=e.host%s ORDER BY e.id DESC LIMIT ?"
+            % (" WHERE " + " AND ".join(where) if where else ""), params + [limit]).fetchall()
+    finally:
+        conn.close()
+    rows.reverse()
+    if a.json:
+        for r in rows:
+            d = {k: r[k] for k in r.keys()}
+            d["details"] = jloads(d.get("details"), {})
+            jprint(d)
+        return 0
+    for r in rows:
+        sev = r["hub_severity"]
+        out("%s  %-8s  %-16s  %-28s  %s%s" % (
+            fmt_ts(r["received_at"]), paint(sev, sev), c(r["host_name"] or r["host"], 16), c(r["kind"], 28),
+            c(r["summary"], 120), "  x%d" % r["count"] if r["count"] > 1 else ""))
+    return 0
+
+
+def cmd_incidents(argv):
+    p = Parser(prog="edr-hub incidents")
+    p.add_argument("--open", action="store_true")
+    p.add_argument("--json", action="store_true")
+    a = p.parse_args(argv)
+    conn = open_db()
+    try:
+        rows = conn.execute("SELECT i.*, h.name AS host_name FROM incidents i LEFT JOIN hosts h ON h.uuid=i.host%s "
+                            "ORDER BY i.updated DESC LIMIT 200" % (" WHERE i.state!='resolved'" if a.open else "")).fetchall()
+    finally:
+        conn.close()
+    if a.json:
+        for r in rows:
+            d = {k: r[k] for k in r.keys()}
+            d["kinds"] = jloads(d["kinds"], [])
+            jprint(d)
+        return 0
+    table(["ID", "STATE", "SEVERITY", "HOST", "UPDATED", "SIGNALS", "TITLE"],
+          [[r["id"], r["state"], r["severity"], c(r["host_name"] or r["host"], 24),
+            fmt_age(r["updated"]), r["signals"], c(r["title"], 80)] for r in rows])
+    return 0
+
+
+def cmd_incident(argv):
+    p = Parser(prog="edr-hub incident")
+    p.add_argument("id", type=int)
+    p.add_argument("--json", action="store_true")
+    a = p.parse_args(argv)
+    conn = open_db()
+    try:
+        i = conn.execute("SELECT i.*, h.name AS host_name FROM incidents i LEFT JOIN hosts h ON h.uuid=i.host WHERE i.id=?", (a.id,)).fetchone()
+        if i is None:
+            raise CliError(hub_common.EXIT_REFUSED, "no such incident")
+        events = conn.execute("SELECT e.* FROM incident_events ie JOIN events e ON e.id=ie.event_rowid "
+                              "WHERE ie.incident_id=? ORDER BY e.id", (a.id,)).fetchall()
+    finally:
+        conn.close()
+    if a.json:
+        d = {k: i[k] for k in i.keys()}
+        d["kinds"] = jloads(d["kinds"], [])
+        d["events"] = [dict({k: e[k] for k in e.keys()}, details=jloads(e["details"], {})) for e in events]
+        jprint(d)
+        return 0
+    out("incident %d  %s  %s  host %s" % (i["id"], i["state"], paint(i["severity"], i["severity"]), c(i["host_name"] or i["host"], 63)))
+    out("title:    %s" % c(i["title"], 120))
+    out("chain:    %s    kinds: %s" % (c(i["chain"], 64), c(", ".join(map(str, jloads(i["kinds"], []))), 160)))
+    out("opened:   %s    updated: %s    signals: %d" % (fmt_ts(i["opened"]), fmt_ts(i["updated"]), i["signals"]))
+    if i["closed_at"]:
+        out("closed:   %s by %s" % (fmt_ts(i["closed_at"]), c(i["closed_by"], 60)))
+    out("")
+    for e in events:
+        out("%s  %-8s  %-28s  %s%s" % (fmt_ts(e["received_at"]), paint(e["hub_severity"], e["hub_severity"]), c(e["kind"], 28),
+                                      c(e["summary"], 120), "  x%d" % e["count"] if e["count"] > 1 else ""))
+    out("")
+    out("resolve:  sudo edr-hub resolve %d" % i["id"])
+    return 0
+
+
+def cmd_resolve(argv):
+    p = Parser(prog="edr-hub resolve")
+    p.add_argument("id", type=int)
+    a = p.parse_args(argv)
+    call("incident.resolve", {"id": a.id})
+    out("incident %d resolved" % a.id)
+    return 0
+
+
+def cmd_ack(argv):
+    raise CliError(hub_common.EXIT_REFUSED, "ack is not available in this release (it arrives with P3)")
+
+
+def cmd_audit(argv):
+    if argv and argv[0] == "verify":
+        Parser(prog="edr-hub audit verify").parse_args(argv[1:])
+        res = call("audit.verify")
+        if res["ok"]:
+            out("audit chain intact: %d rows, head %s" % (res["rows"], res["head"][:16]))
+            return 0
+        out("AUDIT CHAIN BROKEN at row %s (%d rows)" % (res["first_bad_id"], res["rows"]))
+        return hub_common.EXIT_FAIL
+    p = Parser(prog="edr-hub audit")
+    p.add_argument("--since", default="1d")
+    p.add_argument("--json", action="store_true")
+    a = p.parse_args(argv)
+    try:
+        since = hub_common.now_ms() - hub_common.parse_duration(a.since) * 1000
+    except ValueError as exc:
+        raise CliError(hub_common.EXIT_REFUSED, str(exc))
+    conn = open_db()
+    try:
+        rows = conn.execute("SELECT id, ts, actor_kind, actor_detail, action, target, outcome, details FROM audit "
+                            "WHERE ts>=? ORDER BY id DESC LIMIT 1000", (since,)).fetchall()
+    finally:
+        conn.close()
+    rows.reverse()
+    if a.json:
+        for r in rows:
+            d = {k: r[k] for k in r.keys()}
+            d["details"] = jloads(d["details"], {})
+            jprint(d)
+        return 0
+    for r in rows:
+        out("%6d  %s  %-6s %-7s %-26s %-24s %s" % (r["id"], fmt_ts(r["ts"]), r["actor_kind"], r["outcome"], c(r["action"], 26),
+                                                  c(r["target"], 24), c(r["actor_detail"], 80)))
+    return 0
+
+
+def cmd_token(argv):
+    if not argv:
+        raise CliError(hub_common.EXIT_USAGE, "token: create, list or revoke")
+    sub, rest = argv[0], argv[1:]
+    if sub == "create":
+        p = Parser(prog="edr-hub token create")
+        g = p.add_mutually_exclusive_group(required=True)
+        g.add_argument("--name")
+        g.add_argument("--names")
+        g.add_argument("--for", dest="for_")
+        p.add_argument("--ttl", default="15m")
+        p.add_argument("--source")
+        p.add_argument("--json", action="store_true")
+        a = p.parse_args(rest)
+        args = {"ttl": a.ttl}
+        if a.name is not None:
+            args["name"] = a.name
+        if a.names is not None:
+            args["names"] = [x for x in a.names.split(",")]
+        if a.for_ is not None:
+            args["for"] = [x for x in a.for_.split(",")]
+        if a.source:
+            args["source"] = a.source
+        res = call("token.create", args)
+        if a.json:
+            jprint(res)
+            return 0
+        for t in res["tokens"]:
+            out("Token for %s (single use, expires %s, enrollment port %s):" % (
+                c(t["label"], 63), fmt_ts(t["expires_at"]), t.get("enroll_port")))
+            out("  " + t["token"])
+        t0 = res["tokens"][0]
+        addr = (t0.get("hub_addresses") or ["HUB_IP"])[0]
+        out("")
+        out("Save each token in a file on its host (mode 0600), then run from the unpacked client tarball:")
+        out("  sudo ./install.sh --hub %s:%s --token-file FILE" % (c(addr, 45), t0.get("port")))
+        out("For a manual install with the confirmation wait, use --ttl 1h.")
+        return 0
+    if sub == "list":
+        p = Parser(prog="edr-hub token list")
+        p.add_argument("--json", action="store_true")
+        a = p.parse_args(rest)
+        conn = open_db()
+        try:
+            now = hub_common.now_ms()
+            rows = conn.execute("SELECT t.id, t.name, t.bound_host, t.source_cidr, t.expires_at, t.used_at, t.revoked_at, h.name AS host_name "
+                                "FROM tokens t LEFT JOIN hosts h ON h.uuid=t.bound_host ORDER BY t.created_at DESC LIMIT 200").fetchall()
+        finally:
+            conn.close()
+        items = []
+        for r in rows:
+            state = "revoked" if r["revoked_at"] else "used" if r["used_at"] else "expired" if r["expires_at"] < now else "pending"
+            items.append({"id": r["id"], "name": r["name"], "bound_host": r["host_name"] or r["bound_host"],
+                          "source_cidr": r["source_cidr"], "expires_at": r["expires_at"], "state": state})
+        if a.json:
+            for i in items:
+                jprint(i)
+            return 0
+        table(["ID", "NAME", "SOURCE", "EXPIRES", "STATE"],
+              [[c(i["id"], 24), c(i["name"] or ("for " + str(i["bound_host"])), 63), c(i["source_cidr"] or "-", 49),
+                fmt_ts(i["expires_at"]), i["state"]] for i in items])
+        return 0
+    if sub == "revoke":
+        p = Parser(prog="edr-hub token revoke")
+        p.add_argument("id")
+        a = p.parse_args(rest)
+        call("token.revoke", {"id": a.id})
+        out("token %s revoked" % c(a.id, 24))
+        return 0
+    raise CliError(hub_common.EXIT_USAGE, "token: unknown subcommand " + c(sub, 20))
+
+
+def cmd_ui_login(argv):
+    Parser(prog="edr-hub ui-login").parse_args(argv)
+    res = call("ui-login.mint")
+    base = None
+    try:
+        with open(PATHS.ui_url, encoding="utf-8") as f:
+            base = f.readline().strip()
+    except OSError:
+        pass
+    if not base or not base.startswith("http"):
+        base = "http://127.0.0.1:%d" % hub_common.load_settings(PATHS).get("ui_port", 8450)
+    out("%s/#code=%s" % (base.rstrip("/"), res["code"]))
+    out("Valid for 10 minutes, one use. Reach the port with: ssh -L %d:127.0.0.1:%d USER@HUB" % (
+        hub_common.load_settings(PATHS).get("ui_port", 8450), hub_common.load_settings(PATHS).get("ui_port", 8450)))
+    return 0
+
+
+def cmd_never_ban(argv):
+    if not argv:
+        raise CliError(hub_common.EXIT_USAGE, "never-ban: add, remove or list")
+    sub, rest = argv[0], argv[1:]
+    if sub == "list":
+        Parser(prog="edr-hub never-ban list").parse_args(rest)
+        conn = open_db()
+        try:
+            rows = conn.execute("SELECT cidr, reason, added_by, ts FROM never_ban ORDER BY cidr").fetchall()
+        finally:
+            conn.close()
+        table(["CIDR", "ADDED", "BY", "REASON"], [[r["cidr"], fmt_ts(r["ts"]), c(r["added_by"], 30), c(r["reason"], 80)] for r in rows])
+        return 0
+    p = Parser(prog="edr-hub never-ban " + sub)
+    p.add_argument("cidr")
+    if sub == "add":
+        p.add_argument("--reason", default="")
+    elif sub != "remove":
+        raise CliError(hub_common.EXIT_USAGE, "never-ban: unknown subcommand " + c(sub, 20))
+    a = p.parse_args(rest)
+    res = call("never-ban." + sub, {"cidr": a.cidr, "reason": getattr(a, "reason", "")})
+    out("%s %s" % (res["cidr"], "added to the never-ban list" if sub == "add" else "removed from the never-ban list"))
+    return 0
+
+
+def cmd_settings(argv):
+    if not argv:
+        raise CliError(hub_common.EXIT_USAGE, "settings: get or set")
+    sub, rest = argv[0], argv[1:]
+    settings = hub_common.load_settings(PATHS)
+    if sub == "get":
+        p = Parser(prog="edr-hub settings get")
+        p.add_argument("key", nargs="?")
+        a = p.parse_args(rest)
+        lines = {}
+        for k in sorted(hub_common.PLAIN_SETTINGS):
+            lines[k] = (settings.get(k), "")
+        for k in sorted(hub_common.INSTALLER_SETTINGS):
+            lines[k] = (settings.get(k), "  (installer-owned)")
+        for k in hub_common.SECRET_SETTINGS:
+            masked = (settings.get("secrets_set") or {}).get(k)
+            lines[k] = (masked if masked else "(not set)", "  (secret)")
+        if a.key:
+            if a.key not in lines:
+                raise CliError(hub_common.EXIT_REFUSED, "unknown setting " + c(a.key, 40))
+            lines = {a.key: lines[a.key]}
+        for k, (v, note) in lines.items():
+            out("%s = %s%s" % (k, c(json.dumps(v) if not isinstance(v, str) else v, 200), note))
+        return 0
+    if sub == "set":
+        p = Parser(prog="edr-hub settings set")
+        p.add_argument("key")
+        p.add_argument("value")
+        a = p.parse_args(rest)
+        if a.key in hub_common.SECRET_SETTINGS:
+            if a.value != "-":
+                raise CliError(hub_common.EXIT_REFUSED, "a secret is never taken from the command line: "
+                                                         "run `edr-hub settings set %s -` and type or pipe the value" % a.key)
+            return set_secret(a.key)
+        value = sys.stdin.read().rstrip("\n") if a.value == "-" else a.value
+        res = call("settings.set", {"key": a.key, "value": value})
+        out("%s = %s" % (res["key"], c(json.dumps(res["value"]) if not isinstance(res["value"], str) else res["value"], 200)))
+        return 0
+    raise CliError(hub_common.EXIT_USAGE, "settings: unknown subcommand " + c(sub, 20))
+
+
+SECRET_CHECKS = {
+    "webhook_url": "https", "discord_url": "https", "deadman_url": "https",
+}
+
+
+def check_secret_value(key, value):
+    if value == "":
+        return
+    if len(value) > 2048 or any(ord(ch) < 32 or ord(ch) == 127 for ch in value) or value != value.strip():
+        raise CliError(hub_common.EXIT_REFUSED, "the value is too long or holds control characters or spaces at its ends")
+    if key in SECRET_CHECKS:
+        try:
+            hub_common._https_url_or_empty(value)
+        except ValueError:
+            raise CliError(hub_common.EXIT_REFUSED, "%s must be an https URL" % key)
+    if key == "ntfy_topic" and not all(ch.isalnum() or ch in "-_." for ch in value):
+        raise CliError(hub_common.EXIT_REFUSED, "ntfy_topic holds letters, digits, - _ . only")
+
+
+def set_secret(key):
+    """Write the secret into secrets.json here, then tell the hub only that KEY changed."""
+    need_root()
+    value = sys.stdin.readline().rstrip("\n") if not sys.stdin.isatty() else getpass.getpass("Value for %s: " % key)
+    check_secret_value(key, value)
+    call("status")                                          # refuse early when the hub is down
+    old_masked = (hub_common.load_settings(PATHS).get("secrets_set") or {}).get(key)
+    if old_masked:
+        call("settings.secret-changed", {"key": key, "phase": "pre"})
+        wait_for_outbox(8)
+    op_id = hub_audit.append_pending(PATHS, "secrets.write", PATHS.secrets, "started")
+    outcome = "error"
+    try:
+        try:
+            with open(PATHS.secrets, encoding="utf-8") as f:
+                current = json.load(f)
+            if not isinstance(current, dict):
+                raise ValueError("not an object")
+        except FileNotFoundError:
+            current = {}
+        except ValueError:
+            outcome = "refused"
+            raise CliError(hub_common.EXIT_REFUSED, "%s is not valid JSON; fix it by hand first" % PATHS.secrets)
+        if value:
+            current[key] = value
+        else:
+            current.pop(key, None)
+        os.makedirs(os.path.dirname(PATHS.secrets), mode=0o750, exist_ok=True)
+        hub_common.atomic_write(PATHS.secrets, json.dumps(current, indent=1, sort_keys=True) + "\n", 0o600)
+        outcome = "ok"
+    except OSError as exc:
+        raise CliError(hub_common.EXIT_FAIL, "cannot write %s: %s" % (PATHS.secrets, type(exc).__name__))
+    finally:
+        hub_audit.append_pending(PATHS, "secrets.write", PATHS.secrets, outcome, op_id=op_id)
+    if INSTALLED:
+        try:
+            if subprocess.run(["systemctl", "restart", "edr-hub-out"], timeout=60, check=False).returncode != 0:
+                sys.stderr.write("edr-hub: warning: could not restart edr-hub-out; restart it by hand\n")
+        except (OSError, subprocess.SubprocessError):
+            sys.stderr.write("edr-hub: warning: could not restart edr-hub-out; restart it by hand\n")
+    call("settings.secret-changed", {"key": key, "masked": hub_common.mask_secret(value), "phase": "post"})
+    out("%s %s" % (key, "cleared" if not value else "set (%s)" % hub_common.mask_secret(value)))
+    return 0
+
+
+def wait_for_outbox(seconds):
+    """Give edr-hub-out a moment to deliver the notice that is still waiting (best effort)."""
+    if not hub_common.enabled_channels(hub_common.load_settings(PATHS)):
+        return
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        conn = open_db()
+        try:
+            left = conn.execute("SELECT COUNT(*) FROM outbox WHERE state IN ('pending','sending') AND channel!='none'").fetchone()[0]
+        finally:
+            conn.close()
+        if not left:
+            return
+        time.sleep(0.5)
+
+
+def cmd_alert(argv):
+    if not argv or argv[0] != "test":
+        raise CliError(hub_common.EXIT_USAGE, "alert: test")
+    p = Parser(prog="edr-hub alert test")
+    p.add_argument("--channel")
+    a = p.parse_args(argv[1:])
+    res = call("alert.test", {"channel": a.channel} if a.channel else {})
+    ids = res["ids"]
+    if not ids:
+        out("no alert was queued")
+        return hub_common.EXIT_WARN
+    deadline = time.monotonic() + 15
+    rows = []
+    while True:
+        conn = open_db()
+        try:
+            rows = conn.execute("SELECT id, channel, state, attempts, last_error FROM outbox WHERE id IN (%s) ORDER BY id"
+                                % ",".join("?" * len(ids)), ids).fetchall()
+        finally:
+            conn.close()
+        if all(r["state"] in ("sent", "dead") or (r["state"] == "failed" and r["attempts"] > 0) for r in rows) or time.monotonic() > deadline:
+            break
+        time.sleep(0.5)
+    bad = False
+    for r in rows:
+        if r["channel"] == "none":
+            out("no channel is enabled: set one with `edr-hub settings set webhook_url -` or ntfy_topic")
+            bad = True
+        elif r["state"] == "sent":
+            out("%s: sent" % c(r["channel"], 20))
+        else:
+            bad = True
+            out("%s: %s (%s)" % (c(r["channel"], 20), r["state"] if r["state"] != "sending" else "not delivered yet",
+                                c(r["last_error"] or "no answer yet", 120)))
+    return hub_common.EXIT_WARN if bad else hub_common.EXIT_OK
+
+
+def cmd_reissue_cert(argv):
+    Parser(prog="edr-hub reissue-cert").parse_args(argv)
+    res = call("reissue-cert")
+    out("server certificate reissued: serial %s, SANs %s" % (c(res.get("serial"), 40), c(", ".join(map(str, res.get("sans") or [])), 200)))
+    return 0
+
+
+def cmd_agent_hash(argv):
+    if not argv or argv[0] != "add":
+        raise CliError(hub_common.EXIT_USAGE, "agent-hash: add SHA")
+    p = Parser(prog="edr-hub agent-hash add")
+    p.add_argument("sha")
+    p.add_argument("--note", default="")
+    a = p.parse_args(argv[1:])
+    res = call("agent-hash.add", {"sha256": a.sha, "note": a.note})
+    out("agent hash %s %s" % (res["sha256"][:16] + "...", "added" if res["added"] else "was already known"))
+    return 0
+
+
+def cmd_health(argv):
+    Parser(prog="edr-hub health").parse_args(argv)
+    problems = []
+    try:
+        conn = open_db()
+    except CliError as exc:
+        out("unhealthy: " + exc.message)
+        return hub_common.EXIT_FAIL
+    try:
+        now = hub_common.now_ms()
+        tick = meta(conn, "writer_tick")
+        if tick is None or not str(tick).lstrip("-").isdigit():
+            problems.append("the writer has never reported")
+        elif now - int(tick) > 30_000:
+            problems.append("the writer has not committed or idled for %d s" % ((now - int(tick)) // 1000))
+        etick = meta(conn, "engine_tick")
+        if etick is None or not str(etick).lstrip("-").isdigit():
+            problems.append("the engine has never ticked")
+        elif now - int(etick) > 60_000:
+            problems.append("the engine has not ticked for %d s" % ((now - int(etick)) // 1000))
+        cursor = meta(conn, "engine_cursor", "0")
+        cursor = int(cursor) if str(cursor).isdigit() else 0
+        row = conn.execute("SELECT received_at FROM events WHERE id > ? ORDER BY id LIMIT 1", (cursor,)).fetchone()
+        if row is not None and now - row[0] > 60_000:
+            problems.append("the engine cursor is %d s behind" % ((now - row[0]) // 1000))
+    except sqlite3.Error as exc:
+        problems.append("database error: " + c(exc, 80))
+    finally:
+        conn.close()
+    if problems:
+        out("unhealthy: " + "; ".join(problems))
+        return hub_common.EXIT_FAIL
+    out("healthy")
+    return 0
+
+
+# ---- root file operations -----------------------------------------------------------------------
+def cmd_backup(argv):
+    p = Parser(prog="edr-hub backup")
+    p.add_argument("--out")
+    a = p.parse_args(argv)
+    need_root()
+    import hub_backup
+    return hub_backup.backup(PATHS, out=a.out, scheduled=hub_audit.is_scheduled_run(), log=out)
+
+
+def cmd_restore(argv):
+    p = Parser(prog="edr-hub restore")
+    p.add_argument("file")
+    p.add_argument("--ca-key")
+    p.add_argument("--drill", action="store_true")
+    p.add_argument("--public-ip", action="append", default=[])
+    p.add_argument("--passphrase-file")
+    a = p.parse_args(argv)
+    need_root()
+    import hub_backup
+    pw = read_passphrase(a, "CA key passphrase: ") if a.ca_key else None
+    return hub_backup.restore(PATHS, a.file, ca_key=a.ca_key, ca_passphrase=pw, drill=a.drill, public_ips=a.public_ip, log=out)
+
+
+def cmd_ca_export(argv):
+    p = Parser(prog="edr-hub ca-export")
+    p.add_argument("--out")
+    p.add_argument("--passphrase-file")
+    a = p.parse_args(argv)
+    need_root()
+    import hub_backup
+    pw = read_passphrase(a, "Passphrase for the exported CA key (keep it offline): ", confirm=True)
+    return hub_backup.ca_export(PATHS, pw, out=a.out, log=out)
+
+
+COMMANDS = {
+    "status": cmd_status, "host": cmd_host, "events": cmd_events, "incidents": cmd_incidents,
+    "incident": cmd_incident, "resolve": cmd_resolve, "ack": cmd_ack, "token": cmd_token,
+    "ui-login": cmd_ui_login, "never-ban": cmd_never_ban, "settings": cmd_settings, "alert": cmd_alert,
+    "audit": cmd_audit, "backup": cmd_backup, "restore": cmd_restore, "ca-export": cmd_ca_export,
+    "reissue-cert": cmd_reissue_cert, "health": cmd_health, "agent-hash": cmd_agent_hash,
+}
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        sys.stdout.write(USAGE)
+        return 0 if argv else hub_common.EXIT_USAGE
+    if argv[0] == "--version":
+        out("edr-hub " + hub_common.VERSION)
+        return 0
+    handler = COMMANDS.get(argv[0])
+    if handler is None:
+        sys.stderr.write("edr-hub: unknown command %s\n%s" % (c(argv[0], 40), USAGE))
+        return hub_common.EXIT_USAGE
+    try:
+        return handler(argv[1:])
+    except CliError as exc:
+        sys.stderr.write("edr-hub: %s\n" % c(exc.message, 400))
+        return exc.code
+    except BrokenPipeError:
+        return 0
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,6 @@
+# Hub CA profile (PLAN.md section 2, CA and certificates). EC P-384, SHA-384, 10 years.
+# Explicit on purpose: openssl defaults differ between 3.0 and 3.5.
+basicConstraints = critical,CA:TRUE,pathlen:0
+keyUsage = critical,keyCertSign,cRLSign
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid:always

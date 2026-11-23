@@ -1,0 +1,6 @@
+# Client certificate profile. EC P-256, 365 days. No subjectAltName: identity is the CN (the host UUID).
+basicConstraints = critical,CA:FALSE
+keyUsage = critical,digitalSignature
+extendedKeyUsage = clientAuth
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid:always

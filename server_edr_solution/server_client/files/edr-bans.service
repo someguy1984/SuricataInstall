@@ -1,0 +1,53 @@
+# Applies /run/edr-agent/bans.json to nftables table "inet edr" (client PLAN section 4.2).
+# A small root oneshot with fixed input and output. It fails open: a timeout or a failure
+# leaves the site and the network up, and every ban entry expires by its own timeout.
+[Unit]
+Description=Apply the edr-agent ban state to nftables (table inet edr)
+Documentation=file:///usr/local/lib/edr-agent/PLAN.md
+After=nftables.service
+Before=network-pre.target
+# A burst of bans would hit 5 starts in 10 s and fail this unit, then the path unit
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I /usr/local/lib/edr-agent/edr-bans
+# Loading local bans at boot takes under 2 s; the timer applies feeds after boot
+TimeoutStartSec=10
+User=root
+Group=edr-agent
+UMask=0027
+LogNamespace=edr
+Nice=10
+CapabilityBoundingSet=CAP_NET_ADMIN
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+RestrictAddressFamilies=AF_NETLINK AF_UNIX
+IPAddressDeny=any
+StateDirectory=edr-bans
+StateDirectoryMode=0700
+RuntimeDirectory=edr-bans
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+# Starting value: set it after the VM test measures an apply with 200k feed entries
+MemoryMax=1G
+TasksMax=32
+LimitCORE=0
+
+[Install]
+WantedBy=multi-user.target
