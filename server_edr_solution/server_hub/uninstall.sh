@@ -453,7 +453,9 @@ systemctl reset-failed edr-hub-fw-rollback.service edr-hub-install.service 2>/de
 for unit in edr-hub-ui edr-hub-out edr-hub edr-hub-ca; do
     systemctl disable --now "$unit.service" 2>/dev/null || true
 done
-systemctl disable --now edr-hub-clients.path edr-hub-clients.timer 2>/dev/null || true
+# one unit a call: systemd 255 does nothing for the whole list when one unit file is missing
+systemctl disable --now edr-hub-clients.path 2>/dev/null || true
+systemctl disable --now edr-hub-clients.timer 2>/dev/null || true
 systemctl stop edr-hub-clients.service edr-hub-failed.service 2>/dev/null || true
 echo "Stopped (clients spool and retry meanwhile)"
 
@@ -559,7 +561,7 @@ for p in "$PORT" "$ENROLL_PORT" "$UI_PORT"; do
     fi
 done
 if [[ $listening -eq 0 ]]; then echo "PASS: nothing listens on $PORT, $ENROLL_PORT and $UI_PORT"; else fail=1; fi
-units=$({ systemctl list-unit-files --no-legend 'edr-hub*' 2>/dev/null; systemctl list-units --all --no-legend 'edr-hub*' 2>/dev/null; } | awk 'NF {print $1}' | sort -u)
+units=$({ systemctl list-unit-files --no-legend 'edr-hub*' 2>/dev/null; systemctl list-units --all --plain --no-legend 'edr-hub*' 2>/dev/null; } | awk 'NF {print $1}' | sort -u)
 if [[ -n $units ]]; then
     echo "FAIL: edr-hub units remain:"; sed 's/^/  /' <<<"$units"; fail=1
 else

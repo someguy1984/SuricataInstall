@@ -151,7 +151,7 @@ written in the style of the existing ones.
   non-empty `unconsumed_tail` is 413 (a 1 GiB bomb gzips to about 1 MiB, tested). A stream that has not reached `eof`
   (truncated) or has non-empty `unused_data` is 400. `RecursionError`, `ValueError` and
   `UnicodeDecodeError` while parsing are 400.
-- **Why these numbers (arithmetic, Python 3.14; re-measure on 3.12).** A legitimate batch is at most 3 MiB inflated
+- **Why these numbers (arithmetic, Python 3.14; not re-measured on 3.12, where `hub_flood.py` passes all 30 checks).** A legitimate batch is at most 3 MiB inflated
   (the client cuts a batch at 500 events or 3 MiB inflated, whichever comes first). Pre-auth: 64 slots x 8 KiB of headers = 0.5 MiB. Parsing: 4 x (1 MiB compressed + 3 MiB inflated +
   about 24 MiB of `json.loads` for 3 MiB of tiny objects) = about 112 MiB worst case. Base: about 25 MiB of Python,
   20 MiB of SQLite cache, about 65 MiB of thread stacks: about 220 MiB in all, under `MemoryHigh=400M` and
@@ -194,7 +194,8 @@ Bodies, status codes and the client's action for each status: Appendix A.
   never a claimed `ips` value. Rules that count hosts count distinct certificate CNs (§4).
 - **Rate limits** are keyed on the certificate CN.
   - LOW and INFO: a token bucket per host (`rate_low_per_hour`, §14), set above the client's 12,000 an hour ceiling (client §4.5). Over budget the batch is still accepted
-    and the excess is only counted (reply `dropped_low=N`). Flood protection is the client's budget (client §4.5).
+    and the excess is only counted (reply `dropped_low=N`). Flood protection is the client's budget (client §4.5). The buckets
+    are in memory and start full: a hub restart gives every host a full hour's allowance again (up to `rate_low_per_hour` more LOW and INFO events, and a fresh HIGH and CRITICAL bucket), which is harmless because the client's own budget is the real limit.
   - HIGH and CRITICAL are never dropped. They have a larger bucket (`rate_high_per_hour`, §14). Over it, or with the
     writer queue full, the hub answers 429 or 503 with `Retry-After` and stores nothing; the client keeps the batch.
 - **Duplicates.** Every event has an `id`, `<epoch>:<seq>` (client Appendix B); the hub adds the host from the
@@ -225,12 +226,16 @@ extension files** (`pki/strict/{ca,srv,cli}.ext`); `openssl` defaults differ bet
 - **Why strict.** Python 3.13+ (26.04 has 3.14) makes `create_default_context()` strict, and a plain
   `openssl req -x509` CA has no keyUsage and is refused. 3.12 (24.04) is lenient, so the hub and every client set
   `VERIFY_X509_STRICT` explicitly and never clear it. A no-EKU certificate passes as a client certificate, so
-  both EKUs are required.
+  both EKUs are required (the hub signs only the two profiles; a test pins that a leaf of the CA without an EKU does
+  pass the handshake, which is why the issuing profile carries the EKU).
 - **How checked.** On Python 3.14.4 with OpenSSL 3.5.5 these profiles pass `openssl verify -x509_strict` and TLS 1.3
   mutual handshakes both ways; a no-keyUsage CA, a CN-only or DNS-only server certificate and a wrong EKU fail.
   On Python 3.12.3 with OpenSSL 3.0.13 the unit tests (`make unit-2404`) issue both profiles, verify them with
-  `openssl verify -x509_strict` and handshake with both certificate types, and pass; the "no-EKU certificate is not
-  accepted" row has not been run on 3.12. OpenSSL 3.0 differs from 3.5 in three ways the code handles: `x509 -new`
+  `openssl verify -x509_strict` and handshake with both certificate types, and pass. The §12 row "a no-EKU certificate
+  is not accepted as a client certificate" cannot hold at the TLS layer on either version (OpenSSL reads a missing EKU as
+  any purpose); `test_pki.HandshakeTest` pins what does hold on both: the issued client certificate carries `clientAuth`
+  only, the server certificate `serverAuth` only and is refused as a client certificate, and a no-EKU leaf of our CA is
+  accepted by the handshake, so it must never be issued. OpenSSL 3.0 differs from 3.5 in three ways the code handles: `x509 -new`
   has no `-not_before` (signing goes through `openssl ca -startdate`, including the self-signed CA), `req -verify`
   exits 0 after printing "verify failure" (the hub also requires the "verify OK" line), and `openssl ca` can exit 0
   without writing a certificate. The installer self-checks with `openssl verify -x509_strict`.
@@ -653,6 +658,13 @@ origins and "no fix yet". `nginx -v` cannot show a distro fix, because Ubuntu ba
 | E-mail (P3) | `EmailMessage(policy=policy.SMTP)` (raises on CR or LF in a header); plain text; fixed subject plus validated host name; SMTPS or STARTTLS, `ssl.create_default_context()` |
 | All HTTP | https only, default verification (`--webhook-ca` adds a private CA; no off switch), redirects refused |
 
+- **Which addresses the outbound worker connects to.** The name is resolved once. Addresses that are private, loopback,
+  link-local (169.254.169.254 included) or otherwise not global are dropped and never connected to; if none is left the
+  send fails with "the address is private". The rest are tried in the order the resolver returned them (an unreachable
+  AAAA record falls back to the A record), each with an equal share of what is left of the one 5 second wall-clock
+  deadline, and the certificate is checked against the host name, not the address. A connection error moves on to the
+  next address; a TLS or HTTP error does not.
+
 - **Secrets.** The webhook URL, SMTP password and ntfy token are bearer secrets. They live in
   `/etc/edr-hub/secrets.json` (root, 0600; §8 step 2), which `edr-hub-out` receives with `LoadCredential=`. The
   root CLI process writes the file directly when a secret key is set from stdin (`edr-hub settings set webhook_url -`),
@@ -842,8 +854,8 @@ A local website, installed and running by default, separate from the client inge
 
 ## 6. CLI (`edr-hub`)
 
-    edr-hub status                          # services, DB size, hosts up/down, feed age, alert delivery,
-                                            #   backup age; prints the ui-login and incident commands
+    edr-hub status                          # services, DB size, hosts up/down, the CA SHA-256, feed age, alert
+                                            #   delivery, backup age; prints the ui-login and incident commands
     edr-hub host list [--all] | HOST show      # fleet table / one host
     edr-hub host HOST revoke | retire | mark-moved | maintenance [--for 2h | --end]
     edr-hub host UUID adopt                 # orphan UUID after a restore (§7)
@@ -933,7 +945,12 @@ on it. Reads do not use a socket: the CLI and the UI open the database read-only
 `server_hub/install.sh`, with `edr-hub` stopped, and replaces the fresh state. On the box the backup came from,
 with `/var/lib/edr-hub/ca` intact (P3: the key in `/var/lib/edr-hub-ca`), `--ca-key` may be left out: `restore` uses
 the key in place, after checking that it is the key of the `ca/ca.pem` in the backup. With no `--ca-key` and no such
-key, or with a key that does not match, it refuses with exit 3 and changes nothing. The steps:
+key, or with a key that does not match, it refuses with exit 3 and changes nothing. **The backup passphrase:**
+`restore` has no option for it (a passphrase never goes on a command line) and reads `/etc/edr-hub/backup.pass` as it
+stands. A new box wrote a new one at install, which cannot open an old backup, so before `restore` the operator puts
+the passphrase the backup was made with (kept off the box since that first install, §8 step 8) into that file (root,
+`0600`). Without it `restore` refuses (exit 3, nothing changed) and prints this instruction; the box keeps that
+passphrase afterwards, so its later backups use it too. The steps:
 1. Decrypt, check the checksum, run `quick_check` on the database.
 2. **Every token is marked invalid** (a restored database would otherwise revive redeemed ones).
 3. Reissue the hub server certificate and key (`/var/lib/edr-hub/tls/server.pem` and `server.key`) from the restored CA, with a new random serial and the SAN from the stored
@@ -944,7 +961,8 @@ key, or with a key that does not match, it refuses with exit 3 and changes nothi
 5. **Hosts enrolled after the backup** (and hosts renewed since) present a certificate the restored `hosts` table
    does not hold. Accept it only if the certificate is signed by the CA, is not in `revoked.txt`, and its
    serial is absent from the restored `hosts` table (the certificate's `notBefore` is not used). The host goes to state `orphan`: events kept,
-   no policy, no renewal, a HIGH alert, until `edr-hub host UUID adopt`. Older certificates keep the restored
+   no policy, no renewal, one HIGH alert (the `orphan` row of the rules table, raised by the engine on its next tick, with an incident;
+   the request itself writes only an audit row), until `edr-hub host UUID adopt`. Older certificates keep the restored
    state, so a host revoked before the backup stays out. A certificate issued and revoked since the backup is the
    one gap, and the serial list from step 4 covers it.
 
@@ -1295,7 +1313,10 @@ Each row of the §2 Limits table and each flood rule in §2 and §3 gets a test 
 7. Back up, restore on a second hub VM, `rehome` the client; confirm the old hub is deregistered.
 8. Uninstall both: no tables, units or ports (8443, 8444, 8450) remain, and no users unless the data was kept.
 
-Memory and timing figures in §2 were taken on Python 3.14: re-measure on 3.12 (24.04) in this flow.
+Memory and timing figures in §2 were taken on Python 3.14: re-measure on 3.12 (24.04) in this flow. What has run on 3.12.3
+(OpenSSL 3.0.13, Ubuntu 24.04 container, unprivileged user, loopback, 2026-11-24): the unit suites, `e2e_local.py`,
+`hub_flood.py`, `restore_drill_local.py` and `outage_local.py` in its default mode, all passing (`make unit-2404`,
+`--scripts`). Not run on 3.12: `outage_local.py --full`, any installer, a real 24.04 host; the figures of those runs were not kept.
 
 ---
 
@@ -1441,11 +1462,13 @@ monthly.
   or `max_db_size` (`edr-hub settings set`). The writer prunes and replays the overflow file (§3). Never delete
   `-wal` or `-shm` by hand.
 - **Corrupt:** see §3 Integrity. `systemctl stop edr-hub`, `edr-hub restore FILE` from the newest good
-  backup (§7; add `--ca-key FILE` only if `ca/` was lost too), keep the moved-aside file. Clients replay their spool. Hosts enrolled after that backup show as
+  backup (§7; add `--ca-key FILE` only if `ca/` was lost too; on a new box first put the backup's passphrase into
+  `/etc/edr-hub/backup.pass`), keep the moved-aside file. Clients replay their spool. Hosts enrolled after that backup show as
   `orphan`: check each, then `edr-hub host UUID adopt`.
 
 ### Restore drill (quarterly; schedule it yourself, nothing reminds you)
-On a scratch droplet: install the hub (§8), run `systemctl disable --now edr-hub-out`, then `edr-hub restore FILE
+On a scratch droplet: install the hub (§8), run `systemctl disable --now edr-hub-out`, put the backup's own passphrase
+into `/etc/edr-hub/backup.pass` (the install wrote a new one, §7), then `edr-hub restore FILE
 --drill --ca-key FILE` (with `edr-hub` stopped, §7). `--drill` skips the secrets, so the drill box has no webhook or
 dead-man URL, and `edr-hub-out` is off so nothing posts to them. Check hosts, the CA SHA-256 and `quick_check` in
 `edr-hub status`. Destroy the droplet.
@@ -1718,7 +1741,7 @@ table says, and caps any `Retry-After` at 1 hour.
 | 409 (`/v1/enroll`) | UUID already enrolled | Stop; the operator makes a token `--for HOST` |
 | 426 | Protocol unsupported | Keep the last policy, keep spooling, retry hourly; `check.sh` WARNs |
 | 429, 503 | Slow down | Wait `Retry-After` (at most 1 hour), retry the same batch; no header: back off as 5xx |
-| Other 5xx, timeout, refused | Hub trouble | Exponential backoff with full jitter; events cap at 5 minutes, heartbeat and policy at 60 s (client §4.5); keep spooling |
+| Other 5xx, timeout, refused | Hub trouble | Exponential backoff with full jitter; events cap at 5 minutes (1 minute while a HIGH or CRITICAL event waits), heartbeat and policy at 60 s (client §4.5); keep spooling |
 | 431, 411, 414 | Client bug | Log it, keep the previous state, retry at the normal interval; an events batch stays in the spool unsplit |
 
 - **Spool replay** sends at most one batch per second (client §4.5). After a hub restart the agent adds jitter.

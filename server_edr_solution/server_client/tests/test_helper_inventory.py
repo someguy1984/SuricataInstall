@@ -588,6 +588,10 @@ class TestPosture(InvCase):
         sev = {f["details"].get("field"): f["sev"] for f in self.findings(d, "posture")}
         self.assertEqual(sev["app_debug_true"], "HIGH")
         self.assertEqual(sev["env_perm_ok"], "MEDIUM")
+        # edr-check prints "<check>: <summary>": the summary must not say "posture" again
+        said = {f["details"].get("field"): f["summary"] for f in self.findings(d, "posture")}
+        self.assertEqual(said["env_perm_ok"], "env_perm_ok is not satisfied")
+        self.assertFalse([t for t in said.values() if t.startswith("posture")], said)
 
     def test_app_key_in_public_and_world_writable(self):
         fixture_root(self)
@@ -603,6 +607,8 @@ class TestPosture(InvCase):
         sev = {f["details"].get("field"): f["sev"] for f in self.findings(d, "posture")}
         self.assertEqual(sev["app_key_in_public"], "HIGH")
         self.assertEqual(sev["world_writable_in_webroot"], "MEDIUM")
+        self.assertEqual({f["details"].get("field"): f["summary"] for f in self.findings(d, "posture")}["world_writable_in_webroot"],
+                         "world_writable_in_webroot")
 
     def test_env_fifo_symlink_and_huge_file_are_unknown(self):
         fixture_root(self)

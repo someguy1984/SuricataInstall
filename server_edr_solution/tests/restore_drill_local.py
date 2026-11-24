@@ -24,6 +24,8 @@ Part B, `rehome` under SIGKILL (client PLAN 5):
   one chosen connection, or holds the reply of the hub, so that the rehome process is stopped at a known point in
   the sequence and is then killed there. The timed rollback of step 3 is a systemd timer that a loopback run does
   not have, so the test runs its command, `edr-agent rehome --rollback`, itself.
+  A start of the agent runs the unit's ExecStartPre= first, `edr-agent rehome-resume` (client PLAN 5, last row of the
+  rollback table), as systemd would; B6 checks that it finishes a move killed in step 7.
 """
 
 import gzip
@@ -337,6 +339,11 @@ class Agent:
         return p
 
     def start(self):
+        """What systemd does for edr-agent.service: the unit's ExecStartPre= (`rehome-resume`, run as root and allowed to
+        fail), then the agent."""
+        rc, out, err = self.cli("rehome-resume", timeout=120)
+        with open(os.path.join(BASE, "agent-%s-resume.log" % self.name), "a") as f:
+            f.write("rc %d\n%s%s\n" % (rc, out, err))
         self.proc = self.popen("run", "--foreground", log_name="agent-%s.log" % self.name)
 
     def stop(self):
@@ -930,7 +937,7 @@ def a2_after_backup():
     check(st == 200, "web2 at hub 1: policy answered %r %r" % (st, doc))
 
 
-@step("A3", "restore refusals on the new box: hub running (exit 3), a damaged file and a truncated file (exit 2), tried more than once: nothing changes")
+@step("A3", "restore refusals on the new box: hub running, no backup passphrase in place, the wrong one (exit 3, with the instruction), a damaged and a truncated file (exit 2), tried more than once: nothing changes")
 def a3_refusals():
     h2 = CTX["h2"] = Hub("h2")
     h2.set_backup_pass(BACKUP_PASS)                     # the box has the old backup passphrase: it is stored off the box
@@ -954,9 +961,26 @@ def a3_refusals():
         check(rc == want, "restore of the %s backup exited %d, not %d: %s" % (label, rc, want, tail(err + out)))
         after = tree(h2.state, h2.etc)
         check(after == before, "restore of the %s backup changed the box: %s" % (label, tree_diff(before, after)))
+    # The backup passphrase is placed by the operator (hub PLAN 7): a new box has its own, which cannot open the backup.
+    passfile = os.path.join(h2.etc, "backup.pass")
+    mine = open(passfile).read()
+    for label, setup in (("the fresh install's own passphrase", lambda: h2.set_backup_pass("the-fresh-installs-own-passphrase-0123")),
+                         ("no passphrase file", lambda: os.unlink(passfile))):
+        setup()
+        before = tree(h2.state)
+        rc, out, err = h2.cli("restore", bk, "--ca-key", cakey, "--passphrase-file", capass)
+        text = out + err
+        check(rc == 3, "restore with %s exited %d, not 3: %s" % (label, rc, tail(text)))
+        check(passfile in text and "must be the one the backup was made with" in text and "Nothing was changed" in text,
+              "restore with %s does not tell the operator to place the old passphrase: %s" % (label, tail(text, 500)))
+        check("the-fresh-installs-own" not in text, "restore printed a passphrase")
+        after = tree(h2.state)
+        check(after == before, "restore with %s changed the box: %s" % (label, tree_diff(before, after)))
+    h2.set_backup_pass(BACKUP_PASS)
+    check(open(passfile).read() == mine or BACKUP_PASS in open(passfile).read(), "the old passphrase was not put back")
     lines = h2.pending_lines()
-    check(sum(1 for x in lines if x["op"] == "restore" and x["outcome"] == "started") == 9, "pending-audit.jsonl: %r" % lines)
-    check(sum(1 for x in lines if x["op"] == "restore" and x["outcome"] in ("refused", "error")) == 9, "the outcomes of the nine attempts are not on file: %r" % lines)
+    check(sum(1 for x in lines if x["op"] == "restore" and x["outcome"] == "started") == 11, "pending-audit.jsonl: %r" % lines)
+    check(sum(1 for x in lines if x["op"] == "restore" and x["outcome"] in ("refused", "error")) == 11, "the outcomes of the eleven attempts are not on file: %r" % lines)
 
 
 @step("A4", "restore onto the new box with the backup passphrase and the exported CA key (the box has neither) exits 0 and prints what the plan lists")
@@ -1074,6 +1098,11 @@ def a9_orphan():
                 or "presented a certificate this hub did not issue" in r[0]]
     check(wait_until(orphan_alerts, 30, 1), "no HIGH alert for the orphan host in the outbox of hub 2")
     n_alerts = len(orphan_alerts())
+    payloads = [json.loads(r[0]) for r in orphan_alerts()]
+    check({p["kind"] for p in payloads} == {"hub.orphan"}, "the orphan alerts are of kinds %r, one kind (hub.orphan) expected" % sorted({p["kind"] for p in payloads}))
+    check(len({r[0] for r in orphan_alerts()}) == 1, "more than one distinct orphan alert in the outbox: %r" % [p["title"] for p in payloads])
+    check(all("no rule of its own" not in p["meaning"] and "adopt" in p["next_step"] for p in payloads),
+          "the orphan alert has no real meaning and next step: %r" % payloads[0])
     probe(a2, h2.port, "GET", "/v1/policy")
     probe(a2, h2.port, "GET", "/v1/policy")
     rows = [r for r in h2.cli_json("audit", "--since", "1d") if r["action"] == "host.orphan"]
@@ -1113,7 +1142,7 @@ def a11_secrets_and_outbox():
     check(not old_texts, "an alert from before the backup was sent again: %r" % old_texts[:1])
 
 
-@step("A12", "restore --drill: the database and CA come back, secrets.json does not, no channel is on, an alert goes nowhere; a wrong backup passphrase is refused (exit 2)")
+@step("A12", "restore --drill: the database and CA come back, secrets.json does not, no channel is on, an alert goes nowhere; a wrong backup passphrase is refused (exit 3, nothing changed, the instruction printed)")
 def a12_drill():
     h1 = need("h1")[0]
     bk, cakey, capass = need("bk1", "cakey", "capass")
@@ -1124,7 +1153,8 @@ def a12_drill():
     h3.stop()
     before = tree(h3.state, h3.etc)
     rc, out, err = h3.cli("restore", bk, "--drill", "--ca-key", cakey, "--passphrase-file", capass)
-    check(rc == 2, "a wrong backup passphrase exited %d, not 2: %s" % (rc, tail(err + out)))
+    check(rc == 3, "a wrong backup passphrase exited %d, not 3 (refused before anything changed, hub PLAN 17): %s" % (rc, tail(err + out)))
+    check("must be the one the backup was made with" in err + out, "a wrong backup passphrase did not say what to do: %s" % tail(err + out))
     check(tree(h3.state, h3.etc) == before, "a restore with the wrong backup passphrase changed the box")
     h3.set_backup_pass(BACKUP_PASS)
     rc, out, err = h3.cli("restore", bk, "--drill", "--ca-key", cakey, "--passphrase-file", capass)
@@ -1285,11 +1315,10 @@ def a18_status_ca_sha():
     if h2.proc is None or h2.proc.poll() is not None:
         h2.start_healthy(public_ip=None)
     rc, out, err = h2.cli("status")
-    if CTX["ca_sha"] in out or CTX["ca_sha"][:16] in out:
-        return
-    raise Skip("PLAN 15 says to check the CA SHA-256 in `edr-hub status` after a drill restore; status prints none (PLAN 6 does not list it "
-               "for status either). The hash is printed by restore and ca-export and is the last part of every token, so the check can be "
-               "made there. The plan and the code disagree: left for the owner")
+    lines = [l for l in out.splitlines() if l.startswith("ca:")]
+    check(len(lines) == 1, "`edr-hub status` has no ca: line: %s" % tail(out, 600))
+    check(lines[0].split()[-1] == CTX["ca_sha"], "status shows %r, the CA of the source hub is %s" % (lines[0], CTX["ca_sha"]))
+    check(CTX["ca_sha"] in CTX["restore_out"], "restore printed a different CA SHA-256 than status shows")
 
 
 # =================================================================================================
@@ -1572,7 +1601,7 @@ def b5():
     check(c.ag.cli("rehome", "--rollback")[0] == 0, "a second rollback is not a no-op")
 
 
-@step("B6", "kill in step 7 again: the plan says the next start of edr-agent repeats the cleanup")
+@step("B6", "kill in step 7 again: the next start of edr-agent repeats the cleanup (client PLAN 5, last row), and only then")
 def b6():
     c = Cycle("k6")
     c.pre()
@@ -1587,18 +1616,21 @@ def b6():
     check(wait_until(at7, 90, 0.02), "the rehome never reached step 7 (state %r)" % c.ag.rehome_state())
     c.kill()
     fs.release()
+    st = c.ag.rehome_state()
+    check(st and st["step"] == 7, "state after the kill: %r" % st)
+    check(os.path.isdir(os.path.join(c.ag.ident_dir(), st["prev"])), "the old generation is gone before the start")
+    check((c.hs.host("web1") or {}).get("state") == "active", "the old hub was told before the start")
     c.ag.stop()
-    c.ag.start()                                         # "the next start of edr-agent"
-    done = wait_until(lambda: c.ag.rehome_state() is None, 90, 2)
-    c.assert_working_at(c.dst, "after the restart")
-    if not done:
-        # leave the box in a clean state for the checks that follow
-        c.ag.cli("rehome", "--rollback")
-        c.finished()
-        raise Skip("not built: after a kill in step 7 nothing repeats the cleanup when edr-agent starts (client PLAN 5, rollback table, row 7); "
-                   "rehome.json stays, the old generation and the old hub's address stay allowed, renewal and generation cleanup stay switched "
-                   "off (uplink checks rehome_in_progress) until someone runs `edr-agent rehome --rollback`")
+    c.ag.start()                                         # "the next start of edr-agent": ExecStartPre= rehome-resume, then the agent
+    resume_log = open(os.path.join(BASE, "agent-b-resume.log")).read()
+    check(c.ag.rehome_state() is None, "rehome.json is still there after the start (resume said: %s)" % tail(resume_log))
+    check("finishing the cleanup" in resume_log, "the start did not say it finished a rehome: %s" % tail(resume_log))
     c.finished()
+    n = len(open(os.path.join(BASE, "agent-b-resume.log")).read())
+    c.ag.stop()
+    c.ag.start()                                         # and a start after that does nothing
+    check(c.ag.rehome_state() is None and c.ag.current() and c.attached() == c.dst, "a second start changed the identity")
+    check(open(os.path.join(BASE, "agent-b-resume.log")).read()[n:].strip() == "rc 0", "a second start was not silent: %s" % tail(open(os.path.join(BASE, "agent-b-resume.log")).read()[n:]))
 
 
 @step("B7", "events are delivered once: every marker written in part B is at exactly one hub exactly once; `audit verify` is 0 on A and B")
@@ -1651,6 +1683,11 @@ def main():
     global BASE
     BASE = tempfile.mkdtemp(prefix="rdrill", dir="/tmp")
     os.chmod(BASE, 0o700)
+
+    def stop(signum, frame):                            # kill, hang-up and Ctrl-C all end in the cleanup below
+        raise SystemExit(128 + signum)
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, stop)
     only = set(sys.argv[1:])
     steps = [a0, a1_backup, a2_after_backup, a3_refusals, a4_restore, a5_outcome1, a6_tokens, a7_server_cert, a8_serials,
              a9_orphan, a10_revoked_stays_out, a11_secrets_and_outbox, a12_drill, a13_rehome_to_restored, a14_original_box,

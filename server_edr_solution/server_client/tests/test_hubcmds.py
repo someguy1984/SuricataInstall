@@ -15,6 +15,7 @@ from unittest import mock
 import test_transport_pki as support
 from test_transport_pki import HubPair, err, reply, wait_for
 from edragent import bans as bm
+from edragent import cli
 from edragent import hubcmds as hc
 from edragent import identity as idn
 from edragent import spool as sp
@@ -76,7 +77,7 @@ class Case(unittest.TestCase):
 class TestRegister(unittest.TestCase):
     def test_subcommands_and_funcs(self):
         ap = parser()
-        for argv in (["enroll"], ["rehome"], ["bans"], ["unban", "--all"], ["pause"], ["resume"], ["deregister"], ["hub-net"],
+        for argv in (["enroll"], ["rehome"], ["bans"], ["unban", "--all"], ["pause"], ["resume"], ["deregister"], ["hub-net"], ["rehome-resume"],
                      ["rehome", "--rollback"], ["rehome", "--drop-spool"], ["pause", "--for", "5m"], ["unban", "198.51.100.7"]):
             a = ap.parse_args(argv)
             self.assertTrue(callable(a.func), argv)
@@ -89,6 +90,7 @@ class TestRegister(unittest.TestCase):
         self.assertIn("enroll", buf.getvalue())
         self.assertNotIn("SUPPRESS", buf.getvalue())
         self.assertFalse([l for l in buf.getvalue().splitlines() if l.strip().startswith("hub-net ")])
+        self.assertFalse([l for l in buf.getvalue().splitlines() if l.strip().startswith("rehome-resume")])
 
 
 class TestEnroll(Case):
@@ -298,6 +300,28 @@ class TestRehome(Case):
         self.assertEqual(rc, 0)
         self.assertIn("no rehome", out)
         self.assertEqual(idn.current_gen_name(self.p), "gen-1")
+
+    def test_rehome_resume_with_nothing_pending_does_nothing_and_exits_0(self):
+        rc, out, errs = run(["rehome-resume"])
+        self.assertEqual((rc, out, errs), (0, "", ""))
+        self.assertEqual(idn.current_gen_name(self.p), "gen-1")
+
+    def test_rehome_resume_finishes_a_move_killed_in_step_7(self):
+        real = idn.deregister
+        self.agent()
+
+        def killed(*a, **kw):
+            raise SystemExit("killed")
+        with mock.patch.object(idn, "deregister", killed), self.assertRaises(SystemExit):
+            run(["rehome"] + self.hubargs() + ["--token-file", self.tokfile()])
+        self.assertTrue(idn.rehome_in_progress(self.p))
+        self.assertEqual(idn.gen_numbers(self.p), [1, 2])
+        rc, out, errs = run(["rehome-resume"])
+        self.assertEqual(rc, 0, out + errs)
+        self.assertIn("finishing the cleanup", out)
+        self.assertFalse(idn.rehome_in_progress(self.p))
+        self.assertEqual((idn.current_gen_name(self.p), idn.gen_numbers(self.p)), ("gen-2", [2]))
+        self.assertIs(idn.deregister, real)
 
     def test_usage_and_refusals(self):
         rc, out, errs = run(["rehome", "--token-file", self.tokfile()])
@@ -526,13 +550,26 @@ class TestPause(Case):
         self.assertAlmostEqual(self.pause_doc()["until"], T() + 86400, delta=5)
 
     def test_bounds(self):
-        for bad in ("25h", "0s", "0", "-5m", "junk", "1d1s", "2d"):
-            try:
-                rc, out, errs = run(["pause", "--for", bad])
-            except SystemExit as e:        # Python 3.12's argparse takes "-5m" for an option and exits 2 itself
-                rc = hc.EXIT_USAGE if e.code == 2 else e.code
+        for bad in ("25h", "0s", "0", "junk", "1d1s", "2d"):
+            rc, out, errs = run(["pause", "--for", bad])
             self.assertEqual(rc, hc.EXIT_USAGE, bad)
         self.assertFalse(os.path.exists(self.p.pause_json))
+
+    def test_a_negative_duration_is_a_usage_error_on_every_python(self):
+        # through the real entry point: Python 3.12's argparse takes "-5m" for an option, 3.14 for the value
+        for argv in (["pause", "--for", "-5m"], ["pause", "--for", "-5"], ["pause", "--for=-5m"]):
+            errb = io.StringIO()
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(errb):
+                rc = cli.main(argv)
+            self.assertEqual(rc, hc.EXIT_USAGE, argv)
+            self.assertIn("--for must be a duration", errb.getvalue(), argv)
+            self.assertFalse(os.path.exists(self.p.pause_json), argv)
+
+    def test_attach_dash_values(self):
+        self.assertEqual(cli.attach_dash_values(["pause", "--for", "-5m"]), ["pause", "--for=-5m"])
+        self.assertEqual(cli.attach_dash_values(["pause", "--for", "5m"]), ["pause", "--for", "5m"])
+        self.assertEqual(cli.attach_dash_values(["pause", "--for", "-"]), ["pause", "--for", "-"])
+        self.assertEqual(cli.attach_dash_values(["pause", "--for"]), ["pause", "--for"])
 
     def test_resume_removes_the_file_and_is_idempotent(self):
         run(["pause"])

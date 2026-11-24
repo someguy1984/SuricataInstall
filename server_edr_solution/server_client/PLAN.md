@@ -219,7 +219,7 @@ key). Later, not v1: a `bpf-filter` dropping server-to-client 443 (one-sided flo
 
 - **Keep:** `ProtectSystem=strict`, `Protect*`, `Private*`, `Restrict*`, `LockPersonality`, `SystemCallArchitectures`
   (no `MemoryDenyWriteExecute`: it breaks the PCRE2 JIT). **Change:** `AmbientCapabilities=CAP_NET_RAW` only;
-  `CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN CAP_SETUID CAP_SETGID` as the starting value (the laptop file sets
+  `CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN CAP_SYS_NICE CAP_SETUID CAP_SETGID CAP_SETPCAP` plus `SupplementaryGroups=suricata` (the minimum measured in the mock with 8.0.8: Suricata changes user itself and must empty its own bounding set, and without `CAP_DAC_OVERRIDE` root reads `/etc/suricata` only through the group) as the value (the laptop file sets
   none; Suricata starts as root and needs setuid and setgid to drop to `suricata`, and af-packet may need
   `CAP_NET_ADMIN` for promiscuous mode; the VM test removes what it can and records the minimum);
   `ReadWritePaths=/var/log/suricata /var/lib/suricata /run`; keep `--user suricata`. **Delete:**
@@ -1136,7 +1136,9 @@ process tree) is P3 and needs its own bounded endpoint.
   whichever comes first), no event over 5 KiB (the client's own cap, Appendix B), over **mutual TLS 1.3** with the hub CA
   pinned and `X-EDR-Proto: 1`. The agent resolves `identity/current` once per connection and opens all files under it.
 - **Timers.** Heartbeat and `GET /v1/policy` (ETag): every 60 s with +-10% jitter and their own backoff capped at 60 s.
-  Events: backoff with full jitter capped at 5 min. A failed events POST never delays the heartbeat.
+  Events: backoff with full jitter capped at 5 min, but at 1 min while a HIGH or CRITICAL event waits in the spool (a longer
+  backoff already drawn is drawn again, within 1 min of the failed attempt, when such an event is spooled), so that after a
+  hub outage the next try, and with it the `hi` lane's drain at one batch a second, fits the 5 minutes of §10 and §11. A failed events POST never delays the heartbeat.
 - **Replay pacing.** After an outage `hi` goes first, then the rest oldest first, at most one batch a second.
 - **Clock.** `ts` is the event's own time in UTC milliseconds (nginx local times use their offset). `batch_id` is kept
   on retry and is for logs only (the hub dedups by event id); a split batch gets new ids. `sent_at` is stamped on
@@ -1224,6 +1226,7 @@ within 10 minutes" as a planned reboot (hub §4). Confirm in the VM test that th
     WatchdogSec=90
     Restart=always
     RestartSec=5
+    ExecStartPre=-+/usr/bin/python3 -I /usr/local/lib/edr-agent/edr-agent.py rehome-resume   # root: finishes a rehome killed in step 7 (§5)
     ExecStop=/usr/bin/python3 -I /usr/local/lib/edr-agent/edr-agent.py shutdown-notice
     TimeoutStopSec=5
     ExecStart=/usr/bin/python3 -I /usr/local/lib/edr-agent/edr-agent.py
@@ -1661,7 +1664,11 @@ in the transient sandbox of §4.6, allowed to reach the new hub only.
 | 3 to 4 | Restore the saved drop-in, `daemon-reload`, delete `gen-N+1` |
 | 5 | Point `current` back at the previous generation, restore the drop-in, `daemon-reload`, restart `edr-agent` |
 | 6 (timeout or timer) | Same as step 5, then report which check failed. Steps 5 and 6 can be repeated safely |
-| 7 | The move stands. The next start of `edr-agent` repeats the cleanup |
+| 7 | The move stands. The next start of `edr-agent` repeats the cleanup (root's `ExecStartPre=` runs `edr-agent rehome-resume`, which reads the state file and, at step 7 only, runs the commit again; at steps 2 to 6 it only prints that a rehome is waiting for its timer or for `rehome --rollback`) |
+
+Step 7 saves its number before it writes anything, and root takes every address from its own record, never from the
+state file in the agent's tree. A kill between the disarm in step 6 and that save still counts as step 6: the timer is
+gone, so `rehome --rollback` by the operator returns to the old hub, which has not been told yet.
 
 **Behaviour around the move:**
 - **The spool** is kept, with its ids (`<epoch>:<seq>`, no host part, Appendix B). If the new reply carries a

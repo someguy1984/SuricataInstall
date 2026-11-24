@@ -1234,6 +1234,14 @@ WRAP
     for f in edr-agent edr-check edr-uninstall; do jr file "$CURRENT_STEP" "/usr/local/sbin/$f" "$(sha256sum "/usr/local/sbin/$f" | cut -c1-64)" 0755 root:root absent - -; done
 }
 
+# The manifest copy lives in $STATE_A, and the first manifest_flush makes the directory. Whether the kit made it is
+# therefore written down before that flush: step 2 would otherwise find the directory there and record it as present,
+# and the uninstaller would say it existed before the kit. The line is filed under step 2, where ensure_dir would put it.
+make_state_dir() {
+    [[ -d $STATE_A ]] || jr dir 2 "$STATE_A" absent
+    mkdir -p "$STATE_A" 2>/dev/null || true
+}
+
 seed_local_conf() {
     local lc=$ETC_A/local.conf tmp changes=()
     if [[ -f $lc ]]; then
@@ -1572,11 +1580,22 @@ web_env_hosts() {   # host names from the .env files of the web roots: text only
     done <<<"$roots"
 }
 
+# The kit's resolved drop-in is what points the system resolver at the proxy: while it is there, the lock is in use.
+dns_lock_in_place() { [[ -e /etc/systemd/resolved.conf.d/zz-edr-doh.conf ]]; }
+
 step_8() {
     [[ $WANT_DNS -eq 1 ]] || { echo "skipped: --no-dns-lockdown"; return 0; }
-    local series ver toml toml_src work=$WORK/dns lock_ok=1 names n line i ok=0
+    local series ver toml toml_src work=$WORK/dns lock_ok=1 names n line i ok=0 u
     command -v dnscrypt-proxy >/dev/null || die "dnscrypt-proxy is not installed"
     if [[ $(readlink -f /etc/resolv.conf) != /run/systemd/resolve/stub-resolv.conf ]]; then
+        if dns_lock_in_place; then
+            # An earlier run locked DNS, so the system resolver points at the kit's proxy. Switching the proxy off
+            # below would take the site's name resolution with it: nothing is touched (the website always wins).
+            echo "WARNING: /etc/resolv.conf is no longer the systemd-resolved stub, and an earlier run locked DNS: the lock and the proxy are left as they are."
+            echo "         Make /etc/resolv.conf the stub again and run install.sh, or take the lock off by hand (PLAN section 4.7, break-glass)."
+            jr note - "DNS step skipped: /etc/resolv.conf is not the resolved stub; the earlier lock is left in place"
+            return 0
+        fi
         echo "WARNING: /etc/resolv.conf is not the systemd-resolved stub: the DNS step is skipped and nothing is locked"
         jr note - "DNS step skipped: /etc/resolv.conf is not the resolved stub"
         # local.conf must say what is true, or check.sh fails on a lock that was never built and
@@ -1585,6 +1604,16 @@ step_8() {
             conf_edit "" "dns.lockdown=off" || die "could not write [dns] lockdown = off to local.conf"
             echo "         [dns] lockdown = off is now in $ETC_A/local.conf. To lock later: make /etc/resolv.conf the stub, set it to on, run install.sh again."
         fi
+        # step 3 installed dnscrypt-proxy for this step. Its packaged units are enabled, and with the packaged
+        # configuration the service fails at every boot (seen in the mock after a reboot): they are switched off
+        # here, and a later run that does lock switches them on again.
+        # one unit a call: systemd 255 (24.04) does nothing for the whole list when one unit file is missing
+        for u in dnscrypt-proxy.socket dnscrypt-proxy.service dnscrypt-proxy-resolvconf.service; do
+            systemctl stop "$u" >/dev/null 2>&1 || true
+            systemctl disable "$u" >/dev/null 2>&1 || true
+        done
+        systemctl reset-failed dnscrypt-proxy.service >/dev/null 2>&1 || true
+        echo "         dnscrypt-proxy is installed but left switched off (its units are disabled)."
         return 0
     fi
     mkdir -p "$work"
@@ -1950,7 +1979,7 @@ jr flag - conntrack_loaded_before "$CONNTRACK_BEFORE"
 for w in "${WARNS[@]}"; do jr note - "warn: $w"; done
 for w in "${NOTES[@]}"; do jr note - "$w"; done
 STEPS_DONE=1
-mkdir -p "$STATE_A" 2>/dev/null || true
+make_state_dir
 manifest_flush running
 
 if [[ $RERUN_SAME -eq 1 ]]; then

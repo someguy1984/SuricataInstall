@@ -14,6 +14,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, HERE)
@@ -373,6 +374,80 @@ class SendTests(OutCase):
             with self.assertRaises(edr_hub_out.SendError, msg=ip):
                 edr_hub_out.resolve(ip, 443, False)
         self.assertEqual(edr_hub_out.resolve("8.8.8.8", 443, False), "8.8.8.8")
+
+    # ---- a name with several addresses (PLAN section 4: no private address is ever connected to) ----
+    @staticmethod
+    def addrinfo(*addrs):
+        """A getaddrinfo that gives these addresses for the name "localhost" and the real answer for anything else."""
+        real = socket.getaddrinfo
+
+        def fake(host, port, *a, **kw):
+            if host != "localhost":
+                return real(host, port, *a, **kw)
+            return [(socket.AF_INET6 if ":" in x else socket.AF_INET, socket.SOCK_STREAM, 6, "", (x, port)) for x in addrs]
+        return fake
+
+    def test_resolve_all_keeps_the_order_and_drops_what_is_private(self):
+        with mock.patch.object(socket, "getaddrinfo", self.addrinfo("2606:4700::1", "10.0.0.5", "8.8.8.8", "8.8.8.8", "169.254.169.254")):
+            self.assertEqual(edr_hub_out.resolve_all("localhost", 443, False), ["2606:4700::1", "8.8.8.8"])
+            self.assertEqual(edr_hub_out.resolve("localhost", 443, False), "2606:4700::1")
+            self.assertEqual(len(edr_hub_out.resolve_all("localhost", 443, True)), 4)
+        with mock.patch.object(socket, "getaddrinfo", self.addrinfo("10.0.0.5", "::1")):
+            with self.assertRaises(edr_hub_out.SendError) as cm:
+                edr_hub_out.resolve_all("localhost", 443, False)
+            self.assertEqual(str(cm.exception), "the address is private")
+        with mock.patch.object(socket, "getaddrinfo", self.addrinfo()):
+            with self.assertRaises(edr_hub_out.SendError) as cm:
+                edr_hub_out.resolve_all("localhost", 443, False)
+            self.assertEqual(str(cm.exception), "the name did not resolve")
+
+    def test_the_next_address_is_tried_when_the_first_does_not_connect(self):
+        self.serve()
+        # 127.0.0.2 has nothing listening on this port: the connection is refused and the next address is used
+        with mock.patch.object(socket, "getaddrinfo", self.addrinfo("127.0.0.2", "127.0.0.1")):
+            ok, err, _ra = edr_hub_out.http_send("POST", self.url(host="localhost"), {}, b"{}", edr_hub_out.make_context(self.ca_pem), allow_private=True)
+        self.assertEqual((ok, err), (True, ""))
+        self.assertEqual(len(self.server.requests), 1)
+
+    def test_a_private_address_is_never_the_fallback(self):
+        self.serve()
+        # the public address does not connect; the private one (where the server is) must not be tried
+        with mock.patch.object(socket, "getaddrinfo", self.addrinfo("8.8.8.8", "127.0.0.1")), \
+                mock.patch.object(socket, "create_connection", side_effect=ConnectionRefusedError) as cc:
+            ok, err, _ra = edr_hub_out.http_send("POST", self.url(host="localhost"), {}, b"{}", edr_hub_out.make_context(self.ca_pem), allow_private=False)
+        self.assertEqual((ok, err), (False, "connection refused"))
+        self.assertEqual([c.args[0][0] for c in cc.call_args_list], ["8.8.8.8"])
+        self.assertEqual(self.server.requests, [])
+
+    def test_every_address_failing_reports_the_last_error(self):
+        with mock.patch.object(socket, "getaddrinfo", self.addrinfo("127.0.0.2", "127.0.0.3")):
+            self.serve()
+            ok, err, _ra = edr_hub_out.http_send("POST", self.url(host="localhost"), {}, b"{}", edr_hub_out.make_context(self.ca_pem), allow_private=True)
+        self.assertEqual((ok, err), (False, "connection refused"))
+
+    def test_an_address_that_swallows_packets_cannot_use_up_the_whole_deadline(self):
+        self.serve()
+        real, seen = socket.create_connection, []
+
+        def blackhole_first(addr, timeout=None, *a, **kw):
+            seen.append((addr[0], timeout))
+            if addr[0] == "203.0.113.9":
+                time.sleep(timeout)
+                raise socket.timeout("timed out")
+            return real(addr, timeout, *a, **kw)
+        old = edr_hub_out.TIMEOUT_S
+        edr_hub_out.TIMEOUT_S = 2.0
+        try:
+            with mock.patch.object(socket, "getaddrinfo", self.addrinfo("203.0.113.9", "127.0.0.1")), \
+                    mock.patch.object(socket, "create_connection", blackhole_first):
+                started = time.monotonic()
+                ok, err, _ra = edr_hub_out.http_send("POST", self.url(host="localhost"), {}, b"{}", edr_hub_out.make_context(self.ca_pem), allow_private=True)
+                took = time.monotonic() - started
+        finally:
+            edr_hub_out.TIMEOUT_S = old
+        self.assertEqual((ok, err), (True, ""))
+        self.assertLessEqual(seen[0][1], 1.01)          # half of the deadline, not all of it
+        self.assertLess(took, 2.0)
 
     def test_unconfigured_or_unsupported_channels_fail_with_a_fixed_text(self):
         self.serve()

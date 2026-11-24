@@ -783,5 +783,112 @@ class TestSpoolEviction(UplinkCase):
         self.assertTrue(wait_for(lambda: u.spool.depth() == 0 and not os.path.exists(flag), 5))
 
 
+class TestHiLaneRetryCap(UplinkCase):
+    """Client PLAN 4.5 (Timers) and the P2 exit: a hub outage of any length, then every HIGH and CRITICAL event delivered
+    within 5 minutes of the hub's return. The events backoff is full jitter up to 5 minutes; while a HIGH or CRITICAL event
+    waits in the spool its cap is HI_RETRY_S (60 s), so the next try is never further off than that."""
+
+    def spooled(self, hi):
+        self.enroll_files()
+        u = self.make()
+        u._refresh_ident(force=True)
+        u.spool.append(mkev("HIGH" if hi else "LOW"))
+        return u
+
+    def draws(self, hi, seed):
+        u = self.spooled(hi)
+        u.rng.seed(seed)
+        bo = tr.Backoff(ul.EVENTS_RETRY_S, rng=u.rng)
+        for _ in range(12):                                             # the ceiling has long reached its cap
+            bo.failure()
+        return [u._retry_delay(bo) for _ in range(400)]
+
+    def test_the_cap_is_a_minute_with_a_high_event_waiting(self):
+        self.assertEqual((ul.HI_RETRY_S, ul.EVENTS_RETRY_S), (60.0, 300.0))
+        draws = self.draws(True, 11)
+        self.assertLessEqual(max(draws), 60.0)
+        self.assertGreater(max(draws), 50.0)                            # the whole range is used
+        self.assertLess(min(draws), 6.0)
+        self.assertGreater(len({round(d, 3) for d in draws}), 300)      # full jitter, not a fixed value: no stampede
+
+    def test_the_cap_stays_five_minutes_with_only_low_events_waiting(self):
+        draws = self.draws(False, 11)
+        self.assertLessEqual(max(draws), 300.0)
+        self.assertGreater(max(draws), 250.0)
+        self.assertLess(min(draws), 30.0)
+        self.assertGreater(len({round(d, 3) for d in draws}), 300)
+
+    def test_a_capped_draw_is_uniform_not_a_pile_up_at_the_cap(self):
+        u = self.spooled(True)
+        u.rng.seed(3)
+        bo = tr.Backoff(ul.EVENTS_RETRY_S, rng=u.rng)
+        for _ in range(12):
+            bo.failure()
+        draws = [u._retry_delay(bo) for _ in range(600)]
+        at_cap = sum(1 for d in draws if d >= 59.99)
+        self.assertLess(at_cap, 6)                      # clipping a 0..300 draw to 60 would put 80% of them here
+        halves = sum(1 for d in draws if d < 30.0)
+        self.assertTrue(240 < halves < 360, halves)
+
+    def test_a_high_event_spooled_during_a_long_backoff_shortens_it_once(self):
+        u = self.spooled(False)                         # a LOW event waits: the long backoff was drawn for it
+        u.rng.seed(5)
+        u._backoff_at, u._backoff_redrawn = 1000.0, False
+        u._holds["events"] = 1290.0
+        u._shorten_backoff_for_hi()
+        self.assertEqual(u._holds["events"], 1290.0)                    # no HIGH event yet: untouched
+        u.spool.append(mkev("CRITICAL", kind="tetragon.nginx-exec"))
+        u._shorten_backoff_for_hi()
+        self.assertTrue(1000.0 <= u._holds["events"] <= 1060.0, u._holds["events"])    # within a minute of the failed attempt
+        self.assertTrue(u._backoff_redrawn)
+        u._holds["events"] = 1290.0
+        u._shorten_backoff_for_hi()                                     # once: the second call does not draw again
+        self.assertEqual(u._holds["events"], 1290.0)
+
+    def test_a_hold_the_hub_asked_for_is_never_shortened(self):
+        u = self.spooled(True)
+        u._backoff_at = None                          # a Retry-After, or an hourly retry: no backoff behind it
+        u._holds["events"] = u.clock() + 1800.0
+        before = u._holds["events"]
+        u._shorten_backoff_for_hi()
+        self.assertEqual(u._holds["events"], before)
+
+    def test_a_shorter_backoff_is_kept(self):
+        u = self.spooled(False)
+        now = [50.0]
+        u.clock = lambda: now[0]
+        u._backoff_at, u._backoff_redrawn = 40.0, False
+        u._holds["events"] = 41.0
+        u.spool.append(mkev("HIGH"))
+        for seed in range(30):
+            u.rng.seed(seed)
+            u._backoff_redrawn = False
+            u._holds["events"] = 41.0
+            u._shorten_backoff_for_hi()
+            self.assertLessEqual(u._holds["events"], 41.0)
+
+    def test_after_the_hub_returns_a_high_event_goes_at_the_capped_pace(self):
+        """Six refusals would, at the old 300 s cap, put the next try tens of seconds away; with a HIGH event waiting
+        and the cap shrunk to 0.3 s for the test, the event is at the hub within seconds."""
+        self.enroll_files()
+        n = {"c": 0}
+        orig = self.hubs._fleet_handler
+
+        def down(req):
+            if req.path == "/v1/events":
+                n["c"] += 1
+                if n["c"] <= 6:
+                    return err(503, "busy")
+            return orig(req)
+        self.hubs.fleet.handler = down
+        with mock.patch.object(ul, "HI_RETRY_S", 0.3):
+            u = self.make()
+            u.rng.seed(2)
+            u.start()
+            u.submit(mkev("CRITICAL", kind="tetragon.nginx-exec", summary="boom"))
+            self.assertTrue(wait_for(lambda: len(self.sent()) == 1, 8))
+        self.assertEqual(n["c"], 7)
+
+
 if __name__ == "__main__":
     unittest.main()

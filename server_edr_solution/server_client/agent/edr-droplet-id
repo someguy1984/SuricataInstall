@@ -12,12 +12,21 @@ certificate reports two ids.
                      (/var/lib/edr-agent/droplet-id: written at install, or from --droplet-id on hosts
                      that are not droplets) is written. Failing open: the identity stays.
 
-Usage    edr-droplet-id [--root DIR] [--dry-run] [--metadata HOST:PORT] [--timeout SECONDS]
+The unit runs this twice. First `--seed`, as full root and outside the sandbox (ExecStartPre=+): it makes
+/run/edr-droplet-id (root:edr-agent 0640) and, when that holds no id, copies the stored one into it. It never
+touches the network. Then the sandboxed run, which has no capability: it asks the metadata service and, when
+that is silent, keeps what the file holds. The stored id is read by the first run because /var/lib/edr-agent
+is the agent's own directory (edr-agent, 0700), which root without capabilities cannot enter: on the first
+reboot in the mock the file came back empty.
+
+Usage    edr-droplet-id [--root DIR] [--dry-run] [--metadata HOST:PORT] [--timeout SECONDS] [--seed]
          --metadata   another address for the metadata service (tests); default 169.254.169.254:80
+         --seed       no network: make the output file and fill it from the stored id if it holds none
 Python standard library only, run as: python3 -I edr-droplet-id
 """
 
 import configparser
+import grp
 import http.client
 import json
 import os
@@ -222,20 +231,60 @@ def write_id(path, text):
         os.close(fd)
 
 
+def valid_id(text):
+    text = (text or "").strip()
+    return text if text and ID_RE.fullmatch(text) else ""
+
+
+def seed(env):
+    """The unsandboxed first run: the output file exists afterwards, and holds the stored id if it held none."""
+    out = env.p(OUT)
+    try:
+        fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o640)
+    except OSError as e:
+        env.log("cannot make %s: %s" % (OUT, clean(e, 80)))
+        return 1
+    try:
+        os.fchmod(fd, 0o640)
+        if not env.root:
+            try:
+                os.fchown(fd, 0, grp.getgrnam("edr-agent").gr_gid)
+            except (KeyError, OSError) as e:
+                env.log("cannot give %s to group edr-agent: %s" % (OUT, clean(e, 80)))
+    finally:
+        os.close(fd)
+    if valid_id(read_text(env, OUT, 128, one_link=False)):
+        return 0
+    stored = valid_id(read_text(env, STORED, 128, one_link=True))
+    if not stored:
+        return 0
+    try:
+        write_id(out, stored + "\n")
+    except OSError as e:
+        env.log("cannot write %s: %s" % (OUT, clean(e, 80)))
+        return 1
+    env.log("droplet id seeded from the stored value")
+    return 0
+
+
 def main(argv):
     env, files_dir, rest = parse_common(argv)
-    addr, timeout, i = "169.254.169.254:80", 2.0, 0
+    addr, timeout, i, seed_only = "169.254.169.254:80", 2.0, 0, False
     while i < len(rest):
         if rest[i] == "--metadata" and i + 1 < len(rest):
             addr = rest[i + 1]; i += 2
         elif rest[i] == "--timeout" and i + 1 < len(rest):
             timeout = float(rest[i + 1]); i += 2
+        elif rest[i] == "--seed":
+            seed_only = True; i += 1
         else:
-            print("usage: edr-droplet-id [--root DIR] [--dry-run] [--metadata HOST:PORT]", file=sys.stderr)
+            print("usage: edr-droplet-id [--root DIR] [--dry-run] [--metadata HOST:PORT] [--seed]", file=sys.stderr)
             return 2
     if not env.root and os.geteuid() != 0 and not env.dry:
         print("edr-droplet-id: must run as root", file=sys.stderr)
         return 2
+    if seed_only:
+        return 0 if env.dry and not env.root else seed(env)
     did = fetch(addr, timeout)
     source = "metadata"
     if did is None:

@@ -8,10 +8,13 @@ Requires=mock-tls.service
 
 [Service]
 DynamicUser=yes
-# the key is root-only; hand a copy to the dynamic user through a credential
-LoadCredential=hub.key:/etc/ssl/mock/hub.key
+# The key is root-only: a root command (the "+") copies it into the unit's runtime directory for the dynamic user.
+# (LoadCredential did this before; under rootless Docker with systemd 255, Ubuntu 24.04, the credential directory
+# stays empty and the placeholder never starts.)
+RuntimeDirectory=mock-hub-placeholder
+ExecStartPre=+/bin/sh -c 'install -m 0400 -o "$(stat -L -c %%u /run/mock-hub-placeholder)" /etc/ssl/mock/hub.key /run/mock-hub-placeholder/hub.key'
 ExecStart=/usr/bin/openssl s_server -quiet -accept 8443 -tls1_3 -www \
-    -cert /etc/ssl/mock/hub.crt -key ${CREDENTIALS_DIRECTORY}/hub.key
+    -cert /etc/ssl/mock/hub.crt -key /run/mock-hub-placeholder/hub.key
 Restart=on-failure
 NoNewPrivileges=yes
 ProtectSystem=strict

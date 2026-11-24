@@ -356,6 +356,37 @@ class HandshakeTest(PkiBase):
         self.assertNotEqual(out.returncode, 0)
 
 
+    def eku(self, pem_path):
+        r = subprocess.run(["openssl", "x509", "-noout", "-ext", "extendedKeyUsage", "-in", pem_path], capture_output=True, text=True)
+        return r.stdout
+
+    def test_no_eku_certificate_is_not_something_the_hub_issues_and_the_tls_layer_does_not_stop_it(self):
+        """Section 12 row "a no-EKU certificate is not accepted as a client certificate", as it really is. OpenSSL reads a
+        missing EKU as "any purpose", so a leaf of our CA without one passes the handshake (section 2 says so). What keeps it
+        out is that the hub issues only the profile with clientAuth, and a server certificate (serverAuth) is refused as a
+        client certificate (test above). This test pins all three, so a change in either library shows up."""
+        self.assertIn("TLS Web Client Authentication", self.eku(self.client_path))
+        self.assertNotIn("Server Authentication", self.eku(self.client_path))
+        self.assertIn("TLS Web Server Authentication", self.eku(self.paths.server_cert))
+        self.assertNotIn("Client Authentication", self.eku(self.paths.server_cert))
+        d = tempfile.mkdtemp(dir=self.tmp)
+        key, csr = F.make_key_and_csr(d)
+        pub_path = os.path.join(d, "pub.pem")
+        with open(pub_path, "wb") as f:
+            f.write(F.openssl("req", "-noout", "-pubkey", stdin=csr.encode()))
+        ext = os.path.join(d, "noeku.cnf")
+        with open(ext, "w") as f:
+            f.write("basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\n"
+                    "subjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid:always\n")
+        leaf = os.path.join(d, "noeku.pem")
+        F.openssl("x509", "-new", "-force_pubkey", pub_path, "-subj", "/CN=" + UUID, "-CA", self.paths.ca_cert, "-CAkey",
+                  self.paths.ca_key, "-extfile", ext, "-days", "30", "-out", leaf)
+        self.assertEqual(self.eku(leaf).strip(), "")
+        out, cerr = self.handshake(self.server_ctx(), self.client_ctx(cert=leaf, key=key))
+        self.assertIsNone(cerr)
+        self.assertEqual(out["peer"]["subject"][0][0][1], UUID)
+
+
 class RevokedFileTest(PkiBase):
     def test_append_load_and_first_reason_stays(self):
         d = tempfile.mkdtemp(dir=self.tmp)

@@ -1142,23 +1142,27 @@ def finish_commit(paths, ops, st, *, log=None, requester=None, lib_dir=None):
     if new is None:
         log("the new identity is gone; cannot finish the rehome")
         return 2
+    # The state is saved first: from here on every start of edr-agent finishes the move (PLAN 5, row 7), so a kill
+    # before the host-id is written, or between any two of the writes below, never leaves the old identity half undone.
+    st["step"] = 7
+    _save_state(paths, st)
     if st.get("new_host_uuid") and read_host_id(paths) != st["new_host_uuid"]:
         write_host_id(paths, st["new_host_uuid"])
     if st.get("droplet_id"):
         write_stored_droplet_id(paths, st["droplet_id"])
-    st["step"] = 7
-    _save_state(paths, st)
+    # The addresses come from root's own record only. rehome.json sits in the agent's tree, and a start of the agent now
+    # runs this as root, so a state file the agent rewrote must never choose what the drop-in allows. After the record
+    # was committed (no rehome section) its plain address list is the new hub's.
     trusted = read_trusted(paths) or {}
     rh = trusted.get("rehome")
-    new_addrs = (rh["new"] if rh else None) or _clean_addresses(st.get("new_addresses")) or []
-    old_addrs = (rh["old"] if rh else None) or _clean_addresses(st.get("old_addresses")) or []
+    new_addrs = (rh["new"] if rh else trusted.get("addresses")) or []
+    old_addrs = (rh["old"] if rh else None) or []
     if not new_addrs:
         log("root holds no validated address list for the new hub: the drop-in is left as it is")
         return 2
     prev = load_gen(paths, st["prev"])
-    if prev is not None and not st.get("deregistered"):
-        if old_addrs:
-            prev.addresses = old_addrs                  # root dials the addresses it validated, not the ones in hub.conf
+    if prev is not None and not st.get("deregistered") and old_addrs:
+        prev.addresses = old_addrs                      # root dials the addresses it validated, not the ones in hub.conf
         oc = deregister(paths, "rehome", ident=prev, timeout=5.0, requester=requester)
         log("old hub deregister: %s" % (oc.action if oc else "skipped"))
         st["deregistered"] = True
@@ -1167,12 +1171,34 @@ def finish_commit(paths, ops, st, *, log=None, requester=None, lib_dir=None):
     write_trusted(paths, new_addrs)
     ops.daemon_reload()
     shutil.rmtree(gen_path(paths, int(GEN_RE.match(st["prev"]).group(1))), ignore_errors=True)
-    for f in ("rehome.json", "rehome-dropin.saved"):
+    for f in ("rehome-dropin.saved", "rehome.json"):                    # the state file last: a kill before it leaves a start to finish
         try:
             os.unlink(os.path.join(identity_dir(paths), f))
         except OSError:
             pass
     return 0
+
+
+def resume(paths, ops, *, log=None, requester=None):
+    """What a start of edr-agent does about a rehome left on disk (PLAN 5, last row of the rollback table).
+
+    Run by root before each start (`edr-agent rehome-resume`, the unit's ExecStartPre). A rehome killed in step 7 has
+    moved: the next start repeats the cleanup. One killed earlier is not touched here: the timer of step 3 or the
+    operator's `rehome --rollback` ends it. Returns 'none', 'pending' (earlier than step 7), 'finished' or 'failed'."""
+    log = log or (lambda m: None)
+    if not rehome_in_progress(paths):
+        return "none"
+    st = load_rehome_state(paths)
+    if st is None:
+        return "pending"                                            # a state file nobody can read: left for `rehome --rollback`
+    if st.get("step", 0) < 7:
+        log("a rehome is waiting at step %s: its 10-minute timer or `edr-agent rehome --rollback` ends it" % st.get("step", "?"))
+        return "pending"
+    if current_gen_name(paths) != st["new"]:                        # root never acts on a state file that does not match the disk
+        log("rehome.json does not match the current identity: left as it is")
+        return "failed"
+    log("a rehome was interrupted after the move: finishing the cleanup")
+    return "finished" if finish_commit(paths, ops, st, log=log, requester=requester) == 0 else "failed"
 
 
 def rollback(paths, ops, *, log=None, lib_dir=None):
@@ -1211,10 +1237,11 @@ def rollback(paths, ops, *, log=None, lib_dir=None):
     dropin_moved = step >= 4 or (bool(old_addrs) and sorted(dropin_addresses(ops.read_dropin())) != sorted(old_addrs))
     if flipped and prev is not None:
         attempt("point current back", flip_current, paths, st["prev"])
+    if old_addrs:
+        attempt("update root's address record", write_trusted, paths, old_addrs)      # drops its "rehome" section too
     if dropin_moved:
         if old_addrs:
             attempt("restore the drop-in", ops.write_dropin, old_addrs)
-            attempt("update root's address record", write_trusted, paths, old_addrs)
         attempt("daemon-reload", ops.daemon_reload)
     if flipped:
         attempt("restart edr-agent", ops.restart_agent)

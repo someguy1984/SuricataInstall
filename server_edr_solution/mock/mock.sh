@@ -1,5 +1,5 @@
 #!/bin/bash
-# Drive the server_edr_solution mock environment (two Ubuntu 26.04 "droplets" on a private network).
+# Drive the server_edr_solution mock environment (two Ubuntu "droplets" on a private network; 26.04, or 24.04).
 #
 #   ./mock.sh up            build images and start; waits until both boxes are healthy
 #   ./mock.sh test          smoke test; exits non-zero if anything fails
@@ -8,14 +8,17 @@
 #   ./mock.sh logs hub|web  follow that box's journal
 #   ./mock.sh down [--volumes]   stop and remove (--volumes also forgets the mock certificates)
 #
-# With the real installers (first run 2026-11-24: see README.md, "First run"), in this order:
+# With the real installers (see README.md, "Runs so far"), in this order:
 #   ./mock.sh dist          make dist on this machine; copy the tarballs and their hashes into the boxes
 #   ./mock.sh install-hub   disable the placeholder; unpack, check the hash, install.sh --plan, install.sh --yes
 #   ./mock.sh install-web   the client in local mode (MOCK_SURICATA=1 adds Suricata; MOCK_WEB_FLAGS="..." adds flags)
 #   ./mock.sh enroll        token on the hub box, carried in a file to the web box, edr-agent enroll
+#   ./mock.sh reboot        restart both boxes; the units, tables and heartbeat must come back (run before e2e)
 #   ./mock.sh e2e           the end-to-end checks, each PASS or FAIL; exits non-zero on any FAIL
 #   ./mock.sh uninstall     both uninstallers, then the residue checks; puts the placeholder back
 #
+#   MOCK_UBUNTU=24.04 ./mock.sh ...   both boxes on Ubuntu 24.04 (nginx 1.24, PHP 8.3, Python 3.12) instead of 26.04;
+#                                give the same value to every subcommand. One release runs at a time.
 #   MOCK_CAPS=1 ./mock.sh ...    the boxes without `privileged` (compose.caps.yaml; not boot-tested yet)
 #   MOCK_HTTP_PORT=18080 MOCK_HTTPS_PORT=18443 ./mock.sh ...   publish the site on other loopback ports
 #                                (when 80 or 443 is taken here; give the same values to every subcommand)
@@ -38,6 +41,14 @@ if [[ ${MOCK_CAPS:-0} == 1 ]]; then COMPOSE+=(-f compose.caps.yaml); fi
 dc() { docker compose "${COMPOSE[@]}" "$@"; }
 
 export MOCK_HTTP_PORT=${MOCK_HTTP_PORT:-80} MOCK_HTTPS_PORT=${MOCK_HTTPS_PORT:-443}   # compose.yaml reads them
+# The release of both boxes. NGINX_FIXED is that release's USN-9159-1 build (client plan, Appendix A.2).
+export MOCK_UBUNTU=${MOCK_UBUNTU:-26.04}
+case $MOCK_UBUNTU in
+    26.04) : "${MOCK_PHP:=8.5}"; NGINX_FIXED=1.28.3-2ubuntu1.13 ;;
+    24.04) : "${MOCK_PHP:=8.3}"; NGINX_FIXED=1.24.0-2ubuntu7.20 ;;
+    *) echo "mock: MOCK_UBUNTU is 26.04 or 24.04, not '$MOCK_UBUNTU'" >&2; exit 2 ;;
+esac
+export MOCK_PHP
 REPO=$(cd ../.. && pwd)          # the repository root: `make dist` runs there, on this machine
 HUB_IP=10.77.0.10
 HUB_PORT=8443
@@ -97,9 +108,9 @@ run_tests() {
     echo "== web.dev.local from this machine (loopback-published ports $MOCK_HTTP_PORT and $MOCK_HTTPS_PORT)"
     local http="http://web.dev.local:$MOCK_HTTP_PORT" https="https://web.dev.local:$MOCK_HTTPS_PORT"
     local rh="web.dev.local:$MOCK_HTTP_PORT:127.0.0.1" rs="web.dev.local:$MOCK_HTTPS_PORT:127.0.0.1"
-    check "$http serves the PHP 8.5 hello page" \
+    check "$http serves the PHP $MOCK_PHP hello page" \
         bash -c 'p=$(curl -fsS --max-time 10 --resolve "$1" "$2/") &&
-                 grep -q "Hello, world" <<<"$p" && grep -q "PHP 8\.5\." <<<"$p" && grep -q "plain HTTP" <<<"$p"' _ "$rh" "$http"
+                 grep -q "Hello, world" <<<"$p" && grep -qF "PHP $3." <<<"$p" && grep -q "plain HTTP" <<<"$p"' _ "$rh" "$http" "$MOCK_PHP"
     check "$https serves it over TLS with HTTP/2" \
         bash -c 'p=$(curl -fsSk --http2 --max-time 10 --resolve "$1" "$2/") &&
                  grep -q "HTTPS, HTTP/2.0" <<<"$p"' _ "$rs" "$https"
@@ -110,12 +121,12 @@ run_tests() {
         bash -c '[[ $(curl -s -o /dev/null -w "%{http_code}" --resolve "$1" "$2/.env") == 403 ]]' _ "$rh" "$http"
 
     echo "== inside the web box"
-    check "Ubuntu 26.04" dc exec -T web grep -q 'VERSION_ID="26.04"' /etc/os-release
+    check "Ubuntu $MOCK_UBUNTU" dc exec -T web grep -q "VERSION_ID=\"$MOCK_UBUNTU\"" /etc/os-release
     check "systemd is PID 1 and the system is running" \
         dc exec -T web bash -c '[[ $(ps -o comm= -p 1) == systemd ]] && [[ $(systemctl is-system-running --wait) == running ]]'
-    check "php-fpm 8.5 and nginx active" dc exec -T web systemctl is-active --quiet php8.5-fpm nginx
-    check "nginx package is the USN-9159-1 fixed build or newer (NGINX2Root)" \
-        dc exec -T web bash -c 'v=$(dpkg-query -W -f="\${Version}" nginx) && dpkg --compare-versions "$v" ge 1.28.3-2ubuntu1.13'
+    check "php-fpm $MOCK_PHP and nginx active" dc exec -T web systemctl is-active --quiet "php$MOCK_PHP-fpm" nginx
+    check "nginx package is the USN-9159-1 fixed build or newer (NGINX2Root): $NGINX_FIXED" \
+        dc exec -T web bash -c 'v=$(dpkg-query -W -f="\${Version}" nginx) && echo "installed: $v" && dpkg --compare-versions "$v" ge "$1"' _ "$NGINX_FIXED"
 
     echo "== private network (edr_vpc, 10.77.0.0/24)"
     check "web reaches the hub placeholder at 10.77.0.10:8443 over TLS 1.3" \
@@ -288,9 +299,11 @@ append_tetragon_line() {   # append_tetragon_line BINARY
 }
 
 # Tetragon cannot run in a box, so install-web passes --no-tetragon and the agent's Tetragon reader is off.
-# For the replay it is switched on by hand: the log directory as the installer's step 7 makes it, the key in
-# local.conf, and a restart (the agent's unit binds /var/log/tetragon when it starts, and the reader begins at
-# the end of the log). tetragon_replay off puts the key back, so edr-check has no Tetragon to miss.
+# For the replay the reader alone is switched on by hand: the log directory as the installer's step 7 makes it,
+# the key in local.conf, and a restart (the agent's unit binds /var/log/tetragon when it starts, and the reader
+# begins at the end of the log). `edr-agent apply-config` is not run: with the key on it would render the
+# policies and call tetra, which is not there. tetragon_replay off puts the key back, so edr-check has no
+# Tetragon to miss.
 tetragon_replay() {   # tetragon_replay on|off
     local from=off to=on
     [[ $1 == on ]] || { from=on; to=off; }
@@ -299,10 +312,11 @@ tetragon_replay() {   # tetragon_replay on|off
         [[ -e /var/log/tetragon/tetragon.log ]] || install -m 0640 -o root -g edr-agent /dev/null /var/log/tetragon/tetragon.log
         sed -i "s/^tetragon = $1\$/tetragon = $2/" /etc/edr-agent/local.conf
         grep -qx "tetragon = $2" /etc/edr-agent/local.conf
-        edr-agent apply-config >/dev/null
+        before=$(systemctl show edr-agent -p MainPID --value)
         systemctl restart edr-agent
         for i in $(seq 30); do systemctl is-active --quiet edr-agent && break; sleep 1; done
-        systemctl is-active --quiet edr-agent' _ "$from" "$to"
+        systemctl is-active --quiet edr-agent
+        [[ $(systemctl show edr-agent -p MainPID --value) != "$before" ]]' _ "$from" "$to" || return 1
     sleep 5   # the reader opens the log a moment after the unit is active
 }
 tripwire_request() { hubx curl -s -o /dev/null --max-time 10 http://web.dev.local/.env || true; }
@@ -341,6 +355,16 @@ run_e2e() {
     tripwire_request
     check "the tripwire request for /.env is a canary.tripwire event in edr-hub events --json" \
         wait_ok 120 hub_has_event canary.tripwire "" ".env"
+    if [[ ${MOCK_SURICATA:-0} == 1 ]]; then
+        # Plain HTTP for a path an Emerging Threats rule alerts on (Langflow auto-login, CVE-2026-9198). It is sent
+        # from this machine through the published port, so it arrives on the box's default-route interface: that is
+        # the one interface Suricata watches (the "public" one of a droplet). A request from the hub box arrives
+        # on the private network and is not seen.
+        curl -s -o /dev/null --max-time 10 --resolve "web.dev.local:$MOCK_HTTP_PORT:127.0.0.1" \
+            "http://web.dev.local:$MOCK_HTTP_PORT/api/v1/auto_login" || true
+        check "Suricata in the web box alerts on a request and the hub stores a suricata.alert event" \
+            wait_ok 120 hub_has_event suricata.alert "" ""
+    fi
     check "the agent's Tetragon reader is switched on for the replay" tetragon_replay on
     append_tetragon_line "$marker"
     check "the recorded Tetragon line is a CRITICAL tetragon.nginx-exec event" \
@@ -352,6 +376,65 @@ run_e2e() {
     tripwire_request
     check "edr-agent status shows host_revoked and a spool with at least one event" wait_ok 150 agent_revoked_and_spooling
     check "the Tetragon reader is switched off again" tetragon_replay off
+
+    echo
+    echo "mock: $pass passed, $fail failed"
+    ((fail == 0))
+}
+
+# ---- reboot: both boxes restarted, then what must be back by itself ---------------------------------------------
+# A container restart is a new systemd boot with an empty /run, the same disk and the same kernel: it shows whether
+# the units, the tables and the files under /run come back. It is not a kernel reboot (that is the VM tier).
+HOST_FIELD_PY='
+import json, sys
+for line in sys.stdin:
+    try:
+        h = json.loads(line)
+    except ValueError:
+        continue
+    if h.get("name") == "web":
+        print(h.get(sys.argv[1], ""))
+        sys.exit(0)
+sys.exit(1)'
+host_field() { hubx bash -c 'edr-hub host list --all --json | python3 -I -c "$1" "$2"' _ "$HOST_FIELD_PY" "$1"; }
+no_failed_unit() {   # no_failed_unit BOX
+    local left
+    left=$(dc exec -T "$1" bash -c 'systemctl list-units --failed --no-legend --plain; true') || return 1
+    [[ -z $left ]] || { printf '%s\n' "$left"; return 1; }
+}
+web_table_back() { webx nft list table inet edr; }
+droplet_id_is_back() { [[ $(webx cat /run/edr-droplet-id) == mock-web ]]; }
+heartbeat_after() {   # heartbeat_after EPOCH-MS : the hub has heard from web since then, and web still reports its droplet id
+    local seen
+    seen=$(host_field last_seen) && [[ $seen =~ ^[0-9]+$ ]] && ((seen > $1)) && [[ $(host_field droplet_id) == mock-web ]]
+}
+
+run_reboot() {
+    local t0
+    t0=$(($(date +%s) * 1000))
+    echo "== restarting both boxes"
+    docker restart edr-mock-hub-1 edr-mock-web-1 >/dev/null
+    wait_healthy
+
+    echo "== the hub box after the restart"
+    check "edr-hub, edr-hub-out and edr-hub-ui are active within 60 s" wait_ok 60 hubx systemctl is-active --quiet edr-hub edr-hub-out edr-hub-ui
+    check "the table inet edr_hub is loaded again (edr-hub-nft.service)" wait_ok 30 hubx nft list table inet edr_hub
+    check "edr-hub health exits 0" wait_ok 90 hubx edr-hub health
+    check "the backup timer is active" hubx systemctl is-active --quiet edr-hub-backup.timer
+    check "no unit failed in the hub box" no_failed_unit hub
+
+    echo "== the web box after the restart"
+    check "edr-agent is active within 60 s" wait_ok 60 webx systemctl is-active --quiet edr-agent
+    check "the table inet edr is back within 30 s" wait_ok 30 web_table_back
+    check "edr-bans.path, edr-bans.timer, edr-inventory.timer, edr-diskguard.timer and edr-notify.path are active" \
+        webx systemctl is-active --quiet edr-bans.path edr-bans.timer edr-inventory.timer edr-diskguard.timer edr-notify.path
+    check "/run/edr-droplet-id holds the stored id again" wait_ok 30 droplet_id_is_back
+    check "no unit failed in the web box" no_failed_unit web
+    check "nginx and php-fpm are active" webx systemctl is-active --quiet nginx "php$MOCK_PHP-fpm"
+
+    echo "== the two together"
+    check "the hub hears a heartbeat from web within 2 minutes of the restart, with its droplet id" wait_ok 120 heartbeat_after "$t0"
+    check "the host web is still active at the hub" host_is_active
 
     echo
     echo "mock: $pass passed, $fail failed"
@@ -398,6 +481,7 @@ run_residue() {
     check "no edr-hub process" no_process hub '[e]dr_hub'
     check "no code, CLI, firewall file or journal file of the hub is left (the data and the users are kept by a plain uninstall)" no_path hub \
         /usr/local/lib/edr-hub /usr/local/sbin/edr-hub /etc/edr-hub/edr-hub.nft /etc/systemd/journald@edr-hub.conf /etc/apt/apt.conf.d/52edr-hub
+    check "no unit is left failed in the hub box" no_failed_unit hub
     echo "== residue in the web box"
     check "no table inet edr" no_table web edr
     check "no table inet edr_dns" no_table web edr_dns
@@ -409,6 +493,12 @@ run_residue() {
         /var/lib/edr-install /var/lib/edr-bans /var/lib/edr-inventory /var/lib/edr-diskguard /var/lib/edr-notify /var/lib/edr-agent/spool \
         /var/lib/edr-agent/identity /etc/modprobe.d/edr-sctp-block.conf /etc/systemd/journald@edr.conf
     check "the users edr-agent and edr-notify are gone" no_kit_user_on_web
+    if [[ ${MOCK_SURICATA:-0} == 1 ]]; then
+        check "Suricata, which the kit installed, is gone with its directories and its unit drop-in" no_path web \
+            /usr/bin/suricata /etc/suricata /var/lib/suricata /var/log/suricata /etc/systemd/system/suricata.service.d \
+            /etc/apt/preferences.d/suricata-8
+    fi
+    check "no unit is left failed in the web box" no_failed_unit web
     check "nothing of the kit listens in the web box (nginx keeps 80 and 443)" nothing_of_the_kit_listens_on_web
 }
 
@@ -453,6 +543,7 @@ case ${1:-help} in
     install-hub) refuse_rootful install-hub; cmd_install_hub ;;
     install-web) refuse_rootful install-web; cmd_install_web ;;
     enroll) refuse_rootful enroll; cmd_enroll ;;
+    reboot) refuse_rootful reboot; run_reboot ;;
     e2e) refuse_rootful e2e; run_e2e ;;
     uninstall) refuse_rootful uninstall; cmd_uninstall ;;
     down) shift; dc down "$@" ;;

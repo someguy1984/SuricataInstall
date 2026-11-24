@@ -29,14 +29,16 @@ channel change and monthly. An incident also resolves itself after 60 minutes wi
   (`edr-hub settings set`). The writer prunes and replays the overflow file (PLAN section 3). Never delete `-wal` or
   `-shm` by hand.
 - **Corrupt:** see PLAN section 3, Integrity. `systemctl stop edr-hub`, then `edr-hub restore FILE` from the newest
-  good backup (PLAN section 7; add `--ca-key FILE` only if `ca/` was lost too). Keep the moved-aside file. Clients
+  good backup (PLAN section 7; add `--ca-key FILE` only if `ca/` was lost too; on a new box first put the backup's
+  passphrase into `/etc/edr-hub/backup.pass`). Keep the moved-aside file. Clients
   replay their spool. Hosts enrolled after that backup show as `orphan`: check each, then `edr-hub host UUID adopt`.
 
 ## Restore drill
 
 Quarterly; schedule it yourself, nothing reminds you. On a scratch droplet install the hub (PLAN section 8), run
-`systemctl disable --now edr-hub-out`, then `edr-hub restore FILE --drill --ca-key FILE` with `edr-hub` stopped
-(PLAN section 7). `--drill` skips the secrets, so the drill box has no webhook or dead-man URL, and `edr-hub-out` is
+`systemctl disable --now edr-hub-out`. Put the passphrase the backup was made with into `/etc/edr-hub/backup.pass`
+(root, mode 0600; the install wrote a new one that cannot open the old backup, and `restore` has no option for it).
+Then run `edr-hub restore FILE --drill --ca-key FILE` with `edr-hub` stopped (PLAN section 7). `--drill` skips the secrets, so the drill box has no webhook or dead-man URL, and `edr-hub-out` is
 off so nothing posts to them. Check hosts, the CA SHA-256 and `quick_check` in `edr-hub status`. Destroy the droplet.
 
 ## Certificates

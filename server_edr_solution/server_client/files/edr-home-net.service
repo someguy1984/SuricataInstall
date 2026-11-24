@@ -8,7 +8,10 @@ StartLimitIntervalSec=0
 Type=oneshot
 ExecStart=/usr/bin/python3 -I /usr/local/lib/edr-agent/edr-home-net
 User=root
-CapabilityBoundingSet=
+# One capability, for one directory: the Suricata package makes /etc/suricata suricata:suricata 0750, so root
+# without CAP_DAC_OVERRIDE cannot even read the old value there, and the unit failed at every timer run (first
+# install with Suricata in the mock). ProtectSystem=strict and ReadWritePaths below keep the writes to that directory.
+CapabilityBoundingSet=CAP_DAC_OVERRIDE
 RestrictAddressFamilies=AF_UNIX AF_NETLINK
 IPAddressDeny=any
 ProtectHome=yes

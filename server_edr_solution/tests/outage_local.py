@@ -28,6 +28,8 @@ line, not that budget; the real-time sample is the one measured against the 10%.
 """
 
 import argparse
+import atexit
+import ctypes
 import json
 import os
 import random
@@ -61,6 +63,20 @@ OPT = None
 
 
 # ---- small helpers (the same as in e2e_local.py) -----------------------------------------------
+
+class Interrupted(BaseException):
+    """SIGINT, SIGTERM or SIGHUP reached the script. A BaseException, so that no step's `except Exception` takes it for a
+    failed check: it unwinds to main()'s `finally`, which kills every child by process group and removes the directory."""
+
+
+def die_with_parent():
+    """preexec_fn for a child: the kernel kills it if this script dies without running its handlers (SIGKILL, an OOM kill).
+    Linux only; a failure to set it is ignored, the handlers and the `finally` are the main cover."""
+    try:
+        ctypes.CDLL(None, use_errno=True).prctl(1, int(signal.SIGKILL), 0, 0, 0)       # PR_SET_PDEATHSIG
+    except (OSError, AttributeError):
+        pass
+
 
 def free_port():
     for _ in range(200):
@@ -140,7 +156,7 @@ class Hub:
             [PY, "-I", os.path.join(HUB_DIR, "edr_hub.py"), "--state-dir", self.state, "--run-dir", self.run_dir,
              "--etc-dir", self.etc, "--bind", "127.0.0.1", "--port", str(self.port), "--enroll-port", str(self.enroll_port),
              "--ui-port", str(self.ui_port), "--public-ip", "127.0.0.1"],
-            stdout=log, stderr=log, stdin=subprocess.DEVNULL, start_new_session=True)
+            stdout=log, stderr=log, stdin=subprocess.DEVNULL, start_new_session=True, preexec_fn=die_with_parent)
         CHILDREN.append(self.proc)
 
     def stop(self, wait=15):
@@ -231,8 +247,10 @@ class Hub:
 # ---- the agent and its sources -----------------------------------------------------------------
 
 FAKE_JOURNALCTL = r'''#!%s
-import sys, time
-time.sleep(10 ** 6)
+import os, time
+parent = os.getppid()
+while os.getppid() == parent:                   # quiet, and gone when the agent is (even after a kill -9 of the test)
+    time.sleep(1)
 '''
 
 
@@ -275,7 +293,7 @@ class Agent:
     def start(self):
         log = open(os.path.join(BASE, "agent.log"), "ab")
         self.proc = subprocess.Popen([PY, "-I", AGENT, "run", "--foreground"], env=dict(os.environ, **self.env),
-                                     stdout=log, stderr=log, stdin=subprocess.DEVNULL, start_new_session=True)
+                                     stdout=log, stderr=log, stdin=subprocess.DEVNULL, start_new_session=True, preexec_fn=die_with_parent)
         CHILDREN.append(self.proc)
 
     def stop(self):
@@ -524,6 +542,36 @@ def hwm_mb(pid):
     return None if kb is None else kb / 1024.0
 
 
+# ---- what the test allows, and why ---------------------------------------------------------------
+
+PLAN_LIMIT_S = 300          # client PLAN section 10 (P2 exit) and 11 (chaos table): delivered within 5 minutes after the hub is back
+POLL_MARGIN_S = 30          # the test finds out by polling `edr-hub events` (a few seconds a poll) and the hub needs a moment to listen
+BATCH_EVENTS = 500
+
+
+def agent_hi_retry_cap():
+    """The agent's own share of the delay, read from its source (this script never imports the agent): HI_RETRY_S in
+    uplink.py, the longest the events backoff may be while a HIGH or CRITICAL event waits in the spool."""
+    with open(os.path.join(ROOT, "server_client", "agent", "edragent", "uplink.py")) as f:
+        m = re.search(r"^HI_RETRY_S\s*=\s*([0-9.]+)", f.read(), re.M)
+    check(m is not None, "HI_RETRY_S is not defined in uplink.py: the agent has no bound on the retry of a HIGH or CRITICAL event")
+    return float(m.group(1))
+
+
+def delivery_bound(n_high):
+    """Seconds after the hub's port opens within which the last of `n_high` HIGH and CRITICAL markers must be at the hub.
+
+    The plan's limit is 300 s. The agent's backoff for events is full jitter, up to 5 minutes, and up to HI_RETRY_S (60 s)
+    while a HIGH or CRITICAL event is in the spool (client PLAN 4.5). Its last failed attempt was before the port opened,
+    so the next one is at most HI_RETRY_S after that; the `hi` lane then goes first at one batch of 500 a second. The
+    test requires that bound plus the polling margin. The plan's 300 s alone would pass with a 5-minute backoff drawn
+    near its top, which is a draw that cannot be repeated on demand; the bound is the one the code guarantees, and it
+    is below the plan's."""
+    bound = agent_hi_retry_cap() + (n_high + BATCH_EVENTS - 1) // BATCH_EVENTS * 1.0 + POLL_MARGIN_S
+    check(bound <= PLAN_LIMIT_S, "the agent's own bound (%.0f s) is over the plan's %d s" % (bound, PLAN_LIMIT_S))
+    return bound
+
+
 # ---- the steps ---------------------------------------------------------------------------------
 
 def step(num, name):
@@ -681,12 +729,13 @@ def deliver(tag, expected_names, limit_s):
     return done
 
 
-@step("5", "A: the hub returns; every HIGH and CRITICAL marker is at the hub once, within 5 minutes")
+@step("5", "A: the hub returns; every HIGH and CRITICAL marker is at the hub once, within 5 minutes (and within the agent's own bound)")
 def step5():
     h, a = CTX["hub"], CTX["agent"]
     r = CTX["A"]
     names = r["markers"]
-    done = deliver("A", names, 300)
+    bound = delivery_bound(len(names))
+    done = deliver("A", names, PLAN_LIMIT_S)
     evs = h.high_events()
     found = marker_counts(evs, names)
     missing = [m for m, rows in found.items() if not rows]
@@ -695,7 +744,10 @@ def step5():
         % (len(names), sum(1 for m in names if "-crit-" in m), sum(1 for m in names if "-crit-" not in m),
            r["deliver_s"] or -1, min(r["seen"].values()) if r["seen"] else -1))
     check(done and not missing, "%d of %d markers never arrived (first missing: %s)" % (len(missing), len(names), missing[:5]))
-    check(r["deliver_s"] is not None and r["deliver_s"] <= 300, "the last marker arrived %.1f s after the hub's port opened (limit 300 s)" % (r["deliver_s"] or -1))
+    say("allowed: %.0f s (the agent's retry cap %.0f s + the hi lane at one batch a second + %d s of polling); the plan's limit is %d s"
+        % (bound, agent_hi_retry_cap(), POLL_MARGIN_S, PLAN_LIMIT_S))
+    check(r["deliver_s"] is not None and r["deliver_s"] <= bound,
+          "the last marker arrived %.1f s after the hub's port opened (limit %.0f s; the plan's %d s)" % (r["deliver_s"] or -1, bound, PLAN_LIMIT_S))
     dup = {m: len(rows) for m, rows in found.items() if len(rows) != 1}
     check(not dup, "markers not at the hub exactly once: %s" % json.dumps(dict(list(dup.items())[:5])))
     ids = [e["event_id"] for e in evs]
@@ -849,7 +901,7 @@ def step8():
         check(wait_until(lambda: port_open(h.port), 60, 0.1), "the hub's fleet port did not open after the restart")
         r.setdefault("restart_at", []).append(time.time())
     seen_poll()
-    done = wait_until(lambda: (seen_poll() or True) and all(m in seen for m in names_all + extra), 300, 2)
+    done = wait_until(lambda: (seen_poll() or True) and all(m in seen for m in names_all + extra), PLAN_LIMIT_S, 2)
     r["seen"] = seen
     found = marker_counts(h.high_events(), names_all + extra)
     missing = [m for m, rows in found.items() if not rows]
@@ -862,7 +914,9 @@ def step8():
     evs = h.high_events()
     ids = [e["event_id"] for e in evs]
     check(len(ids) == len(set(ids)), "an event id appears twice at the hub")
-    check(since_last <= 300, "the last marker arrived %.1f s after the final restart (limit 300 s)" % since_last)
+    bound = delivery_bound(len(names_all) + len(extra))
+    say("allowed after the final restart: %.0f s (the plan's limit is %d s)" % (bound, PLAN_LIMIT_S))
+    check(since_last <= bound, "the last marker arrived %.1f s after the final restart (limit %.0f s; the plan's %d s)" % (since_last, bound, PLAN_LIMIT_S))
     r["markers"] = names_all + extra
     check(a.alive(), "the agent died while the hub was killed")
 
@@ -892,6 +946,11 @@ def step10():
     cpu_total, wall_total = cpu_seconds(pid), time.time() - CTX["t_agent_start"]
     say("agent RSS peak %.1f MB sampled, %.1f MB kernel high-water mark (plan: MemoryHigh 96 MB, MemoryMax 128 MB, about 30 MB plus the access ring "
         "of 10 to 20 MB expected); agent CPU over the whole run %.1f s of %.0f s wall" % (rss_peak, hwm or 0, cpu_total, wall_total))
+    rss_a = max(smp.peaks[k]["rss"] for k in smp.peaks if k.startswith("A-")) / MB
+    say("with the default event budget (phase A) the RSS peak is %.1f MB, against MemoryHigh 96 MB; phase B raises the budget to its "
+        "largest value (a stress, not a configuration anyone runs) and its peak %.1f MB may pass MemoryHigh, which throttles and does not kill"
+        % (rss_a, max(pk["rss"] for k, pk in smp.peaks.items() if k.startswith("B-")) / MB))
+    check(rss_a <= 96, "agent RSS peak %.1f MB with the default budget is over the plan's MemoryHigh of 96 MB" % rss_a)
     check(a.alive() and smp.alive_always, "the agent was not alive throughout")
     check(hwm is not None and hwm <= 128, "agent memory high-water mark %.1f MB is over the plan's 128 MB (MemoryMax)" % (hwm or 0))
     rc, out, err = h.cli("audit", "verify")
@@ -900,34 +959,54 @@ def step10():
 
 # ---- main --------------------------------------------------------------------------------------
 
+def kill_group(p, grace=5):
+    """SIGTERM to the child's process group, then SIGKILL to the group whether or not its leader is still there: a child
+    of a dead leader keeps the group id, and `killpg` still reaches it."""
+    try:
+        os.killpg(p.pid, signal.SIGTERM)
+        p.wait(grace)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    try:
+        os.killpg(p.pid, signal.SIGKILL)            # the leader that ignored SIGTERM, and members it left behind
+        p.wait(5)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
 def cleanup():
+    """Kill every child by process group and remove the temporary directory. Safe to call twice and never raises: it
+    runs from main()'s `finally`, from the signal handler's unwinding and from atexit."""
+    if CTX.get("cleaned"):
+        return
+    CTX["cleaned"] = True
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):      # a second signal must not cut the clean-up short
+        try:
+            signal.signal(sig, signal.SIG_IGN)
+        except (OSError, ValueError):
+            pass
     s = CTX.get("sampler")
     if s is not None:
         s.halt.set()
+    for p in CHILDREN:
+        try:
+            kill_group(p, grace=3 if CTX.get("interrupted") else 15)
+        except Exception:
+            pass
     a = CTX.get("agent")
     if a is not None:
-        a.stop()
         for f in (a.tfile, a.afile):
             try:
                 f.close()
             except (OSError, AttributeError):
                 pass
-    h = CTX.get("hub")
-    if h is not None:
-        h.stop()
-    for p in CHILDREN:
-        if p.poll() is None:
-            try:
-                os.killpg(p.pid, signal.SIGTERM)
-                p.wait(5)
-            except (OSError, subprocess.TimeoutExpired):
-                try:
-                    os.killpg(p.pid, signal.SIGKILL)
-                    p.wait(5)
-                except (OSError, subprocess.TimeoutExpired):
-                    pass
-    if BASE and os.path.isdir(BASE) and not OPT.keep:
+    if BASE and os.path.isdir(BASE) and not (OPT and OPT.keep):
         shutil.rmtree(BASE, ignore_errors=True)
+
+
+def on_signal(signum, _frame):
+    CTX["interrupted"] = signal.Signals(signum).name
+    raise Interrupted(signal.Signals(signum).name)
 
 
 def main():
@@ -947,6 +1026,9 @@ def main():
     OPT.crit, OPT.high, OPT.acc = (200, 60, 40) if OPT.full else (60, 40, 20)
     BASE = tempfile.mkdtemp(prefix="outage", dir="/tmp")
     os.chmod(BASE, 0o700)
+    atexit.register(cleanup)
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, on_signal)
     steps = [step1, step2, step3, step4, step5, step6, step7, step8, step9, step10]
     t_begin = time.time()
     try:
@@ -958,6 +1040,10 @@ def main():
               % ("full" if OPT.full else "default", OPT.lines, OPT.rt_seconds, OPT.stress_lines, OPT.hold), flush=True)
         for s in steps:
             s()
+    except Interrupted as exc:
+        cleanup()
+        print("outage_local: interrupted by %s; every child killed, %s removed" % (exc, BASE), flush=True)
+        return 130 if str(exc) == "SIGINT" else 143
     finally:
         cleanup()
     failed = [r for r in RESULTS if not r[2]]

@@ -1,11 +1,15 @@
-# Mock droplets for server_edr_solution: two Ubuntu 26.04 machines with systemd as PID 1,
+# Mock droplets for server_edr_solution: two Ubuntu machines (26.04, or 24.04 with MOCK_UBUNTU=24.04) with systemd as PID 1,
 # so they behave like DigitalOcean droplets (units, journald, timers) and the planned
 # installers can be run inside them later.
 #
 #   docker compose build          (from server_edr_solution/mock, or use ./mock.sh up)
 #
 # Targets:  base -> hub   (the hub box; a TLS placeholder on :8443 until `mock.sh install-hub` replaces it)
-#           base -> web   (nginx + PHP 8.5 serving web.dev.local on :80 and :443, and sshd on :22)
+#           base -> web   (nginx + PHP serving web.dev.local on :80 and :443, and sshd on :22)
+#
+# Build arguments (compose.yaml passes them from MOCK_UBUNTU and MOCK_PHP):
+#   UBUNTU_TAG   26.04 (default) or 24.04
+#   PHP_VERSION  the release's own PHP: 8.5 on 26.04, 8.3 on 24.04
 
 ARG UBUNTU_TAG=26.04
 
@@ -44,17 +48,25 @@ RUN systemctl enable mock-tls.service mock-hub-placeholder.service
 
 # --------------------------------------------------------------------------- web
 FROM base AS web
+ARG PHP_VERSION=8.5
 # openssh-server: the client installer's `--yes` confirms itself only when sshd listens on port 22 (client install.sh,
 # wait_confirm). Nothing connects to it; it only has to be there, as on a droplet.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends nginx php8.5-fpm php8.5-cli openssh-server \
+ && apt-get install -y --no-install-recommends nginx php${PHP_VERSION}-fpm php${PHP_VERSION}-cli openssh-server \
  && apt-get clean && rm -rf /var/lib/apt/lists/* \
  && rm -f /etc/nginx/sites-enabled/default
 COPY web/web.dev.local.conf /etc/nginx/sites-available/web.dev.local
 COPY web/web.dev.local.common /etc/nginx/sites-available/web.dev.local.common
 COPY web/public/ /var/www/web.dev.local/public/
 COPY web/mock-tls.service /etc/systemd/system/
-RUN ln -s /etc/nginx/sites-available/web.dev.local /etc/nginx/sites-enabled/web.dev.local \
+# The site files are written for 26.04 (PHP 8.5, nginx 1.28). Two things differ on 24.04: the php-fpm socket name,
+# and nginx 1.24, which has no `http2 on;` directive (it came with 1.25.1) and takes `http2` on the listen line.
+RUN sed -i "s/php8\.5-fpm\.sock/php${PHP_VERSION}-fpm.sock/" /etc/nginx/sites-available/web.dev.local.common \
+ && v=$(dpkg-query -W -f='${Version}' nginx) \
+ && if dpkg --compare-versions "$v" lt 1.25.1; then \
+        sed -i -e '/^[[:space:]]*http2 on;/d' -e 's/^\([[:space:]]*listen .*443 ssl\);/\1 http2;/' /etc/nginx/sites-available/web.dev.local; \
+    fi \
+ && ln -s /etc/nginx/sites-available/web.dev.local /etc/nginx/sites-enabled/web.dev.local \
  && chown -R root:root /var/www/web.dev.local && chmod -R a+rX /var/www/web.dev.local \
- && systemctl enable mock-tls.service nginx.service php8.5-fpm.service \
+ && systemctl enable mock-tls.service nginx.service php${PHP_VERSION}-fpm.service \
  && { systemctl enable ssh.socket 2>/dev/null || systemctl enable ssh.service; }

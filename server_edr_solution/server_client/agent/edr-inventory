@@ -1561,6 +1561,7 @@ class Inventory:
             self.finding("posture", "HIGH", "APP_DEBUG is on (the Ignition exploit class)", field="app_debug_true", env_mode=post["env_mode"])
         if post["app_key_in_public"] is True:
             self.finding("posture", "HIGH", "a file under public/ holds an APP_KEY line", field="app_key_in_public")
+        # the summary is the field name alone: edr-check prints it after the check name, "posture"
         for f in bad_when_true:
             if post.get(f) is True:
                 sev = "MEDIUM"
@@ -1569,10 +1570,10 @@ class Inventory:
                 details = {"field": f}
                 if f == "world_writable_in_webroot":
                     details["paths"] = ww[:20]
-                self.finding("posture", sev, "posture: %s" % f, **details)
+                self.finding("posture", sev, f, **details)
         for f in bad_when_false:
             if post.get(f) is False:
-                self.finding("posture", "MEDIUM", "posture: %s is not satisfied" % f, field=f)
+                self.finding("posture", "MEDIUM", "%s is not satisfied" % f, field=f)
         return post
 
 

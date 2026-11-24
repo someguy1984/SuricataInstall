@@ -220,7 +220,7 @@ ORPHANS_MAX = 64
 def orphan_from_certificate(conn, hub, der_hash, cn, serial, not_after_ms, peer_ip):
     """A certificate signed by our CA that the hosts table does not hold and revoked.txt does not list: a host enrolled
     or renewed after the backup that was restored (section 7, step 5). Makes or converts the host row to `orphan` and
-    raises one HIGH notice per host. Returns the hosts row, or None when it must be refused.
+    writes one audit row per host (the engine raises the HIGH alert). Returns the hosts row, or None when it must be refused.
 
     Only on a hub that was restored (meta.restored_at, set by `edr-hub restore`); never with an older certificate than
     the one the row holds; at most 64 orphan rows."""
@@ -264,19 +264,14 @@ def orphan_from_certificate(conn, hub, der_hash, cn, serial, not_after_ms, peer_
 
 
 def _notify_orphan(conn, hub, host, peer_ip):
+    """The audit row, once per host. The HIGH alert is not sent from here: the engine raises `hub.orphan` for every host
+    in state orphan (hub_engine._hosts_checks, rules table row `orphan`), so one orphan is one alert with the table's
+    meaning and next step and an incident, and no kind exists that the table does not name (PLAN 4, Alert delivery)."""
     try:
         import hub_audit
         hub_db.safely(conn, hub, "audit", lambda: hub_audit.append(
             conn, actor_kind="system", actor_detail="addr=" + (peer_ip or "?"), action="host.orphan",
             target=host["uuid"], outcome="ok", details={"name": host["name"]}))
-    except ImportError:
-        pass
-    try:
-        import hub_alerts
-        hub_db.safely(conn, hub, "orphan alert", lambda: hub_alerts.notify(
-            conn, hub, severity="HIGH", kind="host.orphan", host=host, always=True,
-            summary="host %s presented a certificate this hub did not issue; it waits for `edr-hub host %s adopt`"
-                    % (hub_common.clean(host["name"], 64), host["uuid"])))
     except ImportError:
         pass
 

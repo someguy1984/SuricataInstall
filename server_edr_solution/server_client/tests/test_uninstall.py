@@ -10,7 +10,7 @@ import sys
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
-from test_install_common import (FILES, INSTALL, UNINSTALL, RootCase, manifest_doc, session, tree_hash)  # noqa: E402
+from test_install_common import (FILES, INSTALL, UNINSTALL, FunctionCase, RootCase, manifest_doc, session, tree_hash)  # noqa: E402
 import test_install as ti  # noqa: E402
 
 
@@ -42,7 +42,7 @@ class TestSyntax(unittest.TestCase):
                 self.assertIsNone(self.MUTATING.search(line), "%s: %s" % (name, line))
         gate = src.index("if [[ $PLAN -eq 1 ]]; then\n    plan\n    exit $?\nfi")
         self.assertGreater(src.index("EUID -eq 0", gate), gate)
-        for marker in ("nft delete table inet edr_isolate >/dev/null", "systemctl disable --now edr-bans.path", "rm -rf", "userdel \"$u\"", "apt-get -y purge", "swapoff /swapfile-edr 2>/dev/null", "exec /bin/bash"):
+        for marker in ("nft delete table inet edr_isolate >/dev/null", "off_units edr-bans.path", "rm -rf", "userdel \"$u\"", "apt-get -y purge", "swapoff /swapfile-edr 2>/dev/null", "exec /bin/bash"):
             self.assertGreater(src.index(marker), gate, marker)
 
     def test_packages_users_and_nft_are_limited_to_the_kit(self):
@@ -187,6 +187,139 @@ class TestPlan(RootCase):
         r = self.run_plan()
         self.assertEqual(r.stdout.count("/etc/suricata/drop.conf"), 1)                       # one line for the path
         self.assertIn("put the saved prior copy back at /etc/suricata/drop.conf", r.stdout)
+
+
+    def test_a_directory_the_first_session_made_is_removed_though_a_later_session_found_it_there(self):
+        """A second install over the first records /var/lib/edr-agent as present (it is: the kit made it the first time)."""
+        def dirs(prior):
+            return [{"path": "/var/lib/edr-agent", "prior": prior, "step": 2}]
+        self.manifest(manifest_doc(session(id="aaaa0000-0000-4000-8000-000000000001", dirs=dirs("absent")),
+                                   session(id="bbbb0000-0000-4000-8000-000000000002", kind="upgrade", dirs=dirs("present"))))
+        os.makedirs(self.root + "/var/lib/edr-agent")
+        r = self.run_plan()
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertNotIn("leave /var/lib/edr-agent: it existed before the kit", r.stdout)
+        self.assertIn("remove directory /var/lib/edr-agent", r.stdout)
+
+
+class TestStateDirectories(FunctionCase):
+    """The state directories of the helpers are removed with the others and checked at the end. The two shell lines are
+    cut out of uninstall.sh and run on a temporary tree, with every path moved under it."""
+
+    DIRS = ("edr-bans", "edr-diskguard", "edr-notify", "edr-inventory", "edr-restart", "edr-policy-check", "edr-dns-watch")
+
+    def moved(self, code):
+        return re.sub(r"(?<![\w$/.-])/(var|etc|usr)/", r"$BASE/\1/", code)
+
+    def tree(self):
+        for d in self.DIRS:
+            os.makedirs(os.path.join(self.base, "var", "lib", d, "sub"))
+
+    def test_the_removal_takes_every_state_directory_including_edr_bans(self):
+        line = re.search(r"^rm -rf -- (/var/lib/edr-\S+(?: /var/lib/edr-\S+)+)$", text(), re.M)
+        self.assertIsNotNone(line)
+        self.assertEqual(sorted(p[len("/var/lib/"):] for p in line.group(1).split()), sorted(self.DIRS))
+        self.tree()
+        r = self.run_functions(UNINSTALL, [], self.moved(line.group(0)))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(os.listdir(os.path.join(self.base, "var", "lib")), [])
+
+    def final_check(self, leave):
+        loop = re.search(r'    for p in "\$LIB" "\$LIB.prev" "\$STATE_I" .*?\n        if \[\[ -e \$p \]\]; then fail .*?\n    done\n', text(), re.S)
+        self.assertIsNotNone(loop)
+        self.tree()
+        for d in self.DIRS:
+            if d != leave:
+                shutil.rmtree(os.path.join(self.base, "var", "lib", d))
+        head = 'LIB=$BASE/usr/local/lib/edr-agent STATE_I=$BASE/var/lib/edr-install\nfail() { echo "FAIL: $*"; }\n'
+        return self.run_functions(UNINSTALL, [], head + self.moved(loop.group(0)))
+
+    def test_the_final_check_fails_for_each_state_directory_that_is_still_there(self):
+        for d in self.DIRS:
+            r = self.final_check(leave=d)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("FAIL: %s/var/lib/%s is still there" % (self.base, d), r.stdout)
+            shutil.rmtree(os.path.join(self.base, "var"), True)
+
+    def test_the_final_check_is_quiet_when_they_are_all_gone(self):
+        r = self.final_check(leave=None)
+        self.assertEqual((r.returncode, r.stdout), (0, ""))
+
+
+HUB_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "..", "server_hub")
+
+
+class TestUnitSwitchingOff(FunctionCase):
+    """Fixes found on Ubuntu 24.04 (systemd 255): `systemctl disable --now A B C` does nothing at all when one of the units
+    has no unit file, so one optional unit that was never installed left the others running."""
+
+    SCRIPTS = (INSTALL, UNINSTALL, os.path.join(HUB_DIR, "install.sh"), os.path.join(HUB_DIR, "uninstall.sh"))
+
+    def test_no_disable_call_in_any_of_the_four_scripts_names_more_than_one_unit(self):
+        seen = 0
+        for script in self.SCRIPTS:
+            with open(script) as f:
+                for no, line in enumerate(f, 1):
+                    code = line.strip()
+                    if code.startswith(("#", "echo", "say ")) or "UNIT_OFF) echo" in code:
+                        continue
+                    for m in re.finditer(r"systemctl\s+disable\s+([^;&|<>)\n]*)", code):
+                        words = [w for w in m.group(1).split() if not w.startswith("-") and w != "2"]
+                        seen += 1
+                        self.assertLessEqual(len(words), 1, "%s:%d names %d units: %s" % (os.path.basename(script), no, len(words), code))
+        self.assertGreaterEqual(seen, 8)                                            # the check did look at the calls
+
+    STEP1 = re.compile(r'(?:^off_units\(\) \{.*?^\}\n+)?^say "Step 1: stopping.*?^nft delete table inet edr_isolate[^\n]*\n', re.S | re.M)
+
+    def test_step_1_stops_the_ban_path_and_timer_when_the_policy_check_timer_does_not_exist(self):
+        """The fake systemctl fails a whole call when any unit it names is unknown, as systemd 255 does."""
+        block = self.STEP1.search(text())
+        self.assertIsNotNone(block)
+        body = '''KEEP_DNS=0 KEEP_SURICATA=0
+say() { :; }
+nft() { :; }
+RUNNING="edr-bans.path edr-bans.timer edr-bans.service edr-dns-watch.timer edr-home-net.timer"
+systemctl() {
+    local verb=$1 u known=" $RUNNING "
+    shift
+    local units=()
+    for u in "$@"; do [[ $u == -* ]] || units+=("$u"); done
+    echo "systemctl $verb ${units[*]}" >> "$CALLS"
+    for u in "${units[@]}"; do [[ $known == *" $u "* ]] || return 5; done      # edr-policy-check.timer is not installed
+    case $verb in
+        stop) for u in "${units[@]}"; do RUNNING=${RUNNING/ $u / }; echo "stopped $u" >> "$CALLS"; done ;;
+        disable) if [[ " $* " == *" --now "* ]]; then for u in "${units[@]}"; do echo "stopped $u" >> "$CALLS"; done; fi ;;
+    esac
+}
+''' + block.group(0)
+        r = self.run_functions(UNINSTALL, [], body)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        calls = self.calls()
+        for unit in ("edr-bans.path", "edr-bans.timer", "edr-bans.service", "edr-dns-watch.timer", "edr-home-net.timer"):
+            self.assertIn("stopped %s" % unit, calls)
+
+    def listed(self, script, statement, bullet):
+        with open(script) as f:
+            found = re.search(statement, f.read(), re.S | re.M)
+        self.assertIsNotNone(found)
+        body = '''systemctl() {
+    case $1 in
+        list-unit-files) ;;
+        list-units) if [[ " $* " == *" --plain "* ]]; then echo "edr-bans.timer loaded failed failed Ban timer"; else echo "%s edr-bans.timer loaded failed failed Ban timer"; fi ;;
+    esac
+}
+KEEP_DNS=0
+%s
+echo "LIST=[${%s}]"
+''' % (bullet, found.group(0), found.group(0).split("=", 1)[0])
+        r = self.run_functions(script, [], body)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return re.search(r"LIST=\[(.*)\]", r.stdout, re.S).group(1)
+
+    def test_the_final_check_unit_list_ignores_the_bullet_of_list_units(self):
+        self.assertEqual(self.listed(UNINSTALL, r'^left=\$\(.*?\|\| true\)$', "●"), "edr-bans.timer")
+        self.assertEqual(self.listed(os.path.join(HUB_DIR, "uninstall.sh"), r'^units=\$\(\{.*?\)$', "●").replace("edr-bans", "edr-hub"),
+                         "edr-hub.timer")
 
 
 class TestRefusedManifests(RootCase):

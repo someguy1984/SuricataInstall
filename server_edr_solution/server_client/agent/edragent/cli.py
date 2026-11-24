@@ -349,8 +349,20 @@ def build_parser():
     return p
 
 
+def attach_dash_values(argv):
+    """Turn `--for -5m` into `--for=-5m`. Python 3.12's argparse takes "-5m" for an option and stops with "expected one
+    argument"; 3.14 takes it for the value. Joined, both hand the value to the command, which answers with its own message."""
+    out = []
+    for a in argv:
+        if out and out[-1] == "--for" and a.startswith("-") and len(a) > 1:
+            out[-1] = "--for=" + a
+        else:
+            out.append(a)
+    return out
+
+
 def main(argv=None):
-    argv = list(sys.argv[1:] if argv is None else argv)
+    argv = attach_dash_values(list(sys.argv[1:] if argv is None else argv))
     if not argv or argv[0].startswith("-") and argv[0] not in ("-h", "--help"):
         argv = ["run"] + argv                  # the unit runs the script with no command
     parser = build_parser()

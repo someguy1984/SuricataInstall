@@ -934,7 +934,7 @@ class BackupTests(BackupCase):
         self.assertEqual(self.restore(bad), 2)
         with open(self.paths.backup_pass, "w") as f:
             f.write("a different passphrase entirely\n")
-        self.assertEqual(self.restore(out), 2)
+        self.assertEqual(self.restore(out), 3)                  # refused before anything changed (PLAN 17), with the instruction
 
 
 class BackupSymlinkDefects(BackupCase):

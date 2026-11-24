@@ -109,6 +109,23 @@ class ConfirmedDefects(unittest.TestCase):
         self.assertEqual(self.fx.sql("SELECT state FROM hosts WHERE uuid=?", (a.uuid,))[0]["state"], "pending")
 
 
+    def test_a_new_orphan_is_audited_once_and_the_enroll_path_raises_no_alert_of_its_own(self):
+        """The one HIGH alert for an orphan is the engine's `hub.orphan` (rules table row `orphan`); a second, immediate
+        alert of a kind the table does not name would be a second page with the generic "no rule of its own" text."""
+        import uuid
+        import hub_db
+        self.fx.writer.call(lambda conn: hub_db.meta_set(conn, "restored_at", str(hub_common.now_ms())))
+        cn = str(uuid.uuid4())
+        before = self.fx.sql("SELECT COUNT(*) AS n FROM outbox")[0]["n"]
+
+        def present(conn):
+            return hub_enroll.orphan_from_certificate(conn, self.fx.hub, "cd" * 32, cn, "5678", hub_common.now_ms() + 10 ** 9, "203.0.113.5")
+        self.assertEqual(self.fx.writer.call(present)["state"], "orphan")
+        self.assertIsNone(self.fx.writer.call(present))                    # the same certificate again: already a row, no second notice
+        self.assertEqual(self.fx.sql("SELECT COUNT(*) AS n FROM outbox")[0]["n"], before)
+        self.assertEqual(self.fx.sql("SELECT COUNT(*) AS n FROM audit WHERE action='host.orphan' AND target=?", (cn,))[0]["n"], 1)
+
+
 class VerifiedGood(SharedHub):
     """Things the review tried to break and could not. They stay as regression tests."""
 

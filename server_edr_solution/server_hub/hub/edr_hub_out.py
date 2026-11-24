@@ -91,37 +91,64 @@ def parse_https_url(url):
     return u.hostname, port, path
 
 
-def resolve(host, port, allow_private):
-    """Resolve once and return an address to connect to. A private, loopback or link-local address
-    (169.254.169.254 included) is refused: the webhook must not reach the hub's own network."""
+def resolve_all(host, port, allow_private):
+    """Resolve once and return the addresses we may connect to, in the order the resolver gave them (so an IPv6
+    address first if the system prefers it). A private, loopback or link-local address (169.254.169.254 included)
+    is dropped, never connected to: the webhook must not reach the hub's own network. When every address is
+    dropped the name is refused."""
     try:
         infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
     except OSError:
         raise SendError("the name did not resolve") from None
-    addrs = []
-    for fam, _t, _p, _c, sa in infos:
-        addrs.append(sa[0])
-    if not addrs:
-        raise SendError("the name did not resolve")
-    for a in addrs:
+    allowed, seen, refused = [], set(), False
+    for _fam, _t, _p, _c, sa in infos:
+        a = sa[0]
+        if a in seen:
+            continue
+        seen.add(a)
         try:
             ip = ipaddress.ip_address(a.split("%")[0])
         except ValueError:
             raise SendError("the address is not usable") from None
-        if not allow_private and not ip.is_global:
-            raise SendError("the address is private")
-    return addrs[0]
+        if allow_private or ip.is_global:
+            allowed.append(a)
+        else:
+            refused = True
+    if not allowed:
+        raise SendError("the address is private" if refused else "the name did not resolve")
+    return allowed
+
+
+def resolve(host, port, allow_private):
+    """The first address resolve_all() allows."""
+    return resolve_all(host, port, allow_private)[0]
 
 
 class _Pinned(http.client.HTTPSConnection):
-    """Connects to the address we checked (no second DNS lookup), verifies the certificate against the host name."""
+    """Connects to the addresses we checked (no second DNS lookup), in order, until one answers, within the wall-clock
+    deadline; verifies the certificate against the host name."""
 
-    def __init__(self, host, port, ip, context, timeout):
+    def __init__(self, host, port, ips, context, timeout):
         super().__init__(host, port, timeout=timeout, context=context)
-        self._ip = ip
+        self._ips = [ips] if isinstance(ips, str) else list(ips)
+        self._deadline = time.monotonic() + timeout
 
     def connect(self):
-        raw = socket.create_connection((self._ip, self.port), self.timeout)
+        raw, last = None, None
+        for i, ip in enumerate(self._ips):
+            # each address gets an equal share of what is left, so an address that swallows packets cannot use up the
+            # whole deadline and leave nothing for the next one
+            left = self._deadline - time.monotonic()
+            if left <= 0:
+                break
+            try:
+                raw = socket.create_connection((ip, self.port), left / (len(self._ips) - i))
+                break
+            except OSError as exc:
+                last = exc
+        if raw is None:
+            raise last if last is not None else TimeoutError()
+        raw.settimeout(self.timeout)
         self._raw = raw                                   # so the deadline can cut the connection while it handshakes
         try:
             self.sock = self._context.wrap_socket(raw, server_hostname=self.host)
@@ -167,8 +194,8 @@ def http_send(method, url, headers, body, ctx, allow_private=False):
     timer = None
     try:
         host, port, path = parse_https_url(url)
-        ip = resolve(host, port, allow_private)
-        conn = _Pinned(host, port, ip, ctx, TIMEOUT_S)
+        ips = resolve_all(host, port, allow_private)
+        conn = _Pinned(host, port, ips, ctx, TIMEOUT_S)
 
         def deadline():
             fired.set()

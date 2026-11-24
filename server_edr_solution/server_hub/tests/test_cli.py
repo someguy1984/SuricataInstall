@@ -217,6 +217,8 @@ class ReadCommandTests(CliCase):
         self.code(3, "settings", "get", "nonsense")
 
     def test_status_reports_and_exit_codes(self):
+        import hub_pki
+        hub_pki.init_ca(self.paths)                                 # a hub always has its CA; without it status warns
         r = self.code(1, "status")                                  # no channel, no backup: warnings only
         self.assertIn("hub:        running", r.stdout)
         self.assertIn("hosts:", r.stdout)
@@ -231,6 +233,28 @@ class ReadCommandTests(CliCase):
         # an orphan or a stale backup is a warning
         S.add_host(self.hub.db, "orph", state="orphan")
         self.assertIn("orphan", self.code(1, "status").stdout)
+
+    def test_status_shows_the_ca_sha256_the_runbook_compares(self):
+        """PLAN 15, Restore drill: "check hosts, the CA SHA-256 and quick_check in `edr-hub status`"."""
+        import hashlib
+        import ssl
+        import hub_pki
+        hub_pki.init_ca(self.paths)
+        want = hashlib.sha256(ssl.PEM_cert_to_DER_cert(R(self.paths.ca_cert))).hexdigest()
+        line = [l for l in self.run_cli("status").stdout.splitlines() if l.startswith("ca:")]
+        self.assertEqual(line, ["ca:         SHA-256 " + want])
+        self.assertEqual(want, hub_pki.der_sha256(R(self.paths.ca_cert)))                # the value a token ends with
+
+    def test_status_does_not_print_a_ca_file_that_is_not_a_certificate(self):
+        os.makedirs(self.paths.ca_dir, exist_ok=True)
+        W(self.paths.ca_cert, "-----BEGIN CERTIFICATE-----\n" + NASTY + "\n-----END CERTIFICATE-----\n")
+        r = self.code(1, "status")                                  # a warning, not a crash
+        line = [l for l in r.stdout.splitlines() if l.startswith("ca:")][0]
+        self.assertIn("UNREADABLE", line)
+        self.assertNotIn("\x1b", r.stdout)
+        self.assertNotIn("evil", r.stdout)
+        os.unlink(self.paths.ca_cert)
+        self.assertIn("UNREADABLE", self.code(1, "status").stdout)
 
     def test_status_with_the_hub_down_exits_2_and_still_prints(self):
         self.socks.stop()

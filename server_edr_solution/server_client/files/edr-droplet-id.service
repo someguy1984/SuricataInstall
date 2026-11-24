@@ -1,7 +1,7 @@
 # Reads the DigitalOcean droplet id and writes /run/edr-droplet-id for the agent (client PLAN
 # section 4.6). It may reach the metadata address and nothing else, so the sandboxed agent never
 # gets metadata access. Started before edr-agent.service at every boot and every start of the agent
-# (no RemainAfterExit). The unit has no capability and may write one file.
+# (no RemainAfterExit). The main run has no capability and may write one file.
 [Unit]
 Description=Write the droplet id for the agent
 Before=edr-agent.service
@@ -19,11 +19,14 @@ IPAddressDeny=any
 IPAddressAllow=169.254.169.254
 ProtectHome=yes
 SystemCallFilter=@system-service
-# Only the one file is writable: the unit creates it if it is missing (root, outside the sandbox) and the helper writes
-# into it in place, because a bind-mounted file cannot be replaced by a rename.
+# Two runs (see the helper's header). The first, with "+", is full root outside the sandbox and never touches the
+# network: it makes /run/edr-droplet-id and fills it from the id stored in /var/lib/edr-agent, which the second
+# run cannot read (the directory is edr-agent's, 0700, and this unit has no capability). The second run is the
+# sandboxed one that asks the metadata service; it writes into the file in place, because a bind-mounted file
+# cannot be replaced by a rename.
 # The "-" matters: systemd applies ReadWritePaths to the "+" command too, and without it a missing file fails that
 # command at step NAMESPACE (status 226) before it can create the file. Seen with systemd 259 on the first mock install.
-ExecStartPre=+/bin/sh -c '[ -e /run/edr-droplet-id ] || install -m 0640 -o root -g edr-agent /dev/null /run/edr-droplet-id'
+ExecStartPre=+/usr/bin/python3 -I /usr/local/lib/edr-agent/edr-droplet-id --seed
 ReadWritePaths=-/run/edr-droplet-id
 MemoryMax=64M
 Nice=19

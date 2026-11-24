@@ -973,8 +973,11 @@ def _hosts_checks(conn, hub, now, grace_until):
             elif host["state"] == "orphan":
                 event, _ = _track(conn, "orphan|" + host["uuid"], 1, now)
                 if event == "new":
-                    _finding(conn, hub, host, "orphan", "HIGH", "%s awaits adoption after a restore" % clean(host["name"], 64), now,
-                             chain="host", signal="orphan")
+                    # The only alert for an orphan (PLAN 2, Host states; 4, Rules): hub_enroll writes the audit row, not an alert.
+                    _finding(conn, hub, host, "orphan", "HIGH",
+                             "%s presented a certificate this hub did not issue and awaits adoption" % clean(host["name"], 64), now,
+                             chain="host", signal="orphan",
+                             fields={"uuid": clean(host["uuid"], 40), "adopt with": "edr-hub host %s adopt" % clean(host["uuid"], 40)})
             else:
                 _check_silent(conn, hub, host, now, grace_until)
 

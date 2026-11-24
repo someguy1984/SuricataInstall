@@ -5,6 +5,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -74,6 +75,74 @@ class TestShell(unittest.TestCase):
     def test_it_is_in_the_installed_name_notes(self):
         with open(CHECK_SH) as f:
             self.assertIn("edr-check", f.read())
+
+
+class TestShellRun(Tmp):
+    """check.sh run for real against a temporary root, with a PATH that holds only stubs of the system commands (they log
+    their words and print nothing) and the few plain tools the script needs. Nothing on this machine can be reached."""
+
+    STUBBED = ("systemctl", "nft", "dnscrypt-proxy")
+    TOOLS = ("awk", "grep", "sed", "tr", "sort", "comm", "cut", "head", "tail", "date", "cat", "id", "getent", "wc", "dirname", "basename",
+             "ls", "readlink", "env", "uniq", "sleep", "timeout", "xargs", "mktemp", "rm")
+
+    def setUp(self):
+        super().setUp()
+        self.bin = os.path.join(self.root, "bin")
+        self.log = os.path.join(self.root, "stub-calls.log")
+        os.makedirs(self.bin)
+        for name in self.STUBBED:
+            self.write(os.path.join(self.bin, name), '#!/bin/sh\necho "%s $*" >> "%s"\nexit 0\n' % (name, self.log), 0o755)
+        for name in self.TOOLS:
+            os.symlink(shutil.which(name), os.path.join(self.bin, name))
+
+    def check(self, conf, inventory=None):
+        self.write(self.paths.local_conf, conf, 0o640)
+        if inventory is not None:
+            self.write(self.paths.inventory_json, json.dumps(inventory))
+        env = {"PATH": self.bin, "EDR_AGENT_ROOT": self.root, "HOME": self.root}
+        return subprocess.run(["/bin/bash", CHECK_SH, "--local"], capture_output=True, text=True, timeout=60, env=env, stdin=subprocess.DEVNULL)
+
+    def stub_calls(self):
+        try:
+            with open(self.log) as f:
+                return f.read().splitlines()
+        except FileNotFoundError:
+            return []
+
+    def test_the_dns_section_checks_the_kits_own_toml_never_the_packaged_one(self):
+        r = self.check("[dns]\nlockdown = on\n[kit]\nweb = off\n")
+        self.assertIn("dnscrypt-proxy -check -config /etc/edr-dns/dnscrypt-proxy.toml", self.stub_calls(), r.stdout + r.stderr)
+        self.assertIn("dnscrypt-proxy -check passes", r.stdout)
+        self.assertEqual([c for c in self.stub_calls() if "/etc/dnscrypt-proxy/" in c], [])
+
+    def test_with_the_lock_off_the_dns_section_is_skipped_and_nothing_is_probed(self):
+        r = self.check("[dns]\nlockdown = off\n[kit]\nweb = off\n")
+        self.assertIn("SKIP [dns] lockdown = off: the DNS lock checks are skipped", r.stdout)
+        self.assertEqual([c for c in self.stub_calls() if c.startswith("dnscrypt-proxy")], [])
+
+    def test_the_toml_path_is_the_same_in_check_install_and_the_drop_in(self):
+        with open(CHECK_SH) as f:
+            in_check = set(re.findall(r"dnscrypt-proxy -check -config (\S+)", f.read()))
+        client = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(client, "install.sh")) as f:
+            install = f.read()
+        etc_dns = re.search(r"^ETC_DNS=(\S+)$", install, re.M).group(1)
+        toml = re.search(r"^\s+toml=\$ETC_DNS/(\S+)$", install, re.M).group(1)
+        self.assertRegex(install, r'dnscrypt-proxy -check -config "\$toml"')
+        with open(os.path.join(client, "files", "dnscrypt-proxy-50-edr.conf")) as f:
+            exec_start = re.findall(r"^ExecStart=(.+)$", f.read(), re.M)
+        self.assertEqual(exec_start[-1].split()[-2:], ["-config", etc_dns + "/" + toml])
+        self.assertEqual(in_check, {etc_dns + "/" + toml})
+        self.assertEqual(etc_dns + "/" + toml, "/etc/edr-dns/dnscrypt-proxy.toml")
+
+    def test_a_posture_finding_is_printed_once_with_one_prefix(self):
+        inv = {"checks": {}, "findings": [
+            {"check": "posture", "sev": "MEDIUM", "summary": "nginx_php_any", "details": {"field": "nginx_php_any"}},
+            {"check": "posture", "sev": "MEDIUM", "summary": "nginx_default_server is not satisfied", "details": {"field": "nginx_default_server"}}],
+            "posture": {"nginx_php_any": True, "nginx_default_server": False}}
+        r = self.check("[kit]\nweb = on\n", inv)
+        warns = [l.strip() for l in r.stdout.splitlines() if "posture" in l or "nginx_php_any" in l or "nginx_default_server" in l]
+        self.assertEqual(warns, ["WARN posture: nginx_php_any", "WARN posture: nginx_default_server is not satisfied"], r.stdout)
 
 
 class CheckCase(Tmp):
@@ -542,6 +611,16 @@ class TestStatusFiles(CheckCase):
         self.assertTrue(self.has(out, "WARN", "the apt lists are 60 hours old"))
         self.assertTrue(self.has(self.run_("nginx", text="[sites]\nweb_users = x\n"), "FAIL", "nginx_pkg"))
 
+    def test_a_posture_field_is_printed_once_whether_or_not_the_inventory_made_a_finding_of_it(self):
+        finding = {"check": "posture", "sev": "MEDIUM", "summary": "nginx_php_any", "details": {"field": "nginx_php_any"}}
+        posture = {"nginx_php_any": True, "public_listeners": True, "nginx_default_server": False}
+        self.put(self.paths.inventory_json, {"checks": {}, "findings": [finding], "posture": posture}, age=10)
+        out = self.run_("nginx", phase="P1b")
+        self.assertEqual([t for lvl, t in out if "nginx_php_any" in t], ["posture: nginx_php_any"])
+        # a field with no finding of its own (an older inventory file) is still reported, once
+        self.assertEqual([t for lvl, t in out if "public_listeners" in t], ["posture: public_listeners"])
+        self.assertFalse([t for _, t in out if "posture: posture" in t])
+
     def test_nginx_log_levels_and_formats(self):
         inv = {"checks": {"nginx_logs": {"error_logs": [{"path": "/var/log/nginx/error.log", "level": "error"}],
                                          "access_logs": [{"path": "a", "format": "vhost"}],
@@ -586,6 +665,15 @@ class TestStatusFiles(CheckCase):
         out = checks.run_section("netcheck", self.paths, cfg, now=NOW, phase="P1b",
                                  stdin="%s\n---\n%s\n---\n%s" % (addr, route, "HOME_NET: '[10.116.0.0/20]'\n"))
         self.assertTrue(self.has(out, "FAIL", "HOME_NET lacks 203.0.113.9"))
+        # the file as edr-home-net writes it: a YAML header whose second line is "---", comments, one dotted key
+        # (first install with Suricata in the mock: "HOME_NET could not be read", because the header's "---" was
+        # taken for a separator of this input)
+        real = ('%YAML 1.1\n---\n# Generated by edr-home-net. Do not edit.\n'
+                'vars.address-groups.HOME_NET: "[203.0.113.9/32,10.116.0.0/20,127.0.0.0/8,::1/128]"\n')
+        self.put(self.paths.bans_json, {"never": ["203.0.113.9/32", "10.116.0.2/32", "203.0.113.1/32", "198.51.100.7/32"]})
+        out = checks.run_section("netcheck", self.paths, cfg, now=NOW, stdin="%s\n---\n%s\n---\n%s" % (addr, route, real), phase="P1b")
+        self.assertTrue(self.has(out, "PASS", "HOME_NET covers every address"))
+        self.assertFalse(self.has(out, "WARN", "HOME_NET could not be read"))
         self.put(self.paths.bans_json, {"never": ["203.0.113.9/32"]})
         out = checks.run_section("netcheck", self.paths, cfg, now=NOW, phase="P1b", stdin="%s\n---\n%s\n---\n%s" % (addr, route, good))
         self.assertTrue(self.has(out, "WARN", "never-ban list lacks"))

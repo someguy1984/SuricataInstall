@@ -14,7 +14,8 @@ import http.server
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
-from test_install_common import (FILES, INSTALL, UNINSTALL, CLIENT, RootCase, extract_python, manifest_doc, session, tree_hash)  # noqa: E402
+from test_install_common import (FILES, INSTALL, UNINSTALL, CLIENT, FunctionCase, RootCase, extract_python, manifest_doc, session,  # noqa: E402
+                                 tree_hash)
 
 
 def text():
@@ -447,6 +448,179 @@ class TestPlan(RootCase):
         self.assertEqual(r.returncode, 3)
         self.assertIn("does not match its MANIFEST.sha256", r.stderr)
         self.assertEqual(self.stub_calls(), "")
+
+
+class TestInstallSteps(FunctionCase):
+    """Functions of install.sh run on their own with every system command stubbed (see FunctionCase). Each test pins a
+    fix that the first run in the Docker mock found."""
+
+    def run_fn(self, names, body, **env):
+        return self.run_functions(INSTALL, names, body, **env)
+
+    # -- local.conf on a re-run
+    def test_a_rerun_leaves_local_conf_text_alone_and_repairs_owner_and_mode(self):
+        r = self.run_fn(["seed_local_conf"], '''
+ETC_A=$BASE/etc-edr-agent
+mkdir -p "$ETC_A"
+printf 'the operator wrote this\\n' > "$ETC_A/local.conf"
+chmod 0600 "$ETC_A/local.conf"
+seed_local_conf
+''')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        lc = os.path.join(self.base, "etc-edr-agent", "local.conf")
+        with open(lc) as f:
+            self.assertEqual(f.read(), "the operator wrote this\n")
+        self.assertEqual(os.stat(lc).st_mode & 0o7777, 0o640)
+        self.assertEqual(self.calls(), ["chown root:edr-agent %s" % lc])
+        self.assertIn("never rewritten", r.stdout)
+
+    # -- the DNS step on a host whose resolv.conf is not the resolved stub
+    def dns_step(self, resolv_target, lockdown, locked="0"):
+        return self.run_fn(["jr", "step_8"], '''
+WANT_DNS=1 WORK=$BASE/work JOURNAL=$BASE/journal.tsv ETC_A=$BASE/etc-edr-agent ETC_DNS=$BASE/etc-edr-dns
+CURRENT_STEP=8
+readlink() { echo "$RESOLV_TARGET"; }
+dns_lock_in_place() { [[ $LOCKED == 1 ]]; }
+conf_value() { echo "$LOCKDOWN"; }
+conf_edit() { echo "conf_edit root='$1' ${*:2}" >> "$CALLS"; }
+ensure_dir() { echo "REACHED the DNS step"; exit 42; }
+step_8
+''', RESOLV_TARGET=resolv_target, LOCKDOWN=lockdown, LOCKED=locked)
+
+    # one unit a call, stop before disable (systemd 255 does nothing for a whole list when one unit file is missing)
+    SWITCHED_OFF = ["systemctl %s %s" % (verb, unit) for unit in ("dnscrypt-proxy.socket", "dnscrypt-proxy.service", "dnscrypt-proxy-resolvconf.service")
+                    for verb in ("stop", "disable")] + ["systemctl reset-failed dnscrypt-proxy.service"]
+
+    def test_the_locking_path_still_enables_the_proxy_socket_after_the_skip_branch(self):
+        body = function_body(text(), "step_8")
+        skip, rest = body.split("    mkdir -p \"$work\"\n", 1)
+        self.assertIn("dnscrypt-proxy-resolvconf.service", skip)
+        self.assertNotRegex(skip, r"systemctl\s+enable")
+        self.assertIn("systemctl enable --now dnscrypt-proxy.socket", rest)
+        self.assertNotRegex(rest, r"systemctl\s+disable[^\n]*dnscrypt-proxy")           # the disable belongs to the skip branch only
+
+    def journal(self):
+        try:
+            with open(os.path.join(self.base, "journal.tsv")) as f:
+                return f.read().splitlines()
+        except FileNotFoundError:
+            return []
+
+    def test_without_the_resolved_stub_the_dns_step_is_skipped_and_the_lock_is_written_off_once(self):
+        r = self.dns_step("/etc/resolv.conf.docker", "on")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("REACHED", r.stdout)
+        # the lock is written off, and the packaged units that step 3 installed (they fail at every boot on the packaged
+        # configuration) are switched off: nothing else is started, restarted or installed
+        self.assertEqual(self.calls(), ["conf_edit root='' dns.lockdown=off"] + self.SWITCHED_OFF)
+        self.assertEqual(self.journal(), ["note\t-\tDNS step skipped: /etc/resolv.conf is not the resolved stub"])
+        self.assertIn("[dns] lockdown = off is now in", r.stdout)
+
+    def test_a_second_run_does_not_write_the_lock_off_again(self):
+        r = self.dns_step("/etc/resolv.conf.docker", "off")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.calls(), self.SWITCHED_OFF)                         # the units are switched off on every such run
+        self.assertEqual(len(self.journal()), 1)                                  # the note is still recorded
+        self.assertNotIn("is now in", r.stdout)
+
+    def test_an_earlier_lock_is_left_alone_when_resolv_conf_stops_being_the_stub(self):
+        # The resolver points at the kit's proxy: stopping the proxy here would take name resolution with it.
+        r = self.dns_step("/etc/resolv.conf.other", "on", locked="1")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("REACHED", r.stdout)
+        self.assertEqual(self.calls(), [])                                        # no unit touched, local.conf not edited
+        self.assertEqual(self.journal(), ["note\t-\tDNS step skipped: /etc/resolv.conf is not the resolved stub; the earlier lock is left in place"])
+        self.assertIn("left as they are", r.stdout)
+
+    def test_the_lock_is_known_by_the_resolved_drop_in(self):
+        self.assertIn('dns_lock_in_place() { [[ -e /etc/systemd/resolved.conf.d/zz-edr-doh.conf ]]; }\n', text())
+        self.assertIn("/etc/systemd/resolved.conf.d/zz-edr-doh.conf", text().split("step_8() {", 1)[1])   # the file step 8 installs
+
+    def test_with_the_resolved_stub_the_dns_step_goes_on_and_local_conf_is_left_alone(self):
+        r = self.dns_step("/run/systemd/resolve/stub-resolv.conf", "on")
+        self.assertEqual(r.returncode, 42, r.stdout + r.stderr)
+        self.assertIn("REACHED the DNS step", r.stdout)
+        self.assertEqual(self.calls(), [])
+
+    # -- the agent unit on a re-run or an upgrade
+    def agent_step(self, restart_fails=False):
+        return self.run_fn(["step_9"], '''
+STATE_A=$BASE/state WORK=$BASE/work DROPLET_ID_ARG=mock-1 LIB=$BASE/no-lib
+mkdir -p "$WORK"
+install_table_step() { :; }
+metadata_id() { :; }
+write_file() { cat > /dev/null; }
+install_file() { :; }
+enable_units() { echo "enable_units $*" >> "$CALLS"; }
+systemctl() {
+    echo "systemctl $*" >> "$CALLS"
+    if [[ $1 == restart && -n ${RESTART_FAILS:-} ]]; then return 1; fi
+    return 0
+}
+step_9
+''', RESTART_FAILS="1" if restart_fails else "")
+
+    def test_the_agent_is_enabled_and_then_restarted_not_enabled_with_now(self):
+        r = self.agent_step()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        calls = self.calls()
+        self.assertIn("enable_units edr-agent.service", calls)                    # no --now: that would leave an old agent running
+        self.assertNotIn("enable_units --now edr-agent.service", calls)
+        self.assertIn("systemctl restart edr-agent.service", calls)
+        self.assertLess(calls.index("enable_units edr-agent.service"), calls.index("systemctl restart edr-agent.service"))
+        self.assertFalse([c for c in calls if c.startswith("systemctl start edr-agent")])
+        self.assertLess(calls.index("systemctl restart edr-agent.service"), calls.index("systemctl start edr-inventory.service"))
+
+    def test_a_failed_restart_of_the_agent_is_fatal(self):
+        r = self.agent_step(restart_fails=True)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("edr-agent.service did not start", r.stderr)
+        self.assertNotIn("systemctl start edr-inventory.service", self.calls())   # step 9 stopped there
+
+    # -- the state directory the first manifest write makes
+    def state_dir(self, exists):
+        return self.run_fn(["jr", "journaled", "ensure_dir", "make_state_dir"], '''
+STATE_A=$BASE/var-lib-edr-agent JOURNAL=$BASE/journal.tsv CURRENT_STEP=1
+install() { mkdir -p "${@: -1}"; }
+if [[ -n ${EXISTS:-} ]]; then mkdir -p "$STATE_A"; fi
+make_state_dir
+CURRENT_STEP=2
+ensure_dir "$STATE_A" 0700 edr-agent:edr-agent
+''', EXISTS="1" if exists else "")
+
+    def test_the_state_directory_the_kit_makes_is_recorded_absent_before_the_flush_creates_it(self):
+        r = self.state_dir(exists=False)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        path = os.path.join(self.base, "var-lib-edr-agent")
+        self.assertTrue(os.path.isdir(path))
+        self.assertEqual(self.journal(), ["dir\t2\t%s\tabsent" % path])           # one line, and it is the first one
+
+    def test_a_state_directory_that_was_there_is_recorded_present(self):
+        r = self.state_dir(exists=True)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.journal(), ["dir\t2\t%s\tpresent" % os.path.join(self.base, "var-lib-edr-agent")])
+
+    def test_the_main_flow_makes_the_state_dir_through_make_state_dir_before_the_first_flush(self):
+        src = text()
+        main = src[src.index("# ---- inside the unit edr-install"):]
+        self.assertLess(main.index("\nmake_state_dir\n"), main.index("manifest_flush running"))
+        self.assertNotIn('mkdir -p "$STATE_A"', main)                              # no unrecorded mkdir of its own
+
+    def test_the_first_record_of_a_directory_decides_across_sessions(self):
+        """The reader both scripts embed: the kit made the directory in the first session, so a later session that finds it
+        there (an upgrade, a second install) does not turn it into one that existed before the kit."""
+        progs = [p for p in extract_python(UNINSTALL) if "Prints tab-separated" in p]
+        manifest = os.path.join(self.base, "manifest.json")
+        d = lambda sid, prior: {**session(id=sid), "dirs": [{"path": "/var/lib/edr-agent", "prior": prior, "step": 2}]}  # noqa: E731
+        with open(manifest, "w") as f:
+            json.dump(manifest_doc(d("1234abcd-0000-4000-8000-000000000000", "absent"), d("1234abcd-0000-4000-8000-000000000001", "present")), f)
+        script = os.path.join(self.base, "reader.py")
+        with open(script, "w") as f:
+            f.write(progs[0])
+        r = subprocess.run([sys.executable, "-I", script, manifest, self.base, "all", "-"], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        rows = [l.split("\t") for l in r.stdout.splitlines() if l.startswith("entry\tdir\t")]
+        self.assertEqual([(row[2], row[3]) for row in rows], [("/var/lib/edr-agent", "absent")])
 
 
 class TestManifestWriter(RootCase):

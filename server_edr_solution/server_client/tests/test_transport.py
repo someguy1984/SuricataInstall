@@ -458,6 +458,20 @@ class TestBackoff(unittest.TestCase):
         self.assertGreater(max(samples), 100)
         self.assertLessEqual(max(samples), 128)       # the eighth failure's ceiling is 2**7
 
+    def test_a_per_draw_cap_lowers_the_ceiling_and_the_count_still_advances(self):
+        bo = tr.Backoff(300, rng=random.Random(4))
+        for _ in range(10):
+            bo.failure()
+        draws = [bo.failure(cap=60) for _ in range(200)]
+        self.assertLessEqual(max(draws), 60)
+        self.assertGreater(len(set(draws)), 150)              # uniform below the cap, not clipped to it
+        self.assertEqual(bo.n, 210)
+        self.assertLessEqual(max(tr.Backoff(300, rng=random.Random(4)).failure(cap=1000) for _ in range(3)), 1)   # never above the cap
+        bo2 = tr.Backoff(60, rng=random.Random(4))
+        for _ in range(8):
+            bo2.failure()
+        self.assertLessEqual(max(bo2.failure(cap=1000) for _ in range(100)), 60)
+
     def test_never_zero(self):
         bo = tr.Backoff(60, rng=random.Random(2))
         self.assertTrue(all(bo.failure() > 0 for _ in range(100)))

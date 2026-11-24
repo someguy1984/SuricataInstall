@@ -322,8 +322,9 @@ class Backoff:
         self.floor = floor
         self.n = 0
 
-    def failure(self):
-        ceiling = min(self.cap, self.base * (2 ** min(self.n, 30)))
+    def failure(self, cap=None):
+        """The next wait. `cap` lowers the cap for this one draw (the count still advances; the draw is still uniform)."""
+        ceiling = min(self.cap if cap is None else min(self.cap, float(cap)), self.base * (2 ** min(self.n, 30)))
         self.n += 1
         return max(min(self.floor, ceiling), self.rng.uniform(0, ceiling))
 

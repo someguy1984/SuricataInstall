@@ -540,6 +540,53 @@ class RestoreTests(BackupCase):
         os.unlink(b.paths.pending_audit)
         self.assertEqual(tree_hash(b.root), before)
 
+    def restore_box(self):
+        """A backup of box a, and a new box b with its own, different backup.pass (what a fresh install leaves)."""
+        a = self.box("a")
+        path = self.made_backup(a)
+        key = self.export_key(a)
+        b = self.box("b")
+        b.settings()
+        b.db.close()
+        return a, b, path, key
+
+    def test_restore_on_a_new_box_says_the_old_passphrase_must_be_placed_when_the_file_is_missing(self):
+        a, b, path, key = self.restore_box()
+        os.unlink(b.paths.backup_pass)
+        before = tree_hash(b.root)
+        self.assertEqual(hub_backup.restore(b.paths, path, ca_key=key, ca_passphrase=CA_PASS, log=self.say), 3)
+        text = "\n".join(self.log)
+        self.assertIn(b.paths.backup_pass, text)
+        self.assertIn("It must be the one the backup was made with", text)
+        self.assertIn("root, mode 0600", text)
+        self.assertIn("Nothing was changed", text)
+        os.unlink(b.paths.pending_audit)
+        self.assertEqual(tree_hash(b.root), before)
+
+    def test_restore_with_the_fresh_installs_own_passphrase_is_refused_with_the_same_advice(self):
+        a, b, path, key = self.restore_box()
+        with open(b.paths.backup_pass, "w") as f:
+            f.write("a-new-passphrase-from-the-fresh-install\n")
+        before = tree_hash(b.root)
+        self.assertEqual(hub_backup.restore(b.paths, path, ca_key=key, ca_passphrase=CA_PASS, log=self.say), 3)
+        text = "\n".join(self.log)
+        self.assertIn(b.paths.backup_pass, text)
+        self.assertIn("a fresh install writes a new one", text)
+        self.assertNotIn("a-new-passphrase", text)                                  # never printed
+        self.assertNotIn("backup-passphrase-one", text)
+        os.unlink(b.paths.pending_audit)
+        self.assertEqual(tree_hash(b.root), before)
+        shutil.copy(a.paths.backup_pass, b.paths.backup_pass)                       # placed by the operator: it restores
+        self.log.clear()
+        self.assertEqual(hub_backup.restore(b.paths, path, ca_key=key, ca_passphrase=CA_PASS, log=self.say), 0, self.log)
+
+    def test_a_missing_passphrase_file_on_backup_does_not_talk_about_restore(self):
+        a = self.box()
+        a.settings()
+        os.unlink(a.paths.backup_pass)
+        self.assertEqual(hub_backup.backup(a.paths, log=self.say), 3)
+        self.assertNotIn("restore", "\n".join(self.log))
+
     def test_restore_refuses_while_the_hub_runs(self):
         a = self.box("a")
         path = self.made_backup(a)

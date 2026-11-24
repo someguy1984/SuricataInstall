@@ -77,8 +77,10 @@ class TestHomeNet(TmpCase):
         self.assertEqual(rc, 0, err)
         with open(self.root + "/etc/suricata/edr-home-net.yaml") as fh:
             text = fh.read()
-        self.assertIn('HOME_NET: "[', text)
-        self.assertIn("vars:\n  address-groups:", text)
+        self.assertIn('vars.address-groups.HOME_NET: "[', text)
+        # Never a nested mapping: Suricata empties a mapping an include names again, which left HOME_NET as the
+        # only rule variable and failed the first install with Suricata (EXTERNAL_NET and HTTP_SERVERS undefined).
+        self.assertFalse([ln for ln in text.splitlines() if ln.rstrip().endswith(":") and not ln.lstrip().startswith("#")])
         with open(self.root + "/etc/suricata/home-net.extra") as fh:
             self.assertIn("10.116.0.0/20", fh.read())
         self.assertEqual(self.run_hn(["--check"])[0], 0)
@@ -86,7 +88,8 @@ class TestHomeNet(TmpCase):
         self.assertEqual(self.run_hn(["--check"], fx=fx)[0], 1)
         import yaml  # PyYAML is required in CI
         d = yaml.safe_load(text)
-        self.assertTrue(d["vars"]["address-groups"]["HOME_NET"].startswith("["))
+        self.assertEqual(list(d), ["vars.address-groups.HOME_NET"])
+        self.assertTrue(d["vars.address-groups.HOME_NET"].startswith("["))
 
     def test_a_failing_ip_command_is_reported_not_trusted(self):
         rc, out, err = self.run_hn(["--print"], fx={})
@@ -196,6 +199,52 @@ class TestDropletId(TmpCase):
         self.put("/var/lib/edr-agent/droplet-id", "bad id; rm -rf /\n")
         self.run_id(dead)
         self.assertFalse(os.path.exists(self.root + "/run/edr-droplet-id"))
+
+    # --seed: the unit's first, unsandboxed run (found by the first reboot in the mock: the sandboxed run cannot
+    # read the stored id in /var/lib/edr-agent, so /run/edr-droplet-id came back empty after a reboot).
+    def seed(self):
+        os.makedirs(self.root + "/run", exist_ok=True)
+        return run_helper("edr-droplet-id", ["--root", self.root, "--seed"])
+
+    def test_seed_makes_the_file_and_copies_the_stored_id(self):
+        self.put("/var/lib/edr-agent/droplet-id", "mock-droplet-1\n")
+        rc, out, err = self.seed()
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self.out(), "mock-droplet-1\n")
+        self.assertEqual(os.stat(self.root + "/run/edr-droplet-id").st_mode & 0o777, 0o640)
+
+    def test_seed_with_nothing_stored_leaves_an_empty_file(self):
+        rc, out, err = self.seed()
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self.out(), "")
+
+    def test_seed_never_replaces_an_id_that_is_there_and_ignores_a_bad_stored_value(self):
+        self.put("/run/edr-droplet-id", "999\n")
+        self.put("/var/lib/edr-agent/droplet-id", "mock-droplet-1\n")
+        self.seed()
+        self.assertEqual(self.out(), "999\n")
+        os.unlink(self.root + "/run/edr-droplet-id")
+        self.put("/var/lib/edr-agent/droplet-id", "bad id; rm -rf /\n")
+        self.seed()
+        self.assertEqual(self.out(), "")
+
+    def test_seed_does_not_follow_a_symlink_in_the_agents_directory(self):
+        self.put("/var/lib/edr-agent/elsewhere", "stolen-id\n")
+        os.symlink("elsewhere", self.root + "/var/lib/edr-agent/droplet-id")
+        self.seed()
+        self.assertEqual(self.out(), "")
+
+    def test_after_a_seed_a_silent_metadata_service_keeps_the_stored_id(self):
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        dead = s.getsockname()[1]
+        s.close()
+        self.put("/var/lib/edr-agent/droplet-id", "mock-droplet-1\n")
+        self.seed()
+        self.run_id(dead)
+        self.assertEqual(self.out(), "mock-droplet-1\n")
+        self.run_id()                                   # and a droplet's real id replaces it
+        self.assertEqual(self.out(), "12345678\n")
 
 
 class Hook(http.server.BaseHTTPRequestHandler):

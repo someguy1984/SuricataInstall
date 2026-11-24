@@ -27,6 +27,8 @@ HB_INTERVAL = 60.0
 POLICY_INTERVAL = 60.0
 JITTER = 0.10
 PACE_S = 1.0                     # at most one batch a second
+EVENTS_RETRY_S = 300.0           # cap of the events backoff (full jitter)
+HI_RETRY_S = 60.0                # the cap while a HIGH or CRITICAL event waits: the next try is never further off than this
 LO_FLUSH_S = 5.0                 # a low batch goes after 500 events or 5 s
 IDENT_CHECK_S = 5.0
 RENEW_RETRY_S = 86400.0
@@ -65,6 +67,8 @@ class Uplink:
         self._last_sync = 0.0
         self._pending_since = None
         self._batch_id = None
+        self._backoff_at = None          # when the failed attempt behind the current backoff hold was made
+        self._backoff_redrawn = False
         # status
         self.last_hb_ok = None
         self.hb_gen = ""
@@ -238,7 +242,7 @@ class Uplink:
                 pass
 
     def _events_loop(self):
-        bo = tr.Backoff(300.0, rng=self.rng)
+        bo = tr.Backoff(EVENTS_RETRY_S, rng=self.rng)
         last_send = 0.0
         while not self._stop.is_set():
             ident = self._refresh_ident()
@@ -252,6 +256,7 @@ class Uplink:
             if self._blocked(now):
                 self._stop.wait(1.0 if self._identity_changed else 5.0)
                 continue
+            self._shorten_backoff_for_hi()
             if now < self._holds["events"]:
                 self._stop.wait(min(5.0, self._holds["events"] - now))
                 continue
@@ -281,6 +286,24 @@ class Uplink:
                 # a hold, not a sleep: the loop keeps seeing the drop flag and the eviction records
                 self._holds["events"] = max(self._holds["events"], self.clock() + delay)
 
+    def _retry_delay(self, bo):
+        """Seconds until the next try after a 5xx, a timeout or a refused connection: full jitter, up to 5 minutes, and up to
+        1 minute while a HIGH or CRITICAL event waits (client PLAN 4.5, Timers). The upper bound moves, the jitter stays."""
+        hi = self.spool.depth("hi") > 0
+        self._backoff_at, self._backoff_redrawn = self.clock(), hi
+        return bo.failure(cap=HI_RETRY_S if hi else None)
+
+    def _shorten_backoff_for_hi(self):
+        """A backoff drawn while only low events waited can run for 5 minutes. When a HIGH or CRITICAL event is spooled
+        during it, draw again (once) within HI_RETRY_S of the failed attempt, so that such an event is never more than a
+        minute from the next try. A hold the hub asked for (Retry-After) or one of an hour is not touched."""
+        if self._backoff_at is None or self._backoff_redrawn or self.spool is None or self.spool.depth("hi") == 0:
+            return
+        self._backoff_redrawn = True
+        due = self._backoff_at + self.rng.uniform(0, HI_RETRY_S)
+        if due < self._holds["events"]:
+            self._holds["events"] = due
+
     def _post_events(self, events, batch_id):
         body, used, bid = tr.build_events_body(events, batch_id=batch_id)
         if used == 0:
@@ -292,6 +315,7 @@ class Uplink:
 
     def _send_batch(self, batch, bo):
         """Send one batch and act on the answer. Returns seconds to wait before the next attempt."""
+        self._backoff_at, self._backoff_redrawn = None, False
         key = (batch.lane, batch.seg, batch.start, len(batch.items))
         bid = self._batch_id[1] if self._batch_id and self._batch_id[0] == key else None
         events = batch.events
@@ -330,10 +354,8 @@ class Uplink:
         self._note_outcome("events", oc, self.ev_client)
         if oc.action == tr.WAIT:
             return oc.wait + self.rng.uniform(0, 1.0)
-        if oc.action == tr.BACKOFF:
-            return bo.failure()
-        if oc.action == tr.LOG_RETRY:
-            return bo.failure()
+        if oc.action in (tr.BACKOFF, tr.LOG_RETRY):
+            return self._retry_delay(bo)
         return 1.0
 
     def _split(self, batch, used, bo):
@@ -369,7 +391,7 @@ class Uplink:
             self._note_outcome("events", oc, self.ev_client)
             if oc.action == tr.WAIT:
                 return oc.wait + self.rng.uniform(0, 1.0)
-            return bo.failure() if oc.action in (tr.BACKOFF, tr.LOG_RETRY) else 1.0
+            return self._retry_delay(bo) if oc.action in (tr.BACKOFF, tr.LOG_RETRY) else 1.0
         self._batch_id = None
         return 0
 

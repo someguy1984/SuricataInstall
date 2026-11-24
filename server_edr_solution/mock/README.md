@@ -1,8 +1,8 @@
 # Mock environment
 
-Two Ubuntu 26.04 "droplets" in Docker, on a private network, for trying the server EDR locally before
-touching a real DigitalOcean box. Ubuntu 24.04 is not covered here yet (see "Planned additions"); it is tested in
-a VM.
+Two Ubuntu "droplets" in Docker, on a private network, for trying the server EDR locally before touching a real
+DigitalOcean box. They are Ubuntu 26.04 by default; `MOCK_UBUNTU=24.04` builds both on 24.04 instead (nginx 1.24,
+PHP 8.3, Python 3.12, systemd 255, OpenSSL 3.0). One release runs at a time, and every subcommand needs the same value.
 
 > **WARNING: use rootless Docker only. The boxes run `privileged`, which on rootful Docker is real root on this
 > machine.** The installers unload modules, set sysctls and write `/etc/modprobe.d`; on rootful Docker that
@@ -41,13 +41,14 @@ installers run inside them (`mock.sh install-hub`, `install-web`). The whole rep
     ./mock.sh logs web    # follow a box's journal
     ./mock.sh down        # stop and remove; add --volumes to also forget the certificates
 
-With the real installers, in this order (first run on 2026-11-24, see "First run" below):
+With the real installers, in this order (see "Runs so far" below):
 
     ./mock.sh dist          # make dist on this machine; copy each tarball and a hash made here into its box
     ./mock.sh install-hub   # disable the placeholder; unpack, check the hash, install.sh --plan, install.sh --yes
     ./mock.sh install-web   # the client, local mode: --no-kernel --no-tetragon --droplet-id mock-web --yes
                             # (+ --no-suricata unless MOCK_SURICATA=1; MOCK_WEB_FLAGS="..." adds flags)
     ./mock.sh enroll        # token made on the hub box, carried to the web box in a file, edr-agent enroll
+    ./mock.sh reboot        # restart both boxes; units, tables, the droplet id and the heartbeat must come back
     ./mock.sh e2e           # the checks below; every one PASS or FAIL, exit non-zero on a FAIL
     ./mock.sh uninstall     # edr-uninstall and the hub's uninstall.sh, the residue checks, the placeholder back
 
@@ -91,30 +92,70 @@ Run it after `install-hub`, `install-web` and `enroll`. `mock.sh` is the authori
 - `edr-check` on the web box and the hub's `check.sh` each exit 0 or 1.
 - `edr-hub host web revoke` gives the agent a 403 (`edr-agent status` shows `host_revoked`) and it keeps spooling.
 
+The Tetragon reader is off in a box installed with `--no-tetragon`, so `e2e` switches the reader on for the replay
+(`[kit] tetragon = on` and a restart of the agent, no `apply-config`) and off again at the end.
+
+`./mock.sh reboot` (after `enroll`, before `e2e`, which revokes the host) restarts both containers. That is a new
+systemd boot with an empty `/run` on the same disk and the same kernel, not a kernel reboot. It checks that the hub's
+three units, its table, `edr-hub health` and the backup timer are back; that `edr-agent`, the table `inet edr` (within
+30 s), the kit's timers and path units, nginx and php-fpm are back; that `/run/edr-droplet-id` holds the stored id
+again; that no unit failed in either box; and that the hub hears a heartbeat from the web box within 2 minutes.
+
 `./mock.sh uninstall` then runs both uninstallers and checks that no kit table (`inet edr_hub`, `inet edr`, `inet edr_dns`,
 `inet edr_isolate`), unit, listening port (8443, 8444, 8450) or process is left in either box, and puts the placeholder
 back on `:8443`.
 
-## First run (2026-11-24, rootless Docker, from freshly built boxes)
+## Runs so far (2026-11-24, rootless Docker, from freshly built boxes each time)
 
 `MOCK_HTTP_PORT=18080 MOCK_HTTPS_PORT=18443` was used, because port 80 was taken on the machine.
 
-| Step | Result |
-|------|--------|
-| `up`, `test` | 12 of 12 |
-| `dist`, `install-hub` | installed; the hub's `check.sh` 38 passed, 1 warning (no backup yet), 0 failed |
-| `install-web` | installed and confirmed; `edr-check` 25 passed, 8 warnings, 0 failed. The DNS step is skipped (`/etc/resolv.conf` is Docker's, not the resolved stub), so the DNS lock was not exercised |
-| `enroll` | the host is `pending`, then `active` |
-| `e2e` | 13 of 15. **Open:** (1) the recorded Tetragon line is not seen as a CRITICAL event at the hub: after `tetragon_replay on` the agent kept its old process id, so the restart or the reader did not take effect; not yet investigated. (2) "host_revoked and a spool with at least one event" timed out at 150 s; `edr-agent status` showed both a little later, so the limit or the trigger is wrong, not yet settled |
-| `uninstall` | both uninstallers exit 0; residue checks 13 of 13 |
+| Step | Ubuntu 26.04 | Ubuntu 24.04 |
+|------|--------------|--------------|
+| `up`, `test` | 12 of 12 | 12 of 12 |
+| `dist`, `install-hub` | installed; the hub's `check.sh` 38 passed, 1 warning (no backup yet), 0 failed | the same |
+| `install-web` | installed and confirmed; `edr-check` 25 passed, 0 failed (36 passed, 0 failed with `MOCK_SURICATA=1`) | the same |
+| `enroll` | the host is `pending`, then `active` | the same |
+| `reboot` | 13 of 13 | 13 of 13 |
+| `e2e` | 15 of 15 (16 of 16 with `MOCK_SURICATA=1`) | the same |
+| `uninstall` | both uninstallers exit 0; residue checks 15 of 15 (16 of 16 with `MOCK_SURICATA=1`) | the same |
 
-The first run found and fixed these (each has a unit test where one could be written): the hub installer wrote its
-manifest before `/etc/edr-hub` existed, and installed a package without `apt-get update`; the client's `local.conf`
-lost its `edr-agent` group when a key was written, so the agent could not read it; `edr-droplet-id.service` (and, by
-the same rule, `edr-dns-watch.service`) failed at step NAMESPACE on a path that did not exist yet; `check.sh` tested
-the packaged dnscrypt-proxy file, not the kit's; a skipped DNS step was not recorded, so `check.sh` failed on it; a
-second `install.sh` did not restart the running agent; `uninstall.sh` left `/var/lib/edr-bans`. In a box installed
-with `--no-kernel` the agent's failed network-filter self-test is now a WARN in `edr-check`, not a FAIL.
+Each release was run both without Suricata (the default) and with it (`MOCK_SURICATA=1`: Suricata 8.0.8 from the OISF
+PPA, af-packet on the box's default-route interface, the full rule set, about 33,000 rules loaded). With Suricata,
+`e2e` also sends one request from this machine through the published port for a path an Emerging Threats rule
+alerts on, and expects a `suricata.alert` event at the hub; `uninstall` also checks that Suricata, which the kit
+installed, is gone with its directories.
+
+Not exercised in any run: the DNS step (`/etc/resolv.conf` is Docker's, not the resolved stub, so the installer skips
+it and nothing is locked), Tetragon and every kernel step (`--no-tetragon`, `--no-kernel`). Suricata's performance and
+memory figures mean nothing here (20 cores, no limit enforced).
+
+What the runs found and fixed (each has a unit test where one could be written):
+
+- **Hub installer:** it wrote its manifest before `/etc/edr-hub` existed, and installed a package without `apt-get update`.
+- **Client installer:** `local.conf` lost its `edr-agent` group when a key was written, so the agent could not read
+  it; a skipped DNS step was not recorded (so `check.sh` failed on it) and left the packaged dnscrypt-proxy units
+  enabled, which then failed at every boot; a second `install.sh` did not restart the running agent.
+- **Units:** `edr-droplet-id.service` (and, by the same rule, `edr-dns-watch.service`) failed at step NAMESPACE on a
+  path that did not exist yet. After a reboot `/run/edr-droplet-id` came back empty on a host that relies on the
+  stored id, because the sandboxed helper cannot read the agent's own directory: an unsandboxed `--seed` run now
+  copies it first.
+- **Suricata step (it had never run):** the generated `HOME_NET` include named the `vars:` mapping again, and
+  Suricata empties a mapping that an include names again, so every other rule variable was gone and the rule set would
+  not load: the include now holds one dotted key. The unit override left Suricata unable to read `/etc/suricata`
+  (the package makes it `suricata:suricata 0750` and the override has no `CAP_DAC_OVERRIDE`): it now has the
+  `suricata` group. Its capability list was two short for Suricata's own change of user (`CAP_SETPCAP`,
+  `CAP_SYS_NICE`); the six it needs were measured. `/run/suricata` was gone after a reboot, so the command socket
+  and every stop failed: the unit makes it at each start. `edr-home-net.service` could not write `/etc/suricata`
+  and failed at every timer run. `edr-check` could not read `HOME_NET` back because the file's own `---` line was
+  taken for a separator. The uninstaller left `/etc/suricata`, `/var/lib/suricata`, the logs and two units listed
+  as failed.
+- **`check.sh`:** it tested the packaged dnscrypt-proxy file, not the kit's. In a box installed with `--no-kernel`
+  the agent's failed network-filter self-test is now a WARN, not a FAIL.
+- **Client uninstaller:** it left `/var/lib/edr-bans`. On 24.04 (systemd 255) `systemctl disable --now A B C` does
+  nothing when one unit file is missing, so the ban timer kept running and rebuilt the table the uninstaller had just
+  deleted: units are now stopped and disabled one at a time.
+- **The mock itself:** published ports can be moved; `enroll` can be run twice; the placeholder no longer needs
+  `LoadCredential` (see the `LoadCredential` row of the table below).
 
 ## Docker requirements and safety
 
@@ -174,9 +215,10 @@ Containers share this machine's kernel, so anything that changes the kernel itse
 | Hub install, the `edr-hub` units, sockets and users, the `edr_hub` nftables table (load, rate meters; `--clients-only` is not in this release) | yes, inside the hub box's own network namespace (`install-hub`). The `meta skuid` rule that stops `edr-hub` calling out is proven in a throwaway network namespace (hub section 12, L1) and re-checked in a VM |
 | Hub `IPAddressDeny` and `MemoryMax` limits | **no**, for the same reasons as the two rows above; the rest of the hub's sandbox (`ProtectProc`, `PrivateNetwork`, users, sockets) yes |
 | Enrollment (`:8444`, `/v1/ca`, `/v1/enroll`, a token carried in a file) | yes, against the real hub (`enroll`) |
-| mTLS (client certificate required on `:8443`), heartbeats, events, the host going `pending` then `active`, revoke | yes, against the real hub (`e2e`: two checks still fail, see "First run") |
+| mTLS (client certificate required on `:8443`), heartbeats, events, the host going `pending` then `active`, revoke | yes, against the real hub (`e2e`) |
 | `rehome` and restore | **not yet**: needs a second hub (see "Planned additions") |
 | Local auto-bans from real source addresses | **not yet**: all traffic arrives from private addresses, which are never banned |
+| `LoadCredential` (`edr-hub-out` and `edr-hub-failed` read `secrets.json` through it, `edr-notify` its URL and the alert file) | on 26.04 (systemd 259) yes. On 24.04 (systemd 255) **no**: under rootless Docker `$CREDENTIALS_DIRECTORY` is set but the directory does not exist (tested with a transient unit, with and without `DynamicUser`), so in a 24.04 box the hub has no webhook secret and sends no alert, and nothing reports that. A real 24.04 host is not affected; alert delivery on 24.04 needs the VM tier |
 | Clock changes (certificate renewal at 30 days) | **no**. `CAP_SYS_TIME` does not move the shared clock; use `libfaketime` per service |
 | **Tetragon** (eBPF) | **no**. It would load into this machine's kernel, and under rootless Docker it can't load at all. Replay recorded Tetragon JSON into the agent instead |
 
@@ -204,9 +246,6 @@ Not built yet. Each stays optional, in its own compose profile where it adds a b
   trusted. Sysctls are not probed: the client installer runs with `--no-kernel`, so no sysctl row is tested here.
 - An `attacker` box (curl, nmap, ssh client, h2load) on a new `edr_wan` network, using `198.18.77.0/24` as the
   droplet's "public" side with the web box's default route on it, for ban, scan and h2c tests.
-- A 24.04 variant of both images (`UBUNTU_TAG` and a PHP version as Dockerfile build args: PHP 8.3 and
-  Ubuntu's nginx 1.24 package), each running the enrolment and mTLS round trip (the client installed with `--droplet-id`). Hub tests on Python 3.12 (24.04)
-  need it; until it exists they run in a VM.
 - A second hub, `hub2` at `10.77.0.11`, for `rehome` and restore tests.
 - `libfaketime` in the web image, and `sudo` or `runuser` for the canaries. (`openssh-server` is in the image now.)
 - A Laravel-like app: the Laravel nginx block (only `index.php` runs, catch-all `default_server` returning 444), a
@@ -222,8 +261,8 @@ Not built yet. Each stays optional, in its own compose profile where it adds a b
 |------|---------|
 | `compose.yaml` | The two boxes, both networks, published ports, certificate volumes |
 | `compose.caps.yaml` | Opt-in (`MOCK_CAPS=1`): the boxes with a capability list instead of `privileged`; not boot-tested yet |
-| `Dockerfile` | One shared `base` stage (Ubuntu 26.04 and systemd), then `hub` and `web` targets (the web target also has `openssh-server`) |
-| `mock.sh` | `up`, `test`, `status`, `shell`, `logs`, `down`; and, for the real installers, `dist`, `install-hub`, `install-web`, `enroll`, `e2e`, `uninstall` |
+| `Dockerfile` | One shared `base` stage (Ubuntu 26.04 or 24.04, and systemd), then `hub` and `web` targets (the web target also has `openssh-server`) |
+| `mock.sh` | `up`, `test`, `status`, `shell`, `logs`, `down`; and, for the real installers, `dist`, `install-hub`, `install-web`, `enroll`, `reboot`, `e2e`, `uninstall` |
 | `common/mock-tls.sh` | Creates a self-signed certificate on first boot, so no private key is baked into an image |
 | `hub/*.service`, `web/mock-tls.service` | Certificate units, and the `:8443` placeholder. `mock.sh install-hub` disables the placeholder and `mock.sh uninstall` enables it again |
 | `web/web.dev.local.conf`, `web/web.dev.local.common` | The nginx site: `:80`, and `:443` with HTTP/2 |

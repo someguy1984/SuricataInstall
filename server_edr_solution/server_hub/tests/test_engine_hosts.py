@@ -445,6 +445,20 @@ class SilentTests(HostCase):
         self.tick(T0 + 10 * HOUR + 20_000)
         self.assertEqual(len(self.alerts("hub.orphan")), 1)
 
+    def test_the_orphan_alert_has_the_rules_table_meaning_and_names_the_adopt_command(self):
+        import hub_rules
+        orphan = self.hub.add_host("orph1", state="orphan")
+        self.hub.set_host(self.host["uuid"], last_seen=T0 + 10 * HOUR)
+        self.tick(T0 + 10 * HOUR)
+        (a,) = self.alerts("hub.orphan")
+        p = a["payload"]
+        rule = hub_rules.RULES_BY_ID["orphan"]
+        self.assertEqual((p["severity"], p["meaning"], p["next_step"]), ("HIGH", rule["meaning"], rule["next_step"]))
+        self.assertNotIn("no rule of its own", p["meaning"].lower())
+        self.assertEqual(p["fields"]["adopt with"], "edr-hub host %s adopt" % orphan["uuid"])
+        self.assertIn("orph1", p["title"])
+        self.assertTrue(p["incident_id"] and "edr-hub incident %d" % p["incident_id"] in p["commands"])
+
     def test_retired_moved_and_revoked_hosts_are_not_reported_silent(self):
         for st in ("retired", "moved", "revoked"):
             self.hub.add_host("h-" + st, state=st, last_seen=T0 - DAY)

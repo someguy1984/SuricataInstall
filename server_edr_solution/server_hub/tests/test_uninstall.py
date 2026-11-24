@@ -183,6 +183,53 @@ class PlanTests(PlanCase):
         self.assertIn("put the saved prior copy back at %s" % p, out)
         self.assertNotIn("changed since install", out)
 
+    def test_no_disable_call_names_more_than_one_unit(self):
+        """systemd 255 (Ubuntu 24.04) does nothing for `systemctl disable --now A B` when one unit file is missing."""
+        seen = 0
+        for script in (SCRIPT, os.path.join(os.path.dirname(SCRIPT), "install.sh")):
+            with open(script) as f:
+                for no, line in enumerate(f, 1):
+                    code = line.strip()
+                    if code.startswith(("#", "echo", "say ")) or "UNIT_OFF) echo" in code:
+                        continue
+                    for m in re.finditer(r"systemctl\s+disable\s+([^;&|<>)\n]*)", code):
+                        words = [w for w in m.group(1).split() if not w.startswith("-") and w != "2"]
+                        seen += 1
+                        self.assertLessEqual(len(words), 1, "%s:%d names %d units: %s" % (os.path.basename(script), no, len(words), code))
+        self.assertGreaterEqual(seen, 4)
+
+    def test_the_final_unit_list_ignores_the_bullet_list_units_prints_without_plain(self):
+        with open(SCRIPT) as f:
+            statement = re.search(r"^units=\$\(\{.*?\)$", f.read(), re.S | re.M).group(0)
+        harness = os.path.join(self.root, "list.sh")
+        with open(harness, "w") as f:
+            f.write('''systemctl() {
+    case $1 in
+        list-unit-files) ;;
+        list-units) if [[ " $* " == *" --plain "* ]]; then echo "edr-hub-ui.service loaded failed failed UI"; else echo "● edr-hub-ui.service loaded failed failed UI"; fi ;;
+    esac
+}
+%s
+echo "LIST=[$units]"
+''' % statement)
+        r = subprocess.run(["bash", harness], capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("LIST=[edr-hub-ui.service]", r.stdout)
+
+    def test_the_first_prior_of_a_directory_decides_too(self):
+        """A second install records a directory the kit made as present (it is there); the first line still says absent."""
+        made, found = os.path.join(self.etc, "d"), os.path.join(self.etc, "e")
+        os.makedirs(made)
+        os.makedirs(found)
+        self.manifest({"ts": 1, "kind": "dir", "path": made, "prior": "absent"},
+                      {"ts": 2, "kind": "dir", "path": found, "prior": "present"},
+                      {"ts": 3, "kind": "dir", "path": made, "prior": "present"},
+                      {"ts": 4, "kind": "dir", "path": found, "prior": "absent"})
+        out = self.plan().stdout
+        self.assertIn("remove directory %s if it is empty" % made, out)
+        self.assertNotIn("leave %s: it existed" % made, out)
+        self.assertIn("leave %s: it existed before the kit" % found, out)
+
     def test_an_edited_file_is_reported_and_removed_only_when_the_prior_is_absent(self):
         edited = self.write("edited.conf", "operator changed me\n")
         keep = self.write("keep.conf", "operator changed me too\n")

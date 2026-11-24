@@ -160,12 +160,21 @@ class TestUnitFiles(unittest.TestCase):
     def test_a_writable_path_the_unit_makes_itself_is_optional(self):
         # A path that may be missing when the unit starts (both are on the /run tmpfs) is written "-PATH" and made by
         # a "+" command: without the "-" systemd fails that very command at step NAMESPACE (first mock install).
-        for unit, path in (("edr-droplet-id.service", "/run/edr-droplet-id"), ("edr-dns-watch.service", "/run/systemd/resolved.conf.d")):
+        for unit, path, maker in (("edr-droplet-id.service", "/run/edr-droplet-id", "/usr/local/lib/edr-agent/edr-droplet-id --seed"),
+                                  ("edr-dns-watch.service", "/run/systemd/resolved.conf.d", "/run/systemd/resolved.conf.d")):
             s = directives(read(unit))
             self.assertEqual(s[("Service", "ReadWritePaths")], ["-" + path], unit)
             pre = s[("Service", "ExecStartPre")]
             self.assertEqual(len(pre), 1, unit)
-            self.assertTrue(pre[0].startswith("+") and path in pre[0], unit)
+            self.assertTrue(pre[0].startswith("+") and maker in pre[0], unit)
+
+    def test_the_droplet_id_unit_reads_the_stored_id_outside_its_sandbox(self):
+        # Found by the first reboot in the mock: the stored id is in /var/lib/edr-agent (edr-agent, 0700), and the
+        # main run is root with no capability, so it cannot enter that directory. The "+" run seeds the file.
+        s = directives(read("edr-droplet-id.service"))
+        self.assertEqual(s[("Service", "CapabilityBoundingSet")], [""])
+        self.assertEqual(s[("Service", "ExecStartPre")], ["+/usr/bin/python3 -I /usr/local/lib/edr-agent/edr-droplet-id --seed"])
+        self.assertNotIn("--seed", s[("Service", "ExecStart")][0])
 
     def test_notify_unit_follows_the_plan(self):
         s = directives(read("edr-notify.service"))
@@ -202,13 +211,25 @@ class TestUnitFiles(unittest.TestCase):
         self.assertEqual(s[("Unit", "After")], ["network-online.target edr-droplet-id.service"])
         self.assertEqual(s[("Unit", "Wants")], ["edr-droplet-id.service"])
         self.assertNotIn(("Service", "IPAddressAllow"), s)           # the root-written drop-in holds the hub addresses
+        # a rehome killed in step 7 is finished by root before the next start (PLAN 5); "-" so a failure never stops the agent
+        self.assertEqual(s[("Service", "ExecStartPre")], ["-+/usr/bin/python3 -I /usr/local/lib/edr-agent/edr-agent.py rehome-resume"])
 
     def test_suricata_drop_in_follows_the_plan(self):
         s = directives(read("suricata-edr-override.conf"))
+        # The bounding set has no CAP_DAC_OVERRIDE, and the package's /etc/suricata is suricata:suricata 0750: the
+        # group is what lets the start read suricata.yaml and ExecStop reach the command socket (first install
+        # with Suricata in the mock: "failed to open /etc/suricata/suricata.yaml: Permission denied").
+        self.assertNotIn("CAP_DAC_OVERRIDE", s[("Service", "CapabilityBoundingSet")][0])
+        self.assertNotIn("CAP_DAC_READ_SEARCH", s[("Service", "CapabilityBoundingSet")][0])
+        self.assertEqual(s[("Service", "SupplementaryGroups")], ["suricata"])
         self.assertNotIn(("Service", "ExecStart"), s)                # the packaged af-packet ExecStart stays
-        self.assertEqual(s[("Service", "ExecStartPre")], ["-+/usr/bin/python3 -I /usr/local/lib/edr-agent/edr-home-net --no-reload"])
+        # the second line makes /run/suricata at every start: it is on a tmpfs, and without it the command socket
+        # (and so ExecStop) was gone after the first reboot in the mock
+        self.assertEqual(s[("Service", "ExecStartPre")], ["-+/usr/bin/python3 -I /usr/local/lib/edr-agent/edr-home-net --no-reload",
+                                                         "+/usr/bin/install -d -o suricata -g suricata -m 2770 /run/suricata"])
         self.assertEqual(s[("Service", "AmbientCapabilities")], ["CAP_NET_RAW"])
-        self.assertEqual(s[("Service", "CapabilityBoundingSet")], ["CAP_NET_RAW CAP_NET_ADMIN CAP_SETUID CAP_SETGID"])
+        # the six were measured in the mock (Suricata 8.0.8, af-packet): one fewer and the start fails at capng_change_id
+        self.assertEqual(s[("Service", "CapabilityBoundingSet")], ["CAP_NET_RAW CAP_NET_ADMIN CAP_SYS_NICE CAP_SETUID CAP_SETGID CAP_SETPCAP"])
         self.assertEqual(s[("Service", "ReadWritePaths")], ["/var/log/suricata /var/lib/suricata /run"])
         for k, v in (("OOMScoreAdjust", "800"), ("MemoryHigh", "1000M"), ("MemoryMax", "1300M"), ("Restart", "on-failure"), ("RestartSec", "30"),
                      ("Nice", "10"), ("CPUWeight", "50"), ("IOWeight", "20")):
@@ -217,6 +238,15 @@ class TestUnitFiles(unittest.TestCase):
         self.assertNotIn(("Service", "MemoryDenyWriteExecute"), s)
         for gone in ("-q 0", "nfqueue", "StartLimitIntervalSec=0", "RestartSec=1\n"):
             self.assertNotIn(gone, "\n".join(l for l in read("suricata-edr-override.conf").splitlines() if not l.startswith("#")) + "\n")
+
+    def test_home_net_unit_can_write_the_packages_directory_and_nothing_else(self):
+        # /etc/suricata is suricata:suricata 0750 (the package's choice): root with an empty bounding set could not
+        # read or write there, and the unit failed at every timer run (first install with Suricata in the mock).
+        s = directives(read("edr-home-net.service"))
+        self.assertEqual(s[("Service", "CapabilityBoundingSet")], ["CAP_DAC_OVERRIDE"])
+        self.assertEqual(s[("Service", "ProtectSystem")], ["strict"])
+        self.assertEqual(s[("Service", "ReadWritePaths")], ["/etc/suricata"])
+        self.assertEqual(s[("Service", "IPAddressDeny")], ["any"])
 
     def test_rule_update_unit_follows_the_plan(self):
         s = directives(read("edr-rules-update.service"))

@@ -8,8 +8,9 @@
     resume
 
 The token is read from a file or from stdin, never from the command line. Also here, for the
-installer and the unit files: `deregister --reason uninstall|rehome` and the hidden `hub-net`,
-the network part of enrollment that runs in a sandbox as edr-agent with a JSON request on stdin.
+installer and the unit files: `deregister --reason uninstall|rehome`, the hidden `hub-net`,
+the network part of enrollment that runs in a sandbox as edr-agent with a JSON request on stdin, and the hidden
+`rehome-resume`, which the agent's unit runs as root before every start to finish a rehome killed in step 7.
 Exit codes are PLAN section 15: 0 done, 2 failed, 3 refused, 4 rolled back, 5 not enrolled, 64 usage.
 """
 
@@ -220,6 +221,17 @@ def cmd_rehome(args):
     if rc == 0:
         _say("rehomed to %s" % hub)
     return rc
+
+
+def cmd_rehome_resume(args):
+    """Hidden. The unit's ExecStartPre= (root, before every start of edr-agent): finish a rehome killed in step 7,
+    touch nothing else (PLAN 5, last row of the rollback table). Never stops the agent from starting: the unit
+    ignores the exit code."""
+    paths = _paths()
+    if not _need_root(paths):
+        return EXIT_REFUSED
+    res = idn.resume(paths, idn.SystemOps(paths), log=_say)
+    return EXIT_FAIL if res == "failed" else EXIT_OK
 
 
 # ---- deregister and the hidden network phase ---------------------------------------------------
@@ -481,3 +493,6 @@ def register(subparsers):
 
     p = subparsers.add_parser("hub-net")          # no help line: it is for the enrollment sandbox only
     p.set_defaults(func=cmd_hub_net)
+
+    p = subparsers.add_parser("rehome-resume")    # no help line: it is for the unit's ExecStartPre= only
+    p.set_defaults(func=cmd_rehome_resume)

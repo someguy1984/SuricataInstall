@@ -342,7 +342,7 @@ class ManifestTests(InstallCase):
     """The real step functions, sourced, with run() replaced by a logger: the manifest they write must be one that
     uninstall.sh accepts, and every file is recorded before it is changed."""
 
-    def harness(self, body):
+    def harness(self, body, make_dirs=False):
         script = r'''
 set -Eeuo pipefail
 source "$INSTALL"
@@ -362,9 +362,18 @@ EFF_PORT=8443 EFF_ENROLL=8444 EFF_UI=8450 SSH_PORT=22 CA_SHA=abc NEW_VERSION=0.1
 FINAL_PUBLIC=(203.0.113.10) FINAL_ADMIN=(192.0.2.0/24 2001:db8::/32) OVER_SSH=0
 MIGRATING=0
 '''
+        if make_dirs:           # a directory that install -d would make is made (mkdir is a stub on PATH), so a later write into it can work
+            script += '''
+run() {
+    printf 'NEW\\t%s\\n' "$*" >> "$CALLS_LOG"
+    if [[ $1 == install && $2 == -d ]]; then /bin/mkdir -p -- "${!#}"; fi
+}
+'''
         with open(os.path.join(self.root, "harness.sh"), "w") as f:
             f.write(script + body)
         env = self.env(INSTALL=SCRIPT, CALLS=os.path.join(self.root, "run.log"))
+        if os.path.exists(env["CALLS"]):
+            os.unlink(env["CALLS"])
         r = subprocess.run(["bash", os.path.join(self.root, "harness.sh")], capture_output=True, text=True, env=env, timeout=120)
         return r
 
@@ -512,6 +521,38 @@ MIGRATING=0
                      "file /etc/x absent notahash"):
             r = self.harness("manifest_add %s\n" % args)
             self.assertNotEqual(r.returncode, 0, args)
+
+    def test_the_first_record_needs_no_etc_directory_because_step_users_makes_it_first(self):
+        """On a host with no /etc/edr-hub the manifest lives in a directory that does not exist yet: step_users starts with
+        step_etc, so the directory is made (and recorded) before the first group or user line is written."""
+        shutil.rmtree(self.etc)
+        r = self.harness("step_users\n", make_dirs=True)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("No such file or directory", r.stderr)
+        lines = self.manifest_lines()
+        self.assertEqual(lines[0]["kind"], "dir")
+        self.assertEqual((lines[0]["path"], lines[0]["prior"]), (self.etc, "absent"))
+        self.assertTrue(any(l["kind"] == "group" for l in lines[1:]))
+        first_install = next(i for i, (_s, cmd) in enumerate(self.run_log()) if cmd.startswith("install -d -m 0750 -o root -g root " + self.etc))
+        first_user = next(i for i, (_s, cmd) in enumerate(self.run_log()) if cmd.startswith("useradd "))
+        self.assertLess(first_install, first_user)
+
+    def test_updates_refresh_the_package_lists_first_and_only_when_the_package_is_absent(self):
+        r = self.harness("apt-config() { :; }\nstep_updates\n")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        cmds = [cmd for _s, cmd in self.run_log()]
+        update = [i for i, c in enumerate(cmds) if "apt-get" in c and " update" in c]
+        install = [i for i, c in enumerate(cmds) if "apt-get" in c and "install" in c]
+        self.assertEqual((len(update), len(install)), (1, 1), cmds)
+        self.assertLess(update[0], install[0])
+        for c in (cmds[update[0]], cmds[install[0]]):
+            self.assertIn("-o DPkg::Lock::Timeout=300", c)                    # a lock held by cloud-init is waited for
+        self.assertTrue(cmds[install[0]].endswith("install -y -qq unattended-upgrades"))
+        os.unlink(os.path.join(self.etc, "manifest.jsonl"))
+        r = self.harness("apt-config() { :; }\npackage_present() { return 0; }\nstep_updates\n")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual([c for _s, c in self.run_log() if "apt-get" in c], [])   # nothing is refreshed or installed twice
+        self.assertFalse(os.path.exists(os.path.join(self.etc, "manifest.jsonl")))   # a package that was there is not the kit's
 
     def test_manifest_dir_line_is_first_and_etc_is_not_made_by_a_stub_run(self):
         shutil.rmtree(self.etc)

@@ -403,7 +403,7 @@ plan() {
     else echo "stop and remove tetragon, /usr/local/bin/tetragon and tetra, /usr/local/lib/tetragon, /etc/tetragon, the edr-canary policy and /usr/libexec/edr$([[ $KEEP_LOGS -eq 1 ]] || echo ', then /var/log/tetragon')"; fi
     say "Step 8: Suricata"
     if [[ $KEEP_SURICATA -eq 1 ]]; then echo "skipped: --keep-suricata (the kit's log rotation still goes in step 5)"
-    else echo "stop Suricata, purge it if the kit installed it, remove the kit's rules, cache, home-net files, update units and apt pin; remove the OISF PPA only if the kit added it; then purge nftables if the kit installed it"; fi
+    else echo "stop Suricata, purge it if the kit installed it, remove the kit's rules, cache, home-net files, update units and apt pin, and where the kit installed the package also /etc/suricata, /var/lib/suricata and (without --keep-logs) /var/log/suricata; remove the OISF PPA only if the kit added it; then purge nftables if the kit installed it"; fi
     say "Step 4 to 11, the manifest, last entry first ($mf)"
     out=$(manifest_parse "$mf") || { echo "could not parse the manifest"; return 3; }
     if grep -q $'^manifest\tmissing' <<<"$out"; then
@@ -540,13 +540,26 @@ else
     echo "not enrolled: nothing to deregister"
 fi
 
+# One unit at a time, and stop before disable. With systemd 255 (Ubuntu 24.04) `systemctl disable --now A B C` does
+# nothing at all when one of the units has no unit file, so one optional unit that was never installed left the
+# others running: in the 24.04 mock edr-bans.timer rebuilt the table that step 2 had just deleted.
+off_units() {   # off_units UNIT...
+    local u
+    for u in "$@"; do
+        systemctl stop "$u" >/dev/null 2>&1 || true
+        systemctl disable "$u" >/dev/null 2>&1 || true
+        systemctl reset-failed "$u" >/dev/null 2>&1 || true
+    done
+}
+
 say "Step 1: stopping everything that rebuilds or re-locks"
 systemctl stop edr-install-rollback.timer edr-install-rollback.service edr-install.service edr-agent-pause-end.timer edr-agent-pause-end.service \
     edr-agent-rehome-rollback.timer edr-agent-rehome-rollback.service >/dev/null 2>&1 || true
 systemctl reset-failed edr-install-rollback.service edr-agent-pause-end.service >/dev/null 2>&1 || true
-systemctl disable --now edr-bans.path edr-bans.timer edr-policy-check.timer >/dev/null 2>&1 || true
-[[ $KEEP_DNS -eq 1 ]] || systemctl disable --now edr-dns-watch.timer >/dev/null 2>&1 || true
-[[ $KEEP_SURICATA -eq 1 ]] || systemctl disable --now edr-home-net.timer >/dev/null 2>&1 || true
+off_units edr-bans.path edr-bans.timer edr-policy-check.timer
+systemctl stop edr-bans.service >/dev/null 2>&1 || true      # a run in flight would put the table back
+[[ $KEEP_DNS -eq 1 ]] || off_units edr-dns-watch.timer
+[[ $KEEP_SURICATA -eq 1 ]] || off_units edr-home-net.timer
 nft delete table inet edr_isolate >/dev/null 2>&1 || true
 
 say "Step 2: the inet edr table"
@@ -557,14 +570,14 @@ if [[ $KEEP_DNS -eq 1 ]]; then
     echo "kept by --keep-dns"
 else
     nft delete table inet edr_dns >/dev/null 2>&1 && echo "deleted table inet edr_dns"
-    systemctl disable --now edr-dnslock.service >/dev/null 2>&1 || true
+    off_units edr-dnslock.service
     rm -f -- /etc/systemd/resolved.conf.d/zz-edr-doh.conf /run/systemd/resolved.conf.d/zzz-edr-failopen.conf /etc/systemd/system/edr-dnslock.service
     systemctl daemon-reload >/dev/null 2>&1 || true
     systemctl restart systemd-resolved.service >/dev/null 2>&1 || true
     sleep 2
     if lookup_ok; then
         echo "a lookup works through the system resolver"
-        systemctl disable --now dnscrypt-proxy.socket dnscrypt-proxy.service >/dev/null 2>&1 || true
+        off_units dnscrypt-proxy.socket dnscrypt-proxy.service dnscrypt-proxy-resolvconf.service
         rm -f -- /etc/systemd/system/dnscrypt-proxy.service.d/50-edr.conf
         rmdir /etc/systemd/system/dnscrypt-proxy.service.d 2>/dev/null || true
         systemctl daemon-reload >/dev/null 2>&1 || true
@@ -581,8 +594,7 @@ fi
 say "Step 5: units, hooks and local alerts"
 replay_kind unit '9'
 replay_kind file '9'
-systemctl disable --now edr-notify.path edr-notify.service edr-agent.service edr-inventory.timer edr-diskguard.timer edr-droplet-id.service \
-    edr-rules-update.timer >/dev/null 2>&1 || true
+off_units edr-notify.path edr-notify.service edr-agent.service edr-inventory.timer edr-diskguard.timer edr-droplet-id.service edr-rules-update.timer
 rm -f -- /etc/systemd/system/edr-agent.service.d/*.conf
 rmdir /etc/systemd/system/edr-agent.service.d 2>/dev/null || true
 rm -f -- /etc/apt/apt.conf.d/zz-edr-inventory /etc/apt/apt.conf.d/zz-edr-policy-check /etc/needrestart/conf.d/50-edr.conf /etc/update-motd.d/90-edr
@@ -634,8 +646,18 @@ else
     replay_kind unit '4'
     replay_kind file '4'
     rm -rf /var/lib/suricata/cache/sgh
+    rm -f -- /etc/suricata/.edr-home-net.lock
     systemctl daemon-reload >/dev/null 2>&1 || true
     purge_package suricata
+    # The purge leaves what was made after the install: the downloaded rules, the cache, the logs, and
+    # /etc/suricata itself. They go only when the package was the kit's, and the logs stay with --keep-logs.
+    if grep -q -P "^entry\tpackage\tsuricata\t1\t" <<<"$MANIFEST_OUT" && ! dpkg-query -W -f='${Status}' suricata 2>/dev/null | grep -q 'install ok installed'; then
+        rm -rf -- /var/lib/suricata /etc/suricata /run/suricata
+        echo "removed /var/lib/suricata and /etc/suricata (the kit installed Suricata)"
+        if [[ $KEEP_LOGS -eq 0 ]]; then rm -rf -- /var/log/suricata; echo "removed /var/log/suricata"; else echo "kept /var/log/suricata (--keep-logs)"; fi
+    fi
+    # a stop that failed (no command socket) or a oneshot that failed leaves the unit listed as failed after its file is gone
+    for u in suricata.service edr-home-net.service edr-rules-update.service; do systemctl reset-failed "$u" >/dev/null 2>&1 || true; done
     if grep -q -P $'^entry\tppa\t\\S+\t1\t' <<<"$MANIFEST_OUT"; then
         add-apt-repository -y -r ppa:oisf/suricata-stable && echo "removed the OISF PPA"
     else echo "left the OISF PPA (the kit did not add it, or it is not there)"; fi
@@ -693,7 +715,7 @@ if nft list table inet edr >/dev/null 2>&1; then fail "table inet edr is still l
 if [[ $KEEP_DNS -eq 1 ]]; then kept --keep-dns "inet edr_dns"
 elif nft list table inet edr_dns >/dev/null 2>&1; then fail "table inet edr_dns is still loaded"; else pass "no inet edr_dns table"; fi
 if nft list table inet edr_isolate >/dev/null 2>&1; then fail "table inet edr_isolate is still loaded"; else pass "no inet edr_isolate table"; fi
-left=$({ systemctl list-unit-files --no-legend 'edr-*' 2>/dev/null; systemctl list-units --all --no-legend 'edr-*' 2>/dev/null; } | awk 'NF {print $1}' | sort -u \
+left=$({ systemctl list-unit-files --no-legend 'edr-*' 2>/dev/null; systemctl list-units --all --plain --no-legend 'edr-*' 2>/dev/null; } | awk 'NF {print $1}' | sort -u \
     | grep -v -E '^(edr-install|edr-agent-pause-end|edr-agent-rehome-rollback)' || true)
 if [[ $KEEP_DNS -eq 1 ]]; then left=$(grep -v -E '^edr-(dns-watch|dnslock)' <<<"$left" || true); fi
 if [[ -n $left && $KEEP_ANY -eq 0 ]]; then fail "edr-* units remain:"; sed 's/^/  /' <<<"$left"; else pass "no edr-* unit left$([[ $KEEP_ANY -eq 0 ]] || echo ' (partial run: relaxed)')"; fi

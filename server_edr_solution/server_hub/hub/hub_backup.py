@@ -46,13 +46,21 @@ FREE_SPACE_FLOOR = 32 * 1024 * 1024
 
 
 class BackupError(Exception):
-    """Something failed after the checks passed (exit 2)."""
+    """Something failed after the checks passed (exit 2). `hint` is printed on a line of its own."""
     exit = 2
+
+    def __init__(self, message, hint=""):
+        super().__init__(message)
+        self.hint = hint
 
 
 class Refuse(BackupError):
     """A check said no before anything changed (exit 3)."""
     exit = 3
+
+
+class DecryptError(BackupError):
+    """The passphrase file did not open the container. _restore turns it into a refusal that says what to do."""
 
 
 def _pki(paths):
@@ -84,14 +92,21 @@ def _openssl(args, input_bytes=None, passphrase=None, timeout=60):
             os.close(rfd)
 
 
-def _passfile(paths):
+RESTORE_PASSPHRASE_HELP = (
+    "restore opens the backup with the passphrase in %s. It must be the one the backup was made with (shown once when "
+    "that hub was installed; a fresh install writes a new one). Put it there (root, mode 0600) and run restore again. "
+    "Nothing was changed.")
+
+
+def _passfile(paths, restoring=False):
     path = paths.backup_pass
+    hint = RESTORE_PASSPHRASE_HELP % path if restoring else ""
     try:
         with open(path, "rb") as f:
             if not f.readline().strip():
-                raise Refuse("the backup passphrase file is empty: " + path)
+                raise Refuse("the backup passphrase file is empty: " + path, hint)
     except OSError:
-        raise Refuse("cannot read the backup passphrase file " + path)
+        raise Refuse("cannot read the backup passphrase file " + path, hint)
     return path
 
 
@@ -203,6 +218,8 @@ def _guard(paths, operation, target, scheduled, log, body):
         return _audit_wrap(paths, operation, target, scheduled, body)
     except BackupError as exc:
         _say(log, ("refused: " if exc.exit == 3 else "failed: ") + str(exc))
+        if exc.hint:
+            _say(log, exc.hint)
         return exc.exit
     except Exception as exc:                # anything unforeseen is a failure with a message, never a traceback
         _say(log, "failed: %s %s" % (type(exc).__name__, exc))
@@ -340,7 +357,7 @@ def _unpack(path, passfile, dest_dir=None):
     except (tarfile.TarError, ValueError, EOFError, UnicodeDecodeError) as exc:
         proc.kill()
         proc.wait()
-        raise BackupError("cannot read the backup (wrong passphrase or damaged file): %s" % type(exc).__name__)
+        raise DecryptError("cannot read the backup (wrong passphrase or damaged file): %s" % type(exc).__name__)
     except BaseException:
         proc.kill()
         proc.wait()
@@ -354,7 +371,7 @@ def _unpack(path, passfile, dest_dir=None):
                 pass
     rc = proc.wait(OPENSSL_TIMEOUT)
     if rc != 0:
-        raise BackupError("cannot decrypt the backup (wrong passphrase file?)")
+        raise DecryptError("cannot decrypt the backup (wrong passphrase file?)")
     if manifest is None:
         raise BackupError("the backup has no manifest")
     for name in manifest["files"]:
@@ -581,7 +598,7 @@ def _restore(paths, file, ca_key_file, ca_passphrase, drill, extra_ips, log):
         raise Refuse("no such backup file: " + file)
     if hub_running(paths):
         raise Refuse("edr-hub is running: stop it first (systemctl stop edr-hub)")
-    passfile = _passfile(paths)
+    passfile = _passfile(paths, restoring=True)
     for ip in extra_ips:
         try:
             hub_common.norm_ip(ip)
@@ -597,7 +614,10 @@ def _restore(paths, file, ca_key_file, ca_passphrase, drill, extra_ips, log):
     state_stat = _stat(paths.state_dir)
     stage = tempfile.mkdtemp(prefix=".restore-", dir=paths.state_dir)
     try:
-        manifest = _unpack(file, passfile, stage)
+        try:
+            manifest = _unpack(file, passfile, stage)
+        except DecryptError as exc:
+            raise Refuse(str(exc), RESTORE_PASSPHRASE_HELP % paths.backup_pass)
         staged_db = os.path.join(stage, "hub.db")
         check = sqlite3.connect(staged_db)
         try:

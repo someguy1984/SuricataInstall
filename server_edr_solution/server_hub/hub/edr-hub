@@ -207,6 +207,20 @@ def jloads(text, default):
 
 
 # ---- read commands ------------------------------------------------------------------------------
+def ca_sha256_line():
+    """(text, ok): the SHA-256 of the CA certificate's DER form, the last part of every token and the value a client pins
+    (PLAN section 15, Restore drill: the operator compares it with the one printed at install). Computed here from
+    ca/ca.pem, so nothing in the text can come from anywhere but a hash."""
+    import hashlib
+    import ssl
+    try:
+        with open(PATHS.ca_cert, encoding="ascii") as f:
+            pem = f.read(8192)
+        return "SHA-256 %s" % hashlib.sha256(ssl.PEM_cert_to_DER_cert(pem)).hexdigest(), True
+    except (OSError, ValueError, UnicodeError):
+        return "UNREADABLE (%s is missing or is not one certificate)" % c(PATHS.ca_cert, 80), False
+
+
 def cmd_status(argv):
     Parser(prog="edr-hub status").parse_args(argv)
     warn = False
@@ -254,6 +268,10 @@ def cmd_status(argv):
         if states.get("orphan"):
             warn = True
             out("             WARNING: %d orphan host(s): check, then `edr-hub host UUID adopt`" % states["orphan"])
+        ca_text, ca_ok = ca_sha256_line()
+        out("ca:         %s" % ca_text)
+        if not ca_ok:
+            warn = True
         sev = conn.execute("SELECT severity, COUNT(*) FROM incidents WHERE state!='resolved' GROUP BY severity").fetchall()
         out("incidents:  %s" % (", ".join("%d %s" % (n, s) for s, n in sev) + " open" if sev else "none open"))
         pending = conn.execute("SELECT COUNT(*) FROM outbox WHERE state IN ('pending','sending','failed') AND channel!='none'").fetchone()[0]

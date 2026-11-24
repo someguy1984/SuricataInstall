@@ -16,6 +16,9 @@ NotifyAccess=main
 WatchdogSec=90
 Restart=always
 RestartSec=5
+# As root (the "+", outside the sandbox) before each start: finish a rehome killed in step 7, do nothing otherwise
+# (client PLAN section 5). The "-" lets the agent start whatever it prints: the website always wins.
+ExecStartPre=-+/usr/bin/python3 -I /usr/local/lib/edr-agent/edr-agent.py rehome-resume
 ExecStop=/usr/bin/python3 -I /usr/local/lib/edr-agent/edr-agent.py shutdown-notice
 TimeoutStopSec=5
 ExecStart=/usr/bin/python3 -I /usr/local/lib/edr-agent/edr-agent.py

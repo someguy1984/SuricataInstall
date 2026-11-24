@@ -130,6 +130,60 @@ def extract_python(script_path):
     return re.findall(r"<<'PY'[^\n]*\n(.*?)\nPY\n", text, re.S)
 
 
+def shell_functions(script_path, names):
+    """The text of the named functions of a shell script. install.sh runs its argument parser and its steps at the top
+    level, so it cannot be sourced whole: a test takes the functions it needs and runs them on their own. The end of a
+    function is the first line, the opening one or a closing brace alone, after which bash accepts the text."""
+    with open(script_path) as f:
+        lines = f.read().split("\n")
+    out = []
+    for name in names:
+        start = next((i for i, line in enumerate(lines) if line.startswith(name + "() {")), None)
+        assert start is not None, "no function %s in %s" % (name, script_path)
+        for end in range(start, len(lines)):
+            if end > start and lines[end] != "}":
+                continue
+            text = "\n".join(lines[start:end + 1])
+            if subprocess.run(["bash", "-n"], input=text, capture_output=True, text=True).returncode == 0:
+                out.append(text)
+                break
+        else:
+            raise AssertionError("function %s does not end" % name)
+    return "\n".join(out) + "\n"
+
+
+class FunctionCase(unittest.TestCase):
+    """Functions of an installer run on their own, in a temporary directory. Every command that could change a system
+    is a function here that writes its words to $CALLS and does nothing, so no test can touch the machine it runs on;
+    a test redefines one of them where it needs another answer. $BASE is the temporary directory."""
+
+    LOGGED = ("systemctl", "chown", "chgrp", "apt-get", "apt", "useradd", "groupadd", "userdel", "nft", "sysctl", "systemd-run",
+              "modprobe", "dnscrypt-proxy", "resolvectl", "add-apt-repository")
+
+    def setUp(self):
+        self.base = tempfile.mkdtemp(prefix="edr-fn-")
+        self.addCleanup(shutil.rmtree, self.base, True)
+        self.calls_path = os.path.join(self.base, "calls.log")
+
+    def run_functions(self, script, names, body, **env):
+        prelude = ["set -uo pipefail", 'BASE="%s"' % self.base, 'CALLS="%s"' % self.calls_path, ': > "$CALLS"',
+                   'die() { echo "ERROR: $*" >&2; exit 2; }']
+        prelude += ['%s() { echo "%s $*" >> "$CALLS"; }' % (n, n) for n in self.LOGGED]
+        path = os.path.join(self.base, "harness.sh")
+        with open(path, "w") as f:
+            f.write("\n".join(prelude) + "\n" + shell_functions(script, names) + body + "\n")
+        e = {k: v for k, v in os.environ.items() if not k.startswith(("EDR_", "SSH_"))}
+        e.update(env)
+        return subprocess.run(["bash", path], capture_output=True, text=True, env=e, timeout=60, stdin=subprocess.DEVNULL, cwd="/")
+
+    def calls(self):
+        try:
+            with open(self.calls_path) as f:
+                return f.read().splitlines()
+        except FileNotFoundError:
+            return []
+
+
 class TestCommon(unittest.TestCase):
     def test_scripts_exist(self):
         for p in (INSTALL, UNINSTALL):

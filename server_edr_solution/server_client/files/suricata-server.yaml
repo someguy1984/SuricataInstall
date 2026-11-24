@@ -14,8 +14,9 @@
 # false); checksum checks off; stream.midstream false; reassembly depth 512kb; TLS and SSH bypass
 # after the handshake (SNI, JA4 and HASSH are logged first); sgh-mpm-caching with a 7 day max age.
 # HOME_NET: the include: at the end brings in /etc/suricata/edr-home-net.yaml (written by
-# edr-home-net) as if it were in-lined, so it overrides the placeholder above; verify with
-# `suricata --dump-config | grep HOME_NET`.
+# edr-home-net), which holds the single dotted key vars.address-groups.HOME_NET and so replaces
+# only the placeholder below. An include that names the vars: mapping again would empty it
+# (tested on 8.0.8: 2 of 29 variables left). Verify with `suricata --dump-config | grep '^vars'`.
 # Two eve instances: eve.json (alert, anomaly, stats) and eve-bulk.json (tls, ssh, quic), which
 # edr-diskguard may drop. http, dns, flow, files and drop are not logged.
 # /etc/suricata/edr-dns.rules holds the low-priority DoH SNI alerts (a stub until the DNS step).

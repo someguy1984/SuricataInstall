@@ -1,7 +1,7 @@
 # Mock environment for server_edr_solution: a hub and a web droplet on a private network.
 #
 #   ./mock.sh up       build and start, then wait until both are healthy
-#   ./mock.sh test     smoke test (page on :80 and :443, PHP 8.5, hub reachable over the private network)
+#   ./mock.sh test     smoke test (page on :80 and :443, the release's PHP, hub reachable over the private network)
 #   ./mock.sh down     stop and remove (add --volumes to forget certificates)
 #   dist, install-hub, install-web, enroll, e2e, uninstall: the real installers (see README.md)
 #
@@ -15,6 +15,9 @@
 #
 # systemd runs as PID 1, which needs extra privileges. Under rootless Docker those privileges stay
 # inside your user namespace; under rootful Docker they are real root on the host (see README).
+
+# MOCK_UBUNTU (26.04 or 24.04) and MOCK_PHP choose the release; mock.sh sets both. One release runs at a time:
+# the project name is the same, so `up` with the other release replaces the boxes.
 
 name: edr-mock
 
@@ -38,7 +41,9 @@ services:
     build:
       context: .
       target: hub
-    image: edr-mock-hub:26.04
+      args:
+        UBUNTU_TAG: ${MOCK_UBUNTU:-26.04}
+    image: edr-mock-hub:${MOCK_UBUNTU:-26.04}
     hostname: hub
     networks:
       edr_vpc:
@@ -59,7 +64,10 @@ services:
     build:
       context: .
       target: web
-    image: edr-mock-web:26.04
+      args:
+        UBUNTU_TAG: ${MOCK_UBUNTU:-26.04}
+        PHP_VERSION: ${MOCK_PHP:-8.5}
+    image: edr-mock-web:${MOCK_UBUNTU:-26.04}
     hostname: web
     networks:
       edr_vpc:
@@ -74,7 +82,7 @@ services:
       - ../..:/opt/SuricataInstall:ro
       - web_tls:/etc/ssl/mock
     healthcheck:
-      test: ["CMD-SHELL", "systemctl is-active --quiet nginx php8.5-fpm && curl -fsS -o /dev/null http://127.0.0.1/"]
+      test: ["CMD-SHELL", "systemctl is-active --quiet nginx php${MOCK_PHP:-8.5}-fpm && curl -fsS -o /dev/null http://127.0.0.1/"]
       interval: 5s
       timeout: 5s
       retries: 24

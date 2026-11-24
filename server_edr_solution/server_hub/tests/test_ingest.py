@@ -888,8 +888,8 @@ class IdentityTest(IngestCase):
         self.assertEqual((h["state"], h["uuid"]), ("orphan", self.c.uuid))
         self.assertTrue(h["name"].startswith("orphan-"))
         self.assertEqual(len(self.events()), 1)
-        self.assertEqual(len(notices), 1)
-        self.assertEqual((notices[0]["severity"], notices[0]["always"]), ("HIGH", True))
+        self.assertEqual(notices, [])                                         # the one HIGH alert is the engine's hub.orphan, not the request's
+        self.assertEqual([r["target"] for r in self.fx.sql("SELECT target FROM audit WHERE action='host.orphan'")], [self.c.uuid])
         self.assertEqual(self.c.heartbeat()[0], 200)
         self.assertEqual(self.host()["state"], "orphan")                       # a heartbeat does not activate it
         status, _h, body = self.c.request("GET", "/v1/policy")
@@ -942,7 +942,9 @@ class IdentityTest(IngestCase):
             again = clients[0].send_events([ev()])[0]
         self.assertEqual(codes, [200, 200, 403])                                     # the third is over the cap
         self.assertEqual(again, 200)
-        self.assertEqual(sorted(notices), sorted(c.uuid for c in clients[:2]))      # one notice per host, not per request
+        self.assertEqual(notices, [])                                               # no alert from the request (the engine raises hub.orphan)
+        self.assertEqual(sorted(r["target"] for r in self.fx.sql("SELECT target FROM audit WHERE action='host.orphan'")),
+                         sorted(c.uuid for c in clients[:2]))                       # one audit row per host, not per request
         self.assertEqual(len(self.fx.sql("SELECT 1 FROM hosts WHERE state='orphan'")), 2)
 
     def test_moved_row_with_an_unknown_certificate_stays_refused(self):

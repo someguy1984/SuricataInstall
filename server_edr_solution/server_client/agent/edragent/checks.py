@@ -833,8 +833,12 @@ def nginx(ctx):
         ctx.warn("SCTP is built into this kernel: the module block cannot cover it")
     posture = inv.get("posture") if isinstance(inv.get("posture"), dict) else {}
     if phase_ge(ctx.phase(), "P1b") and posture:
+        # the findings above already print every posture field the inventory judged; only a field it left without a
+        # finding (an older inventory file) is added here, so nothing is printed twice
+        reported = {(f.get("details") or {}).get("field") for f in findings if f.get("check") == "posture" and isinstance(f.get("details"), dict)}
         for k, v in sorted(posture.items()):
-            if k in ("app_debug_true", "nginx_php_any", "app_key_in_public", "world_writable_in_webroot", "public_listeners") and v is True:
+            if k in ("app_debug_true", "nginx_php_any", "app_key_in_public", "world_writable_in_webroot", "public_listeners") and v is True \
+                    and k not in reported:
                 ctx.warn("posture: %s" % k)
 
 
@@ -868,7 +872,8 @@ def suricata(ctx):
 
 
 def _split_stdin(text):
-    parts = text.split("\n---\n")
+    # two separators only: the third part is a YAML file, and its own second line is "---"
+    parts = text.split("\n---\n", 2)
     parts += [""] * (3 - len(parts))
     return parts[0], parts[1], parts[2]
 
