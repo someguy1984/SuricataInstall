@@ -591,7 +591,7 @@ rm -f -- /etc/systemd/journald@edr.conf
 if [[ $KEEP_LOGS -eq 0 ]]; then
     for d in /var/log/journal/*.edr /run/log/journal/*.edr; do [[ -d $d ]] && rm -rf -- "$d"; done
 fi
-rm -rf -- /var/lib/edr-diskguard /var/lib/edr-notify /var/lib/edr-inventory /var/lib/edr-restart /var/lib/edr-policy-check /var/lib/edr-dns-watch
+rm -rf -- /var/lib/edr-bans /var/lib/edr-diskguard /var/lib/edr-notify /var/lib/edr-inventory /var/lib/edr-restart /var/lib/edr-policy-check /var/lib/edr-dns-watch
 rm -rf -- /run/edr-bans /run/edr-inventory /run/edr-diskguard /run/edr-policy-check /run/edr-dns-watch /run/edr-droplet-id /run/edr-install.token
 systemctl daemon-reload >/dev/null 2>&1 || true
 
@@ -712,7 +712,8 @@ while IFS=$'\t' read -r tag k name a b _; do
 done <<<"$MANIFEST_OUT"
 [[ $bad -eq 1 ]] || pass "prior sysctl values restored"
 if [[ $KEEP_ANY -eq 0 ]]; then
-    for p in "$LIB" "$LIB.prev" "$STATE_I" /etc/edr-dns /usr/libexec/edr /usr/local/sbin/edr-agent; do
+    for p in "$LIB" "$LIB.prev" "$STATE_I" /etc/edr-dns /usr/libexec/edr /usr/local/sbin/edr-agent \
+             /var/lib/edr-bans /var/lib/edr-diskguard /var/lib/edr-notify /var/lib/edr-inventory /var/lib/edr-restart /var/lib/edr-policy-check /var/lib/edr-dns-watch; do
         if [[ -e $p ]]; then fail "$p is still there"; fi
     done
 fi

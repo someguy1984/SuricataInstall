@@ -147,17 +147,20 @@ def _sign(tmp, *, pub_pem, csr_pem, subject, ext_path, extra_ext, days, ca_pem_p
         args += ["-not_before", _stamp(not_before), "-not_after", _stamp(not_after)]
         _must(args, what="signing")
     else:
-        if self_key_path is not None:
-            raise PkiError("this openssl cannot back-date a self-signed certificate")
         _sign_with_ca_command(tmp, csr_pem, subject, ext_file, ca_pem_path, ca_key_path, serial_hex,
-                              not_before, not_after, out_path)
+                              not_before, not_after, out_path, self_key_path)
+    if not os.path.exists(out_path):      # openssl 3.0 `ca` can refuse a request and still exit 0
+        raise PkiError("signing failed")
     with open(out_path, encoding="utf-8") as f:
         return f.read()
 
 
 def _sign_with_ca_command(tmp, csr_pem, subject, ext_file, ca_pem_path, ca_key_path, serial_hex, not_before,
-                          not_after, out_path):
-    """The fallback for openssl 3.0: `openssl ca -startdate` with a throwaway config and database."""
+                          not_after, out_path, self_key_path=None):
+    """The fallback for openssl 3.0: `openssl ca -startdate` with a throwaway config and database.
+
+    With self_key_path the certificate is self-signed (the CA): the request is made from that key and `-selfsign` is used.
+    """
     db_dir = os.path.join(tmp, "cadb")
     os.mkdir(db_dir, 0o700)
     open(os.path.join(db_dir, "index.txt"), "w").close()
@@ -169,11 +172,16 @@ def _sign_with_ca_command(tmp, csr_pem, subject, ext_file, ca_pem_path, ca_key_p
                 "default_md = sha384\npolicy = p\nunique_subject = no\ncopy_extensions = none\n"
                 "[p]\ncommonName = supplied\n" % (db_dir, db_dir, db_dir))
     csr_path = os.path.join(tmp, "req.csr")
-    with open(csr_path, "wb") as f:
-        f.write(csr_pem)
-    _must(["ca", "-batch", "-notext", "-config", cnf, "-cert", ca_pem_path, "-keyfile", ca_key_path, "-in", csr_path,
-           "-out", out_path, "-subj", subject, "-md", "sha384", "-startdate", _stamp(not_before),
-           "-enddate", _stamp(not_after), "-extfile", ext_file], what="signing")
+    if self_key_path is not None:
+        _must(["req", "-new", "-key", self_key_path, "-subj", subject, "-out", csr_path], what="signing")
+        who = ["-selfsign", "-keyfile", self_key_path]
+    else:
+        with open(csr_path, "wb") as f:
+            f.write(csr_pem)
+        who = ["-cert", ca_pem_path, "-keyfile", ca_key_path]
+    _must(["ca", "-batch", "-notext", "-config", cnf] + who + ["-in", csr_path,
+          "-out", out_path, "-subj", subject, "-md", "sha384", "-startdate", _stamp(not_before),
+          "-enddate", _stamp(not_after), "-extfile", ext_file], what="signing")
 
 
 def _verify(tmp, ca_pem_path, pem_text, purpose):
@@ -332,8 +340,9 @@ class Pki:
         if len(raw) > hub_common.CSR_MAX_BYTES or csr_pem.count("-----BEGIN") != 1 or not _PEM_BLOCK.match(csr_pem):
             raise PkiError("the CSR must be one PEM block of at most 4 KiB")
         with self._sign_sem:
-            code, _out, _err = _run(["req", "-verify", "-noout"], stdin=raw)
-            if code != 0:
+            code, out, err = _run(["req", "-verify", "-noout"], stdin=raw)
+            # OpenSSL 3.0 (Ubuntu 24.04) prints "verify failure" and still exits 0, so the success line is required too
+            if code != 0 or b"verify OK" not in out + err:
                 raise PkiError("the CSR is not signed by its own key")
             pub = _must(["req", "-noout", "-pubkey"], stdin=raw, what="public key extraction")
             _check_p256(pub)

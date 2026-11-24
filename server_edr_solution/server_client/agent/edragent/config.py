@@ -517,13 +517,23 @@ def set_key_in_text(text, section, key, value):
 
 
 def write_text_atomic(path, text, mode=0o640):
+    """Replace path with text. A rewrite keeps the owner and group of the file it replaces: local.conf is
+    root:edr-agent 0640, and the new file root makes would be root:root, which the agent cannot read."""
     directory = os.path.dirname(path)
     os.makedirs(directory, exist_ok=True)
+    try:
+        old = os.stat(path)
+    except OSError:
+        old = None
     tmp = path + ".tmp"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, mode)
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write(text)
         f.flush()
+        if old is not None:
+            new = os.fstat(f.fileno())
+            if (new.st_uid, new.st_gid) != (old.st_uid, old.st_gid):
+                os.fchown(f.fileno(), old.st_uid, old.st_gid)
         os.fsync(f.fileno())
     os.replace(tmp, path)
 

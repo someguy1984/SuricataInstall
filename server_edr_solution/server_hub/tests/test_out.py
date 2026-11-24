@@ -201,7 +201,8 @@ class OutCase(unittest.TestCase):
         with open(self.paths.secrets, "w") as f:
             json.dump(kw, f)
 
-    def url(self, path=SECRET_PATH, host="localhost"):
+    # 127.0.0.1, not "localhost": in a container "localhost" resolves to ::1 first, and the server listens on IPv4 only
+    def url(self, path=SECRET_PATH, host="127.0.0.1"):
         return "https://%s:%d%s" % (host, self.server.port, path)
 
     def job(self, n=1, channel="webhook", **kw):
@@ -233,7 +234,7 @@ class SendTests(OutCase):
     def test_ntfy_gets_the_secret_topic_and_bearer_token_from_the_worker(self):
         self.serve()
         self.secrets(ntfy_topic="long-random-topic-4711", ntfy_token="tk_secrettoken")
-        self.sock.options = {"ntfy_url": "https://localhost:%d" % self.server.port, "webhook_ca_pem": self.ca_pem}
+        self.sock.options = {"ntfy_url": "https://127.0.0.1:%d" % self.server.port, "webhook_ca_pem": self.ca_pem}
         self.sock.items = [self.job(3, channel="ntfy")]
         self.worker().take_and_send()
         self.assertEqual(self.sock.results[0]["ok"], True)
@@ -249,7 +250,7 @@ class SendTests(OutCase):
     def test_ntfy_without_a_token_sends_no_authorization_header(self):
         self.serve()
         self.secrets(ntfy_topic="t")
-        self.sock.options = {"ntfy_url": "https://localhost:%d" % self.server.port, "webhook_ca_pem": self.ca_pem}
+        self.sock.options = {"ntfy_url": "https://127.0.0.1:%d" % self.server.port, "webhook_ca_pem": self.ca_pem}
         self.sock.items = [self.job(3, channel="ntfy")]
         self.worker().take_and_send()
         self.assertNotIn("Authorization", self.server.requests[0]["headers"])
@@ -394,7 +395,7 @@ class SendTests(OutCase):
     def test_no_secret_reaches_a_stored_error_or_the_log(self):
         self.serve(status=500)
         self.secrets(webhook_url=self.url(), ntfy_topic="TOPICSECRET", ntfy_token="TOKENSECRET")
-        self.sock.options = {"ntfy_url": "https://localhost:%d/ntfyroot" % self.server.port, "webhook_ca_pem": None}      # untrusted: TLS error
+        self.sock.options = {"ntfy_url": "https://127.0.0.1:%d/ntfyroot" % self.server.port, "webhook_ca_pem": None}      # untrusted: TLS error
         self.sock.items = [self.job(1), self.job(2, channel="ntfy")]
         with tempfile.TemporaryFile(mode="w+") as err:
             old = sys.stderr
@@ -593,7 +594,7 @@ class ProcessTests(OutCase):
         self.secrets(webhook_url=self.url(), ntfy_topic="TOPICSECRET")
         os.makedirs(self.paths.out_state_dir, mode=0o700)
         with open(self.paths.channels, "w") as f:
-            json.dump({"channels": ["webhook", "ntfy"], "options": {"ntfy_url": "https://localhost:%d/" % self.server.port, "webhook_ca_pem": None}}, f)
+            json.dump({"channels": ["webhook", "ntfy"], "options": {"ntfy_url": "https://127.0.0.1:%d/" % self.server.port, "webhook_ca_pem": None}}, f)
         r = self.run_out("--failed-notice", "--allow-private")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(sorted(q["path"] for q in self.server.requests), sorted([SECRET_PATH, "/"]))
@@ -667,7 +668,7 @@ class DeadlineAndBackoffTests(OutCase):
         edr_hub_out.TIMEOUT_S = 1.5
         try:
             started = time.time()
-            ok, err, _ra = edr_hub_out.http_send("POST", "https://localhost:%d/x" % srv.getsockname()[1], {}, b"{}",
+            ok, err, _ra = edr_hub_out.http_send("POST", "https://127.0.0.1:%d/x" % srv.getsockname()[1], {}, b"{}",
                                                  edr_hub_out.make_context(self.ca_pem), allow_private=True)
             took = time.time() - started
         finally:

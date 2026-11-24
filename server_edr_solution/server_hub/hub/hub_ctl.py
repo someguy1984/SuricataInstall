@@ -852,9 +852,13 @@ class Sockets:
 
     def _status(self, ctx, args):
         started = getattr(self.hub, "started_at", None)
+        # The writer's last outcome: "storage_full" when the cap or the disk is reached (PLAN section 3).
+        writer_status = getattr(self.hub.writer, "status", None)
+        storage = writer_status() if callable(writer_status) else {}
         return {"version": hub_common.VERSION, "pid": os.getpid(), "started_at": started,
                 "uptime_s": int((now_ms() - started) / 1000) if started else None,
-                "channels": hub_common.enabled_channels(self.hub.settings)}
+                "channels": hub_common.enabled_channels(self.hub.settings),
+                "storage": storage.get("state", "ok")}
 
     # ---- out.sock -------------------------------------------------------------------------------
     def _outbox_take(self, ctx, args):

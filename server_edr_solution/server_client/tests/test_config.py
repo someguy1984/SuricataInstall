@@ -268,5 +268,36 @@ class TestApplyConfig(Tmp):
         self.assertEqual(cfgmod.parse_text(t4, "x")[1], [])
 
 
+class TestRewriteKeepsOwner(Tmp):
+    """Found on the first install in the mock: `install.sh` makes local.conf root:edr-agent 0640, then a
+    rewrite through update_local_conf left a new root:root file that the agent could not read."""
+
+    def test_a_rewrite_gives_the_new_file_the_old_owner_and_group(self):
+        from unittest import mock
+        path = os.path.join(self.root, "local.conf")
+        with open(path, "w") as f:
+            f.write("[kit]\n")
+        real = os.stat(path)
+        fake_old = os.stat_result((real.st_mode, real.st_ino, real.st_dev, 1, real.st_uid + 1, real.st_gid + 2, 6, 0, 0, 0))
+        calls = []
+        real_stat = os.stat
+        with mock.patch.object(cfgmod.os, "stat", lambda p, *a, **k: fake_old if p == path else real_stat(p, *a, **k)), \
+                mock.patch.object(cfgmod.os, "fchown", lambda fd, uid, gid: calls.append((uid, gid))):
+            cfgmod.write_text_atomic(path, "[kit]\nweb = off\n", 0o640)
+        self.assertEqual(calls, [(real.st_uid + 1, real.st_gid + 2)])
+        with open(path) as f:
+            self.assertEqual(f.read(), "[kit]\nweb = off\n")
+
+    def test_a_new_file_and_an_unchanged_owner_are_not_chowned(self):
+        from unittest import mock
+        path = os.path.join(self.root, "fresh.conf")
+        calls = []
+        with mock.patch.object(cfgmod.os, "fchown", lambda fd, uid, gid: calls.append((uid, gid))):
+            cfgmod.write_text_atomic(path, "a\n", 0o640)
+            cfgmod.write_text_atomic(path, "b\n", 0o640)
+        self.assertEqual(calls, [])
+        self.assertEqual(os.stat(path).st_mode & 0o777, 0o640)
+
+
 if __name__ == "__main__":
     unittest.main()

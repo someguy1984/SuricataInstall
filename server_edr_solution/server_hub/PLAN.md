@@ -115,7 +115,7 @@ written in the style of the existing ones.
   certificate equals the host's current or pending hash (CN and serial from `getpeercert()` are display values and go
   to `revoked.txt`), and the state allows the route (host states: Enrollment). Anything else is 403.
   A certificate from another CA fails the handshake. With tickets off and the per-request check, a resumed
-  session cannot outlive a revocation. CN and serial from `getpeercert()` were tested on Python 3.14; re-check on 3.12.
+  session cannot outlive a revocation. CN and serial from `getpeercert()` are exercised by the real mutual-TLS unit tests on Python 3.14 and on 3.12.3 (OpenSSL 3.0.13), where they pass.
 - **Per connection, never on the listening socket.** Wrapping the listener would run every handshake on the accept
   thread. It only accepts, with `request_queue_size = 128` (the default 5 loses SYNs when the fleet reconnects
   after a hub restart; clients add jitter). Override `process_request()` only:
@@ -228,8 +228,12 @@ extension files** (`pki/strict/{ca,srv,cli}.ext`); `openssl` defaults differ bet
   both EKUs are required.
 - **How checked.** On Python 3.14.4 with OpenSSL 3.5.5 these profiles pass `openssl verify -x509_strict` and TLS 1.3
   mutual handshakes both ways; a no-keyUsage CA, a CN-only or DNS-only server certificate and a wrong EKU fail.
-  Python 3.12 with OpenSSL 3.0 has **not** been run: unit tests handshake with both certificate types on 3.12 and
-  3.14; the installer self-checks with `openssl verify -x509_strict`.
+  On Python 3.12.3 with OpenSSL 3.0.13 the unit tests (`make unit-2404`) issue both profiles, verify them with
+  `openssl verify -x509_strict` and handshake with both certificate types, and pass; the "no-EKU certificate is not
+  accepted" row has not been run on 3.12. OpenSSL 3.0 differs from 3.5 in three ways the code handles: `x509 -new`
+  has no `-not_before` (signing goes through `openssl ca -startdate`, including the self-signed CA), `req -verify`
+  exits 0 after printing "verify failure" (the hub also requires the "verify OK" line), and `openssl ca` can exit 0
+  without writing a certificate. The installer self-checks with `openssl verify -x509_strict`.
 - **Signing procedure** (per request, under a signing semaphore of 2):
   1. Cap the CSR at 4 KiB, one PEM block; `openssl req -verify` proves key possession. Take only the public
      key and require EC `prime256v1`; subject and extensions in the CSR are never used.

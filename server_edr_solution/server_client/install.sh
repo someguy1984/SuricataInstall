@@ -1236,7 +1236,11 @@ WRAP
 
 seed_local_conf() {
     local lc=$ETC_A/local.conf tmp changes=()
-    if [[ -f $lc ]]; then echo "local.conf exists: it is never rewritten"; return 0; fi
+    if [[ -f $lc ]]; then
+        # the text is the operator's; the owner and mode are the kit's (the agent reads it through its group)
+        chown root:edr-agent "$lc"; chmod 0640 "$lc"
+        echo "local.conf exists: it is never rewritten"; return 0
+    fi
     tmp=$WORK/lc
     mkdir -p "$tmp$ETC_A"
     {
@@ -1575,6 +1579,12 @@ step_8() {
     if [[ $(readlink -f /etc/resolv.conf) != /run/systemd/resolve/stub-resolv.conf ]]; then
         echo "WARNING: /etc/resolv.conf is not the systemd-resolved stub: the DNS step is skipped and nothing is locked"
         jr note - "DNS step skipped: /etc/resolv.conf is not the resolved stub"
+        # local.conf must say what is true, or check.sh fails on a lock that was never built and
+        # edr-dns-watch looks for a proxy that is not configured
+        if [[ $(conf_value dns.lockdown) != off ]]; then
+            conf_edit "" "dns.lockdown=off" || die "could not write [dns] lockdown = off to local.conf"
+            echo "         [dns] lockdown = off is now in $ETC_A/local.conf. To lock later: make /etc/resolv.conf the stub, set it to on, run install.sh again."
+        fi
         return 0
     fi
     mkdir -p "$work"
@@ -1676,7 +1686,11 @@ step_9() {
     fi
     systemctl daemon-reload
     enable_units edr-droplet-id.service
-    enable_units --now edr-agent.service edr-inventory.timer edr-diskguard.timer edr-notify.path
+    enable_units --now edr-inventory.timer edr-diskguard.timer edr-notify.path
+    enable_units edr-agent.service
+    # restart, not start: on a re-run or an upgrade the running agent still holds the old code, the old unit
+    # and the old local.conf (seen in the mock: a second install.sh left the first agent running)
+    systemctl restart edr-agent.service || die "edr-agent.service did not start (journalctl --namespace=edr -u edr-agent)"
     for id in $(seq 20); do systemctl is-active --quiet edr-agent.service && break; sleep 1; done
     systemctl is-active --quiet edr-agent.service || die "edr-agent.service did not start (journalctl --namespace=edr -u edr-agent)"
     systemctl start edr-inventory.service || true

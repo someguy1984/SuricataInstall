@@ -152,9 +152,20 @@ class TestUnitFiles(unittest.TestCase):
         self.assertEqual(s[("Service", "IPAddressAllow")], ["169.254.169.254"])
         self.assertEqual(s[("Unit", "Before")], ["edr-agent.service"])
         self.assertNotIn(("Service", "RemainAfterExit"), s)
-        self.assertEqual(s[("Service", "ReadWritePaths")], ["/run/edr-droplet-id"])           # one file, not all of /run
+        # one file, not all of /run; "-" because the file does not exist when the "+" command that creates it starts
+        self.assertEqual(s[("Service", "ReadWritePaths")], ["-/run/edr-droplet-id"])
         self.assertEqual(len(s[("Service", "ExecStartPre")]), 1)
         self.assertTrue(s[("Service", "ExecStartPre")][0].startswith("+"))
+
+    def test_a_writable_path_the_unit_makes_itself_is_optional(self):
+        # A path that may be missing when the unit starts (both are on the /run tmpfs) is written "-PATH" and made by
+        # a "+" command: without the "-" systemd fails that very command at step NAMESPACE (first mock install).
+        for unit, path in (("edr-droplet-id.service", "/run/edr-droplet-id"), ("edr-dns-watch.service", "/run/systemd/resolved.conf.d")):
+            s = directives(read(unit))
+            self.assertEqual(s[("Service", "ReadWritePaths")], ["-" + path], unit)
+            pre = s[("Service", "ExecStartPre")]
+            self.assertEqual(len(pre), 1, unit)
+            self.assertTrue(pre[0].startswith("+") and path in pre[0], unit)
 
     def test_notify_unit_follows_the_plan(self):
         s = directives(read("edr-notify.service"))

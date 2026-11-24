@@ -180,8 +180,15 @@ class TestNginxLimits(NginxCase):
         os.makedirs(self.root + "/etc/nginx/sites-enabled")
         os.symlink("../sites-available/s", self.root + "/etc/nginx/sites-enabled/s")
         cfg, a = self.analyse()
-        self.assertTrue(a["http2"])
-        self.assertFalse(cfg.incomplete)
+        if os.geteuid() == 0:
+            self.assertTrue(a["http2"])
+            self.assertFalse(cfg.incomplete)
+        else:
+            # Run without root (make unit), the target belongs to the test user: a symlink to a file that a
+            # non-root user can write is not followed, and the result says it is incomplete.
+            self.assertFalse(a["http2"])
+            self.assertTrue(cfg.incomplete)
+            self.assertIn("include_symlink_writable", [p["kind"] for p in cfg.problems])
 
     def test_include_depth_8_is_allowed_and_9_is_a_limit(self):
         # nginx.conf is depth 0, d1 is depth 1: the 8th nested include is depth 8, the 9th is over the limit

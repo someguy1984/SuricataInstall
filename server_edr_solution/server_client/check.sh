@@ -312,7 +312,7 @@ if phase_ge P1b; then
 		skip "[dns] lockdown = off: the DNS lock checks are skipped"
 	else
 		if have dnscrypt-proxy; then
-			if dnscrypt-proxy -check -config /etc/dnscrypt-proxy/dnscrypt-proxy.toml >/dev/null 2>&1; then pass "dnscrypt-proxy -check passes"; else fail "dnscrypt-proxy -check fails"; fi
+			if dnscrypt-proxy -check -config /etc/edr-dns/dnscrypt-proxy.toml >/dev/null 2>&1; then pass "dnscrypt-proxy -check passes"; else fail "dnscrypt-proxy -check fails"; fi
 		else
 			fail "dnscrypt-proxy is not installed"
 		fi

@@ -378,7 +378,13 @@ def agent(ctx):
     alerts = _alerts_24h(ctx)
     if any(a.get("kind") == "health.sandbox_ineffective" for a in alerts) or \
             any(a.get("kind") == "health.sandbox_ineffective" for a in (summary or {}).get("alerts") or []):
-        ctx.fail("sandbox self-test failed: the agent's network filter (IPAddressDeny) is not in force")
+        if ctx.on("kit", "kernel"):
+            ctx.fail("sandbox self-test failed: the agent's network filter (IPAddressDeny) is not in force")
+        else:
+            # installed with --no-kernel (a container): systemd has no BPF firewall there, so the filter cannot
+            # be in force. Said every time, never passed; on a real host this line is a FAIL.
+            ctx.warn("sandbox self-test failed: the agent's network filter (IPAddressDeny) is not in force "
+                     "([kit] kernel = off: expected in a container, a FAIL anywhere else)")
     elif summary is not None:
         ctx.pass_("sandbox self-test: no failure recorded")
     # spool

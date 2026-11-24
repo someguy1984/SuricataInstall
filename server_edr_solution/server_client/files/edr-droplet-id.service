@@ -21,8 +21,10 @@ ProtectHome=yes
 SystemCallFilter=@system-service
 # Only the one file is writable: the unit creates it if it is missing (root, outside the sandbox) and the helper writes
 # into it in place, because a bind-mounted file cannot be replaced by a rename.
+# The "-" matters: systemd applies ReadWritePaths to the "+" command too, and without it a missing file fails that
+# command at step NAMESPACE (status 226) before it can create the file. Seen with systemd 259 on the first mock install.
 ExecStartPre=+/bin/sh -c '[ -e /run/edr-droplet-id ] || install -m 0640 -o root -g edr-agent /dev/null /run/edr-droplet-id'
-ReadWritePaths=/run/edr-droplet-id
+ReadWritePaths=-/run/edr-droplet-id
 MemoryMax=64M
 Nice=19
 TimeoutStartSec=10

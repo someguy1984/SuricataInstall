@@ -2,6 +2,7 @@
 "Request parser and limits", "Identity", "Storage" and the slow-client tests of L2). Everything here talks real mutual
 TLS 1.3 to the real server on 127.0.0.1."""
 
+import datetime
 import gzip
 import io
 import json
@@ -111,9 +112,12 @@ class TransportTest(IngestCase):
         with open(pub, "wb") as f:
             f.write(F.openssl("req", "-noout", "-pubkey", stdin=csr.encode()))
         out = os.path.join(self.fx.tmp, "expired.pem")
-        F.openssl("x509", "-new", "-force_pubkey", pub, "-subj", "/CN=" + self.c.uuid, "-CA", self.fx.paths.ca_cert, "-CAkey",
-                  self.fx.paths.ca_key, "-sha384", "-extfile", self.fx.hub.paths.find_data("pki", "strict", "cli.ext"),
-                  "-not_before", "20200101000000Z", "-not_after", "20200102000000Z", "-out", out)
+        # `openssl ca -startdate` rather than `x509 -not_before`, which OpenSSL 3.0 (Ubuntu 24.04) does not have
+        utc = datetime.timezone.utc
+        hub_pki._sign_with_ca_command(self.fx.tmp, csr.encode(), "/CN=" + self.c.uuid,
+                                      self.fx.hub.paths.find_data("pki", "strict", "cli.ext"), self.fx.paths.ca_cert,
+                                      self.fx.paths.ca_key, "0abc", datetime.datetime(2020, 1, 1, tzinfo=utc),
+                                      datetime.datetime(2020, 1, 2, tzinfo=utc), out)
         old = F.Client(self.fx, key_path=key)
         old.ca_pem = self.fx.hub.pki.ca_pem()
         old.cert_path = out

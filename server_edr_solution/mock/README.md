@@ -41,8 +41,7 @@ installers run inside them (`mock.sh install-hub`, `install-web`). The whole rep
     ./mock.sh logs web    # follow a box's journal
     ./mock.sh down        # stop and remove; add --volumes to also forget the certificates
 
-With the real installers, in this order (**written but not yet run**: nobody has started these steps, so the first run
-may find mistakes in them; the installers, the hub and the agent have only been tested outside the mock):
+With the real installers, in this order (first run on 2026-11-24, see "First run" below):
 
     ./mock.sh dist          # make dist on this machine; copy each tarball and a hash made here into its box
     ./mock.sh install-hub   # disable the placeholder; unpack, check the hash, install.sh --plan, install.sh --yes
@@ -78,7 +77,7 @@ The list below is the summary; `mock.sh` is the authority on the exact checks an
 - The hub reaches `https://web.dev.local` over the private network.
 - The hub publishes no ports to this machine.
 
-## What `./mock.sh e2e` checks (written, not yet run)
+## What `./mock.sh e2e` checks
 
 Run it after `install-hub`, `install-web` and `enroll`. `mock.sh` is the authority on the exact checks.
 
@@ -95,6 +94,27 @@ Run it after `install-hub`, `install-web` and `enroll`. `mock.sh` is the authori
 `./mock.sh uninstall` then runs both uninstallers and checks that no kit table (`inet edr_hub`, `inet edr`, `inet edr_dns`,
 `inet edr_isolate`), unit, listening port (8443, 8444, 8450) or process is left in either box, and puts the placeholder
 back on `:8443`.
+
+## First run (2026-11-24, rootless Docker, from freshly built boxes)
+
+`MOCK_HTTP_PORT=18080 MOCK_HTTPS_PORT=18443` was used, because port 80 was taken on the machine.
+
+| Step | Result |
+|------|--------|
+| `up`, `test` | 12 of 12 |
+| `dist`, `install-hub` | installed; the hub's `check.sh` 38 passed, 1 warning (no backup yet), 0 failed |
+| `install-web` | installed and confirmed; `edr-check` 25 passed, 8 warnings, 0 failed. The DNS step is skipped (`/etc/resolv.conf` is Docker's, not the resolved stub), so the DNS lock was not exercised |
+| `enroll` | the host is `pending`, then `active` |
+| `e2e` | 13 of 15. **Open:** (1) the recorded Tetragon line is not seen as a CRITICAL event at the hub: after `tetragon_replay on` the agent kept its old process id, so the restart or the reader did not take effect; not yet investigated. (2) "host_revoked and a spool with at least one event" timed out at 150 s; `edr-agent status` showed both a little later, so the limit or the trigger is wrong, not yet settled |
+| `uninstall` | both uninstallers exit 0; residue checks 13 of 13 |
+
+The first run found and fixed these (each has a unit test where one could be written): the hub installer wrote its
+manifest before `/etc/edr-hub` existed, and installed a package without `apt-get update`; the client's `local.conf`
+lost its `edr-agent` group when a key was written, so the agent could not read it; `edr-droplet-id.service` (and, by
+the same rule, `edr-dns-watch.service`) failed at step NAMESPACE on a path that did not exist yet; `check.sh` tested
+the packaged dnscrypt-proxy file, not the kit's; a skipped DNS step was not recorded, so `check.sh` failed on it; a
+second `install.sh` did not restart the running agent; `uninstall.sh` left `/var/lib/edr-bans`. In a box installed
+with `--no-kernel` the agent's failed network-filter self-test is now a WARN in `edr-check`, not a FAIL.
 
 ## Docker requirements and safety
 
@@ -150,11 +170,11 @@ Containers share this machine's kernel, so anything that changes the kernel itse
 | systemd-resolved drop-in | only after installing systemd-resolved (the image has none), and `/etc/resolv.conf` is a Docker bind mount, so the installer must cope with it |
 | `IPAddressDeny` / `IPAddressAllow` | **no**. Under rootless Docker systemd has no BPF firewall and silently does not enforce them |
 | `MemoryMax`, `CPUQuota` | only if the box shows a real value in its `memory.max`; otherwise the limit is not enforced |
-| `edr-agent` install, local mode, uninstall | yes (`install-web`, `uninstall`: written, not yet run) |
-| Hub install, the `edr-hub` units, sockets and users, the `edr_hub` nftables table (load, rate meters; `--clients-only` is not in this release) | yes, inside the hub box's own network namespace (`install-hub`: written, not yet run). The `meta skuid` rule that stops `edr-hub` calling out is proven in a throwaway network namespace (hub section 12, L1) and re-checked in a VM |
+| `edr-agent` install, local mode, uninstall | yes (`install-web`, `uninstall`) |
+| Hub install, the `edr-hub` units, sockets and users, the `edr_hub` nftables table (load, rate meters; `--clients-only` is not in this release) | yes, inside the hub box's own network namespace (`install-hub`). The `meta skuid` rule that stops `edr-hub` calling out is proven in a throwaway network namespace (hub section 12, L1) and re-checked in a VM |
 | Hub `IPAddressDeny` and `MemoryMax` limits | **no**, for the same reasons as the two rows above; the rest of the hub's sandbox (`ProtectProc`, `PrivateNetwork`, users, sockets) yes |
-| Enrollment (`:8444`, `/v1/ca`, `/v1/enroll`, a token carried in a file) | yes, against the real hub (`enroll`: written, not yet run) |
-| mTLS (client certificate required on `:8443`), heartbeats, events, the host going `pending` then `active`, revoke | yes, against the real hub (`e2e`: written, not yet run) |
+| Enrollment (`:8444`, `/v1/ca`, `/v1/enroll`, a token carried in a file) | yes, against the real hub (`enroll`) |
+| mTLS (client certificate required on `:8443`), heartbeats, events, the host going `pending` then `active`, revoke | yes, against the real hub (`e2e`: two checks still fail, see "First run") |
 | `rehome` and restore | **not yet**: needs a second hub (see "Planned additions") |
 | Local auto-bans from real source addresses | **not yet**: all traffic arrives from private addresses, which are never banned |
 | Clock changes (certificate renewal at 30 days) | **no**. `CAP_SYS_TIME` does not move the shared clock; use `libfaketime` per service |

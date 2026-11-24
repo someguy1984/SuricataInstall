@@ -301,6 +301,19 @@ class TestAgent(CheckCase):
         a2 = alertlog.AlertLog(self.paths.alerts_jsonl, lambda: NOW)
         self.assertEqual(len(alertlog.read_alerts(self.paths.alerts_jsonl, NOW - 86400 * 2)), 2)
 
+    def test_sandbox_failure_is_a_warn_where_the_kit_was_installed_with_no_kernel(self):
+        # Found on the first install in the mock: under rootless Docker systemd has no BPF firewall, the agent's
+        # self-test fails every start, and a FAIL here rolled the whole install back.
+        self.put(self.paths.summary_json, {"v": 1, "written_at": int(NOW) - 5, "counts": {}, "hub": {"mode": "local"},
+                                           "alerts": [{"sev": "HIGH", "kind": "health.sandbox_ineffective", "summary": "x"}],
+                                           "agent": {"pid": os.getpid(), "version": "0.1.0", "config": "local", "config_errors": []}})
+        self.assertTrue(self.has(self.run_("agent"), "FAIL", "sandbox self-test failed"))
+        self.write(self.paths.local_conf, "[kit]\nkernel = off\n")
+        out = self.run_("agent")
+        self.assertTrue(self.has(out, "WARN", "sandbox self-test failed"))
+        self.assertFalse(self.has(out, "FAIL", "sandbox self-test failed"))
+        self.assertFalse(self.has(out, "PASS", "sandbox self-test"))
+
     def test_gaps_and_drops_in_24_hours(self):
         self.summary(health_24h={"gap": 2, "spool_dropped": 1})
         out = self.run_("agent")

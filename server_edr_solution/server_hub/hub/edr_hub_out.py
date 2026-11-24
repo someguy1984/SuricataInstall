@@ -180,6 +180,8 @@ def http_send(method, url, headers, body, ctx, allow_private=False):
         h.update(headers or {})
         conn.request(method, path, body=body, headers=h)
         resp = conn.getresponse()
+        if fired.is_set():          # Python 3.12 takes headers cut off by the deadline as a complete reply
+            raise TimeoutError
         status = resp.status
         ra = _retry_after(resp.getheader("Retry-After"))
     except SendError as exc:

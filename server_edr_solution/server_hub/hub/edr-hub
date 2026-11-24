@@ -212,6 +212,7 @@ def cmd_status(argv):
     warn = False
     fail = False
     now = hub_common.now_ms()
+    info = {}
     try:
         info = call("status")
         out("hub:        running, version %s, pid %s, up %ss" % (c(info.get("version")), info.get("pid"), info.get("uptime_s")))
@@ -234,6 +235,17 @@ def cmd_status(argv):
         if pct >= 80:
             warn = True
             out("             WARNING: over 80% of the cap")
+        # PLAN section 3: "storage full" is shown while the writer cannot store, and while events wait in the overflow file
+        try:
+            waiting = os.path.getsize(PATHS.critical_overflow)
+        except OSError:
+            waiting = 0
+        if info.get("storage") == "storage_full":
+            warn = True
+            out("storage:    storage full: LOW and INFO events get 503, HIGH and CRITICAL go to critical-overflow.jsonl (%d bytes waiting)" % waiting)
+        elif waiting:
+            warn = True
+            out("storage:    storage was full: %d bytes of HIGH and CRITICAL events wait in critical-overflow.jsonl for space" % waiting)
         states = dict(conn.execute("SELECT state, COUNT(*) FROM hosts GROUP BY state").fetchall())
         up = conn.execute("SELECT COUNT(*) FROM hosts WHERE state IN ('active','pending') AND last_seen > ?",
                           (now - 5 * 60 * 1000,)).fetchone()[0]

@@ -501,7 +501,7 @@ class Spool:
             ln.active = None
             ln.dirty = False
         data = self._read_unacked(ln, n)
-        events = [json_or_none(x) for x in data.split(b"\n") if x]
+        events = [kind_and_source(x) for x in data.split(b"\n") if x]      # not the whole events: a segment holds about 10,000
         info = ln.segs.pop(n)
         self._unlink(ln.seg_path(n))
         if ln.ack and ln.ack[0] == n:
@@ -773,6 +773,12 @@ class Spool:
                 "rejected": self.rejected,
                 "pressure": self.pressure,
             }
+
+
+def kind_and_source(line):
+    """What _note_drop needs of a dropped line: its kind and source (None for a corrupt line)."""
+    ev = json_or_none(line)
+    return None if ev is None else {"kind": ev.get("kind"), "source": ev.get("source")}
 
 
 def json_or_none(line):

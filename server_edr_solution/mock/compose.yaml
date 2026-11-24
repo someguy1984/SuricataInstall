@@ -67,8 +67,9 @@ services:
         aliases: [web.dev.local]
       edr_egress: {}
     ports:
-      - "127.0.0.1:80:80"
-      - "127.0.0.1:443:443"
+      # MOCK_HTTP_PORT and MOCK_HTTPS_PORT move the published ports when 80 or 443 is taken on this machine
+      - "127.0.0.1:${MOCK_HTTP_PORT:-80}:80"
+      - "127.0.0.1:${MOCK_HTTPS_PORT:-443}:443"
     volumes:
       - ../..:/opt/SuricataInstall:ro
       - web_tls:/etc/ssl/mock

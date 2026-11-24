@@ -1204,14 +1204,19 @@ def rollback(paths, ops, *, log=None, lib_dir=None):
         except Exception as exc:                      # each undo step is tried; one failure stops none of the others
             log("rollback: %s failed: %s" % (what, exc.__class__.__name__))
 
-    if step >= 5 and prev is not None:
+    # Each step does its work first and saves its number after, so a kill between the two leaves the number one behind:
+    # `current` already on the new generation under step 4, the both-hubs drop-in under step 3. Look at the files too,
+    # or the undo would delete the generation `current` points at.
+    flipped = step >= 5 or current_gen_name(paths) == st["new"]
+    dropin_moved = step >= 4 or (bool(old_addrs) and sorted(dropin_addresses(ops.read_dropin())) != sorted(old_addrs))
+    if flipped and prev is not None:
         attempt("point current back", flip_current, paths, st["prev"])
-    if step >= 4:
+    if dropin_moved:
         if old_addrs:
             attempt("restore the drop-in", ops.write_dropin, old_addrs)
             attempt("update root's address record", write_trusted, paths, old_addrs)
         attempt("daemon-reload", ops.daemon_reload)
-    if step >= 5:
+    if flipped:
         attempt("restart edr-agent", ops.restart_agent)
     attempt("disarm the timer", ops.disarm_rollback_timer)
     shutil.rmtree(gen_path(paths, int(GEN_RE.match(st["new"]).group(1))), ignore_errors=True)

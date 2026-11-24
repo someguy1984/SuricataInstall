@@ -453,17 +453,21 @@ class _Counter:
     def add(self, key, ts, token=None):
         dq = self.d.get(key)
         if dq is None:
-            dq = collections.deque()
+            dq = []                      # a list: an empty deque costs about 750 bytes, and a scan from many addresses fills every key
             self.d[key] = dq
             if len(self.d) > self.cap:
                 self.d.popitem(last=False)
         else:
             self.d.move_to_end(key)
         dq.append((ts, token))
-        while dq and dq[0][0] < ts - self.window:
-            dq.popleft()
+        old = ts - self.window
+        i = 0
+        while i < len(dq) and dq[i][0] < old:
+            i += 1
+        if i:
+            del dq[:i]
         if len(dq) > 1000:
-            dq.popleft()
+            del dq[0]
         return dq
 
     def clear(self, key):

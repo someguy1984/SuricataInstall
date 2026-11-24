@@ -167,7 +167,7 @@ class VerifiedGood(SharedHub):
         st, _h, body = client.enroll_request(fx.make_token(name="evil")["token"], csr)
         self.assertEqual(st, 200)
         client.adopt(json.loads(body))
-        text = subprocess.run(["openssl", "x509", "-in", client.cert_path, "-noout", "-subject", "-ext",
+        text = subprocess.run(["openssl", "x509", "-in", client.cert_path, "-noout", "-subject", "-nameopt", "RFC2253", "-ext",
                                "basicConstraints,subjectAltName,extendedKeyUsage"], capture_output=True, text=True).stdout
         self.assertIn("subject=CN=" + client.uuid, text)
         self.assertIn("CA:FALSE", text)

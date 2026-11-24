@@ -704,6 +704,7 @@ migration_backup() {
 step_users() {
     local u
     say "Step 2: users and directories"
+    step_etc          # first: the manifest lives in it, and every record below writes a line there
     for u in "${HUB_USERS[@]}"; do
         if ! getent passwd "$u" >/dev/null 2>&1; then
             record group "$u"
@@ -720,7 +721,6 @@ step_users() {
             echo "User $u exists"
         fi
     done
-    step_etc
     # /var/lib/edr-hub: edr-hub:edr-hub-ui 2750, so files inherit the group the dashboard reads with
     run install -d -m 0750 -o edr-hub -g edr-hub-ui "$STATE"
     run chmod 2750 "$STATE"
@@ -828,7 +828,10 @@ step_updates() {
     say "Step 6: updates and reboots"
     if ! package_present unattended-upgrades; then
         record package unattended-upgrades
-        run apt-get install -y -qq unattended-upgrades
+        # a new droplet's package lists can be empty or stale: refresh them first, and wait for a lock that
+        # cloud-init or unattended-upgrades may hold
+        run apt-get -o DPkg::Lock::Timeout=300 update -qq
+        DEBIAN_FRONTEND=noninteractive run apt-get -o DPkg::Lock::Timeout=300 install -y -qq unattended-upgrades
     fi
     # the files of the kit are put in place by step 4; here only what apt says
     if ! apt-config dump 2>/dev/null | grep -q 'APT::Periodic::Unattended-Upgrade "1"'; then

@@ -8,7 +8,7 @@
 #   ./mock.sh logs hub|web  follow that box's journal
 #   ./mock.sh down [--volumes]   stop and remove (--volumes also forgets the mock certificates)
 #
-# With the real installers (WRITTEN BUT NOT YET RUN: see README.md), in this order:
+# With the real installers (first run 2026-11-24: see README.md, "First run"), in this order:
 #   ./mock.sh dist          make dist on this machine; copy the tarballs and their hashes into the boxes
 #   ./mock.sh install-hub   disable the placeholder; unpack, check the hash, install.sh --plan, install.sh --yes
 #   ./mock.sh install-web   the client in local mode (MOCK_SURICATA=1 adds Suricata; MOCK_WEB_FLAGS="..." adds flags)
@@ -17,6 +17,8 @@
 #   ./mock.sh uninstall     both uninstallers, then the residue checks; puts the placeholder back
 #
 #   MOCK_CAPS=1 ./mock.sh ...    the boxes without `privileged` (compose.caps.yaml; not boot-tested yet)
+#   MOCK_HTTP_PORT=18080 MOCK_HTTPS_PORT=18443 ./mock.sh ...   publish the site on other loopback ports
+#                                (when 80 or 443 is taken here; give the same values to every subcommand)
 #
 # Use rootless Docker only (see README.md; the boxes run privileged): a rootful daemon is refused
 # unless MOCK_ALLOW_ROOTFUL=1 is set. If DOCKER_HOST is unset and the system socket is missing, the
@@ -35,6 +37,7 @@ COMPOSE=(-f compose.yaml)
 if [[ ${MOCK_CAPS:-0} == 1 ]]; then COMPOSE+=(-f compose.caps.yaml); fi
 dc() { docker compose "${COMPOSE[@]}" "$@"; }
 
+export MOCK_HTTP_PORT=${MOCK_HTTP_PORT:-80} MOCK_HTTPS_PORT=${MOCK_HTTPS_PORT:-443}   # compose.yaml reads them
 REPO=$(cd ../.. && pwd)          # the repository root: `make dist` runs there, on this machine
 HUB_IP=10.77.0.10
 HUB_PORT=8443
@@ -50,6 +53,15 @@ refuse_rootful() {
     [[ $opts == *rootless* ]] && return 0
     echo "mock: this Docker daemon is not rootless, and the boxes run privileged (see README.md)." >&2
     echo "      Use rootless Docker. In a throwaway VM only: MOCK_ALLOW_ROOTFUL=1 $0 ${1:-}" >&2
+    exit 1
+}
+
+# A published port that something else on this machine holds: say so before docker does, with the way round it.
+# The mock's own web box holding it (a second `up`) is fine.
+port_free() {   # port_free PORT VARIABLE
+    ss -Hltn "sport = :$1" 2>/dev/null | grep -q "127.0.0.1:$1\|0.0.0.0:$1\|\*:$1" || return 0
+    [[ -n $(docker port edr-mock-web-1 2>/dev/null) ]] && return 0
+    echo "mock: 127.0.0.1:$1 is taken on this machine. Publish the site elsewhere: $2=<port> $0 up" >&2
     exit 1
 }
 
@@ -82,18 +94,20 @@ check() {   # check DESCRIPTION COMMAND...
 }
 
 run_tests() {
-    echo "== web.dev.local from this machine (loopback-published ports)"
-    check "http://web.dev.local:80 serves the PHP 8.5 hello page" \
-        bash -c 'p=$(curl -fsS --max-time 10 --resolve web.dev.local:80:127.0.0.1 http://web.dev.local/) &&
-                 grep -q "Hello, world" <<<"$p" && grep -q "PHP 8\.5\." <<<"$p" && grep -q "plain HTTP" <<<"$p"'
-    check "https://web.dev.local:443 serves it over TLS with HTTP/2" \
-        bash -c 'p=$(curl -fsSk --http2 --max-time 10 --resolve web.dev.local:443:127.0.0.1 https://web.dev.local/) &&
-                 grep -q "HTTPS, HTTP/2.0" <<<"$p"'
+    echo "== web.dev.local from this machine (loopback-published ports $MOCK_HTTP_PORT and $MOCK_HTTPS_PORT)"
+    local http="http://web.dev.local:$MOCK_HTTP_PORT" https="https://web.dev.local:$MOCK_HTTPS_PORT"
+    local rh="web.dev.local:$MOCK_HTTP_PORT:127.0.0.1" rs="web.dev.local:$MOCK_HTTPS_PORT:127.0.0.1"
+    check "$http serves the PHP 8.5 hello page" \
+        bash -c 'p=$(curl -fsS --max-time 10 --resolve "$1" "$2/") &&
+                 grep -q "Hello, world" <<<"$p" && grep -q "PHP 8\.5\." <<<"$p" && grep -q "plain HTTP" <<<"$p"' _ "$rh" "$http"
+    check "$https serves it over TLS with HTTP/2" \
+        bash -c 'p=$(curl -fsSk --http2 --max-time 10 --resolve "$1" "$2/") &&
+                 grep -q "HTTPS, HTTP/2.0" <<<"$p"' _ "$rs" "$https"
     check "the certificate names web.dev.local" \
-        bash -c 'openssl s_client -connect 127.0.0.1:443 -servername web.dev.local </dev/null 2>/dev/null |
-                 openssl x509 -noout -ext subjectAltName | grep -q "DNS:web.dev.local"'
+        bash -c 'openssl s_client -connect "127.0.0.1:$1" -servername web.dev.local </dev/null 2>/dev/null |
+                 openssl x509 -noout -ext subjectAltName | grep -q "DNS:web.dev.local"' _ "$MOCK_HTTPS_PORT"
     check "dotfiles are refused (/.env -> 403)" \
-        bash -c '[[ $(curl -s -o /dev/null -w "%{http_code}" --resolve web.dev.local:80:127.0.0.1 http://web.dev.local/.env) == 403 ]]'
+        bash -c '[[ $(curl -s -o /dev/null -w "%{http_code}" --resolve "$1" "$2/.env") == 403 ]]' _ "$rh" "$http"
 
     echo "== inside the web box"
     check "Ubuntu 26.04" dc exec -T web grep -q 'VERSION_ID="26.04"' /etc/os-release
@@ -118,7 +132,7 @@ run_tests() {
     ((fail == 0))
 }
 
-# ---- the real installers (written, not yet run) -------------------------------------------------------------
+# ---- the real installers ------------------------------------------------------------------------------------
 die() { echo "mock: $*" >&2; exit 1; }
 hubx() { dc exec -T hub "$@"; }
 webx() { dc exec -T web "$@"; }
@@ -203,13 +217,28 @@ echo "== install.sh (local mode: no --hub)"
 BOX
 }
 
+PENDING_TOKEN_PY='
+import json, sys
+for line in sys.stdin:
+    try:
+        t = json.loads(line)
+    except ValueError:
+        continue
+    if t.get("name") == "web" and t.get("state") == "pending":
+        print(t.get("id", ""))'
+
 # The token goes from the hub box to the web box through two pipes and a file: it is never an argument
 # and never on this machine's disk.
 cmd_enroll() {
-    local py='import json, sys; print(json.load(sys.stdin)["tokens"][0]["token"])'
+    local py='import json, sys; print(json.load(sys.stdin)["tokens"][0]["token"])' id
+    # a second run: the hub refuses a new token while one for the same name is pending, so that one is revoked first
+    for id in $(hubx bash -c 'edr-hub token list --json | python3 -I -c "$1"' _ "$PENDING_TOKEN_PY"); do
+        hubx edr-hub token revoke "$id" >/dev/null && echo "mock: revoked the pending token $id left by an earlier run"
+    done
     hubx edr-hub token create --name web --ttl 1h --json | python3 -I -c "$py" |
         webx sh -c 'umask 077; cat > /root/mock-dist/web.token'
-    webx edr-agent enroll --hub "$HUB_IP:$HUB_PORT" --token-file "$DIST/web.token" --droplet-id mock-web
+    # no --droplet-id here: install-web gave it, edr-droplet-id.service wrote it, and enroll refuses a second one
+    webx edr-agent enroll --hub "$HUB_IP:$HUB_PORT" --token-file "$DIST/web.token"
     webx rm -f "$DIST/web.token"
     # what the hub says right after: pending until the first heartbeat (the e2e check reads this note)
     host_state | hubx tee "$DIST/web.state-after-enroll" >/dev/null || true
@@ -255,8 +284,28 @@ ts = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + ".000000000Z"
 with open("/var/log/tetragon/tetragon.log", "a") as f:
     f.write(json.dumps({"process_kprobe": kp, "node_name": "web", "time": ts}) + "\n")'
 append_tetragon_line() {   # append_tetragon_line BINARY
-    webx bash -c 'mkdir -p /var/log/tetragon && python3 -I -c "$1" "$2"' _ "$TETRAGON_PY" "$1"
+    webx python3 -I -c "$TETRAGON_PY" "$1"
 }
+
+# Tetragon cannot run in a box, so install-web passes --no-tetragon and the agent's Tetragon reader is off.
+# For the replay it is switched on by hand: the log directory as the installer's step 7 makes it, the key in
+# local.conf, and a restart (the agent's unit binds /var/log/tetragon when it starts, and the reader begins at
+# the end of the log). tetragon_replay off puts the key back, so edr-check has no Tetragon to miss.
+tetragon_replay() {   # tetragon_replay on|off
+    local from=off to=on
+    [[ $1 == on ]] || { from=on; to=off; }
+    webx bash -c 'set -e
+        install -d -m 2750 -o root -g edr-agent /var/log/tetragon
+        [[ -e /var/log/tetragon/tetragon.log ]] || install -m 0640 -o root -g edr-agent /dev/null /var/log/tetragon/tetragon.log
+        sed -i "s/^tetragon = $1\$/tetragon = $2/" /etc/edr-agent/local.conf
+        grep -qx "tetragon = $2" /etc/edr-agent/local.conf
+        edr-agent apply-config >/dev/null
+        systemctl restart edr-agent
+        for i in $(seq 30); do systemctl is-active --quiet edr-agent && break; sleep 1; done
+        systemctl is-active --quiet edr-agent' _ "$from" "$to"
+    sleep 5   # the reader opens the log a moment after the unit is active
+}
+tripwire_request() { hubx curl -s -o /dev/null --max-time 10 http://web.dev.local/.env || true; }
 
 exit_0_or_1() { local rc=0; "$@" >/dev/null 2>&1 || rc=$?; ((rc <= 1)); }
 
@@ -284,22 +333,25 @@ run_e2e() {
     check "the host web was pending right after enrollment (or already active)" state_after_enroll_ok
     check "the host web is active at the hub within 2 minutes" wait_ok 120 host_is_active
 
-    echo "== events reach the hub (within 2 minutes each)"
-    hubx curl -s -o /dev/null --max-time 10 http://web.dev.local/.env || true
-    append_tetragon_line "$marker"
-    check "the tripwire request for /.env is a canary.tripwire event in edr-hub events --json" \
-        wait_ok 120 hub_has_event canary.tripwire "" ".env"
-    check "the recorded Tetragon line is a CRITICAL tetragon.nginx-exec event" \
-        wait_ok 120 hub_has_event tetragon.nginx-exec CRITICAL "$marker"
-
-    echo "== health checks"
+    echo "== health checks (before the replay switches the Tetragon reader on)"
     check "edr-check on the web box exits 0 or 1" exit_0_or_1 webx edr-check
     check "the hub's check.sh exits 0 or 1" exit_0_or_1 hubx /usr/local/lib/edr-hub/check.sh
+
+    echo "== events reach the hub (within 2 minutes each)"
+    tripwire_request
+    check "the tripwire request for /.env is a canary.tripwire event in edr-hub events --json" \
+        wait_ok 120 hub_has_event canary.tripwire "" ".env"
+    check "the agent's Tetragon reader is switched on for the replay" tetragon_replay on
+    append_tetragon_line "$marker"
+    check "the recorded Tetragon line is a CRITICAL tetragon.nginx-exec event" \
+        wait_ok 120 hub_has_event tetragon.nginx-exec CRITICAL "$marker"
 
     echo "== revoke: the agent gets 403 and keeps spooling"
     check "edr-hub host web revoke succeeds" hubx edr-hub host web revoke
     append_tetragon_line "$marker-after-revoke"
+    tripwire_request
     check "edr-agent status shows host_revoked and a spool with at least one event" wait_ok 150 agent_revoked_and_spooling
+    check "the Tetragon reader is switched off again" tetragon_replay off
 
     echo
     echo "mock: $pass passed, $fail failed"
@@ -312,11 +364,18 @@ no_table() {   # no_table BOX TABLE
     ! dc exec -T "$1" nft list table inet "$2" >/dev/null 2>&1
 }
 no_units() {   # no_units BOX GLOB
-    local a b
-    a=$(dc exec -T "$1" systemctl list-unit-files "$2" --no-legend) || return 1
-    b=$(dc exec -T "$1" systemctl list-units --all "$2" --no-legend) || return 1
-    [[ -z $a && -z $b ]]
+    local left
+    # systemctl exits 1 when the pattern matches nothing, which is the good case here: only the text counts
+    left=$(dc exec -T "$1" bash -c 'systemctl list-unit-files "$1" --no-legend; systemctl list-units --all "$1" --no-legend; true' _ "$2") || return 1
+    [[ -z $left ]] || { printf '%s\n' "$left"; return 1; }
 }
+no_path() {   # no_path BOX PATH...
+    local box=$1 left
+    shift
+    left=$(dc exec -T "$box" bash -c 'for p in "$@"; do [[ -e $p || -L $p ]] && echo "$p"; done; true' _ "$@") || return 1
+    [[ -z $left ]] || { printf '%s\n' "$left"; return 1; }
+}
+no_kit_user_on_web() { ! webx getent passwd edr-agent edr-notify >/dev/null; }
 no_listener() {   # no_listener BOX EXTENDED-REGEX-OF-PORTS
     local sockets
     sockets=$(dc exec -T "$1" ss -Hltn) || return 1
@@ -337,12 +396,19 @@ run_residue() {
     check "no edr-hub unit file or unit" no_units hub 'edr-hub*'
     check "nothing listens on 8443, 8444 or 8450" no_listener hub '8443|8444|8450'
     check "no edr-hub process" no_process hub '[e]dr_hub'
+    check "no code, CLI, firewall file or journal file of the hub is left (the data and the users are kept by a plain uninstall)" no_path hub \
+        /usr/local/lib/edr-hub /usr/local/sbin/edr-hub /etc/edr-hub/edr-hub.nft /etc/systemd/journald@edr-hub.conf /etc/apt/apt.conf.d/52edr-hub
     echo "== residue in the web box"
     check "no table inet edr" no_table web edr
     check "no table inet edr_dns" no_table web edr_dns
     check "no table inet edr_isolate" no_table web edr_isolate
     check "no edr unit file or unit" no_units web 'edr-*'
     check "no edr-agent process" no_process web '[e]dr-agent'
+    check "no code, configuration or state of the client is left (host-id alone is kept)" no_path web \
+        /usr/local/lib/edr-agent /usr/local/sbin/edr-agent /usr/local/sbin/edr-check /usr/local/sbin/edr-uninstall /etc/edr-agent /etc/edr-dns \
+        /var/lib/edr-install /var/lib/edr-bans /var/lib/edr-inventory /var/lib/edr-diskguard /var/lib/edr-notify /var/lib/edr-agent/spool \
+        /var/lib/edr-agent/identity /etc/modprobe.d/edr-sctp-block.conf /etc/systemd/journald@edr.conf
+    check "the users edr-agent and edr-notify are gone" no_kit_user_on_web
     check "nothing of the kit listens in the web box (nginx keeps 80 and 443)" nothing_of_the_kit_listens_on_web
 }
 
@@ -367,9 +433,11 @@ BOX
 case ${1:-help} in
     up)
         refuse_rootful up
+        port_free "$MOCK_HTTP_PORT" MOCK_HTTP_PORT
+        port_free "$MOCK_HTTPS_PORT" MOCK_HTTPS_PORT
         dc up -d --build
         wait_healthy
-        echo "mock: up. Add '127.0.0.1 web.dev.local' to /etc/hosts to browse http(s)://web.dev.local"
+        echo "mock: up. Add '127.0.0.1 web.dev.local' to /etc/hosts to browse http://web.dev.local:$MOCK_HTTP_PORT and https://web.dev.local:$MOCK_HTTPS_PORT"
         ;;
     test) refuse_rootful test; run_tests ;;
     status)

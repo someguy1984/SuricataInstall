@@ -527,7 +527,10 @@ class TestPause(Case):
 
     def test_bounds(self):
         for bad in ("25h", "0s", "0", "-5m", "junk", "1d1s", "2d"):
-            rc, out, errs = run(["pause", "--for", bad])
+            try:
+                rc, out, errs = run(["pause", "--for", bad])
+            except SystemExit as e:        # Python 3.12's argparse takes "-5m" for an option and exits 2 itself
+                rc = hc.EXIT_USAGE if e.code == 2 else e.code
             self.assertEqual(rc, hc.EXIT_USAGE, bad)
         self.assertFalse(os.path.exists(self.p.pause_json))
 

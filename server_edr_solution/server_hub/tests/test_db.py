@@ -175,7 +175,11 @@ class PragmaAndSchemaTest(DbCase):
         w = self.start()
         w.call(lambda c: add_event(c))
         copy = os.path.join(self.tmp, "copy.db")
-        w.conn.execute("VACUUM INTO ?", (copy,))
+        # a second connection: the writer's own connection is in use by its thread (after-commit work), and VACUUM
+        # fails with "SQL statements in progress" when the two overlap (seen on 3.12 and on 3.14, about 1 run in 8)
+        other = sqlite3.connect(self.hub.paths.db)
+        other.execute("VACUUM INTO ?", (copy,))
+        other.close()
         probe = sqlite3.connect(copy)
         self.assertEqual(probe.execute("PRAGMA journal_mode").fetchone()[0], "delete")
         probe.close()

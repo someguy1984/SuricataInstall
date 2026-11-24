@@ -19,8 +19,11 @@ IOSchedulingClass=idle
 CapabilityBoundingSet=CAP_NET_ADMIN
 NoNewPrivileges=yes
 ProtectSystem=strict
-# resolved reads its drop-ins from /run/systemd/resolved.conf.d
-ReadWritePaths=/run/systemd/resolved.conf.d
+# resolved reads its drop-ins from /run/systemd/resolved.conf.d. The directory is on a tmpfs and no package makes
+# it, so the unit makes it at every start (root, outside the sandbox). The "-" matters: systemd applies
+# ReadWritePaths to the "+" command too, and a missing directory would fail it at step NAMESPACE (status 226).
+ExecStartPre=+/bin/mkdir -p -m 0755 /run/systemd/resolved.conf.d
+ReadWritePaths=-/run/systemd/resolved.conf.d
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes

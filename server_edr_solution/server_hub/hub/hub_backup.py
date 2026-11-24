@@ -648,6 +648,10 @@ def _prepare_db(staged_db):
         conn.execute("UPDATE outbox SET state='dead', last_error='restored' WHERE state IN ('pending','sending','failed')")
         conn.execute("INSERT INTO meta (key, value) VALUES ('restored_at', ?) "
                      "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(now),))
+        # The read offset of pending-audit.jsonl in the backup belongs to the file of the box the backup came from. On
+        # this box it can point into the middle of a line or past the restore's own lines, so they would never be read.
+        # Start at 0: pending_audit_seen (restored with it) stops lines that were already taken from being taken twice.
+        conn.execute("DELETE FROM meta WHERE key='pending_audit_offset'")
         conn.commit()
     finally:
         conn.close()
