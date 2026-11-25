@@ -15,6 +15,47 @@
 # Not included (too noisy on a desktop): create_user_ns, which browsers,
 # snaps and bubblewrap do constantly, and capset, which every systemd
 # service does at start.
+#
+# setresuid is watched in two places, because its arguments cannot tell a root
+# process that lowered its effective uid for a moment and is coming back (sudo
+# does this, and so does apt) from a program regaining root through its saved
+# uid: both are setresuid(-1, 0, -1). The credentials held when the call is
+# made can.
+#   __sys_setresuid           two kinds of caller, told apart by capabilities:
+#                             one that holds CAP_SETUID as it calls (root saying
+#                             again that it is root, or changing its real or
+#                             saved uid), and one that has no CAP_SETUID even in
+#                             its permitted set (no uid of 0 anywhere: the
+#                             kernel refuses it, and the entry shows the -1).
+#   security_task_fix_setuid  every other caller: CAP_SETUID permitted but not
+#                             effective, which is root with a lowered effective
+#                             uid, or a setuid program. The kernel hands this
+#                             hook the old and the new credentials and reaches
+#                             it only when the call is allowed and changes
+#                             something, so its entries show the uids from
+#                             before the call. The entry is the attempt: another
+#                             security module could still refuse it.
+# One case is not logged there: real uid 0, saved uid 0, effective uid 42 going
+# back to effective uid 0. Uid 42 is _apt, and this is libapt's downloader
+# (pkgAcquire::Run) switching to its sandbox user and straight back, on every
+# apt update, apt-get update, unattended-upgrade and Ubuntu Pro cache refresh.
+# The test is on those three uids alone, whatever the program: a process in
+# that state has been root all along. Still logged: coming back to 0 with a
+# real or saved uid of 42, or through setuid or setreuid, and the refused
+# attempt of a process that is _apt outright (an apt download method).
+# _apt is 42 where base-passwd 3.6.1 or later created it. An older install
+# that was upgraded keeps the number apt's postinst gave it (getent passwd
+# _apt); there the exception does not apply and apt is logged as before. To
+# cover such a machine, add its number to the values of the last selector.
+#
+# Not logged at all: a caller with CAP_SETUID permitted but not effective whose
+# call changes nothing or is refused (a program with a permitted-only file
+# capability, or root that dropped the capability by hand).
+#
+# Do not add matchReturnArgs or matchReturnActions to any hook in this policy.
+# Tetragon 1.7.1 does not reset its selector state on return, and
+# security_task_fix_setuid runs inside all four uid calls, so a return filter
+# is judged against whichever selector that hook stopped at.
 apiVersion: cilium.io/v1alpha1
 kind: TracingPolicy
 metadata:
@@ -88,11 +129,148 @@ spec:
       index: 0
       type: "int64"
     selectors:
+    # the caller holds CAP_SETUID as it makes the call
     - matchArgs:
       - index: 1 # effective uid
         operator: "Equal"
         values:
         - "0"
+      matchCapabilities:
+      - type: Effective
+        operator: In
+        values:
+        - "CAP_SETUID"
+      matchNamespaces:
+      - namespace: User
+        operator: In
+        values:
+        - "host_ns"
+      matchActions:
+      - action: Post
+        rateLimit: "1m"
+        rateLimitScope: "process"
+    # the caller has no CAP_SETUID it could raise: the kernel refuses the call
+    - matchArgs:
+      - index: 1 # effective uid
+        operator: "Equal"
+        values:
+        - "0"
+      matchCapabilities:
+      - type: Permitted
+        operator: NotIn
+        values:
+        - "CAP_SETUID"
+      matchNamespaces:
+      - namespace: User
+        operator: In
+        values:
+        - "host_ns"
+      matchActions:
+      - action: Post
+        rateLimit: "1m"
+        rateLimitScope: "process"
+  - call: "security_task_fix_setuid" # (struct cred *new, const struct cred *old, int flags)
+    syscall: false
+    message: "Process switched to uid 0 (setresuid)"
+    # five args is Tetragon's limit; the selectors name them by position (args:)
+    # because three of them read the same function argument
+    args:
+    - index: 1
+      type: "uint32"
+      resolve: "uid.val"
+      label: "old-uid"
+    - index: 1
+      type: "uint32"
+      resolve: "euid.val"
+      label: "old-euid"
+    - index: 1
+      type: "uint32"
+      resolve: "suid.val"
+      label: "old-suid"
+    - index: 0
+      type: "uint32"
+      resolve: "euid.val"
+      label: "new-euid"
+    - index: 2
+      type: "int"
+    # Logged unless real uid 0 AND saved uid 0 AND effective uid 42: the three
+    # selectors are alternatives, one for each way of not being that case.
+    selectors:
+    # the real uid was not 0
+    - matchArgs:
+      - args: [4] # 4 is setresuid; setuid (1), setreuid (2) and setfsuid (8) have their own entries
+        operator: "Equal"
+        values:
+        - "4"
+      - args: [3] # new effective uid
+        operator: "Equal"
+        values:
+        - "0"
+      - args: [0]
+        operator: "NotEqual"
+        values:
+        - "0"
+      matchCapabilities:
+      - type: Effective
+        operator: NotIn
+        values:
+        - "CAP_SETUID"
+      matchNamespaces:
+      - namespace: User
+        operator: In
+        values:
+        - "host_ns"
+      matchActions:
+      - action: Post
+        rateLimit: "1m"
+        rateLimitScope: "process"
+    # the saved uid was not 0
+    - matchArgs:
+      - args: [4] # 4 is setresuid; setuid (1), setreuid (2) and setfsuid (8) have their own entries
+        operator: "Equal"
+        values:
+        - "4"
+      - args: [3] # new effective uid
+        operator: "Equal"
+        values:
+        - "0"
+      - args: [2]
+        operator: "NotEqual"
+        values:
+        - "0"
+      matchCapabilities:
+      - type: Effective
+        operator: NotIn
+        values:
+        - "CAP_SETUID"
+      matchNamespaces:
+      - namespace: User
+        operator: In
+        values:
+        - "host_ns"
+      matchActions:
+      - action: Post
+        rateLimit: "1m"
+        rateLimitScope: "process"
+    # the effective uid was not 42 (_apt)
+    - matchArgs:
+      - args: [4] # 4 is setresuid; setuid (1), setreuid (2) and setfsuid (8) have their own entries
+        operator: "Equal"
+        values:
+        - "4"
+      - args: [3] # new effective uid
+        operator: "Equal"
+        values:
+        - "0"
+      - args: [1]
+        operator: "NotEqual"
+        values:
+        - "42"
+      matchCapabilities:
+      - type: Effective
+        operator: NotIn
+        values:
+        - "CAP_SETUID"
       matchNamespaces:
       - namespace: User
         operator: In

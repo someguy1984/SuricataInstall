@@ -507,7 +507,7 @@ Everything Tetragon sees goes to `/var/log/tetragon/tetragon.log` (root-only), m
 | `sensitive-files` | Reads of `/etc/shadow`, sudoers, SSH and GPG private keys, cloud and Docker credentials, browser password and cookie stores, the login keyring and CLI tokens, by anything other than the program that owns them |
 | `persistence` | Writes, symlinks (`systemctl enable`), hard links and renames into cron, systemd, autostart, shell start-up files, PAM, apt hooks and similar |
 | `boot-config` | Writes, deletions and renames in the boot configuration: `/etc/default/grub`, `/etc/grub.d`, `/boot` (GRUB, EFI binaries, kernels, initrds) and the kernel hooks in `/etc/kernel`. Kernel updates and `update-grub` show up here; anything else is worth a look |
-| `privilege-escalation` | Processes switching to uid 0 |
+| `privilege-escalation` | Processes switching to uid 0. One round trip is not logged: a root process coming back from apt's sandbox user `_apt` (uid 42), which libapt's downloader does on every `apt update`, unattended-upgrade and Ubuntu Pro cache refresh; see the policy header |
 | `setuid-files` | A file being given the setuid bit |
 | `kernel-tampering`, `monitor-kernel-modules` | eBPF program loads, ptrace-style access to other processes, kernel module loads and unloads |
 | `suspicious-exec` | Programs run from `/dev/shm`. Programs with no file at all (memfd, deleted) are picked up from exec events by the journal copy |
